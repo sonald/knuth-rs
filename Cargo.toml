@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ai",
+    "crates/knuth-cli",
+    "crates/knuth-core",
+    "crates/knuth-runtime",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["sonald <yinshuiboy@gmail.com>"]
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.clippy]
+large_enum_variant = "allow"
+
+
+[workspace.dependencies]
+# Async runtime.
+tokio = { version = "1.52.3", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "io-util",
+    "tracing",
+] }
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Error handling.
+anyhow = "1.0"
+thiserror = "2"
+
+# Misc utilities shared across crates.
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "serde",
+] }
+tracing = "0.1"
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+ignore = "0.4"
+
+futures = "0.3"

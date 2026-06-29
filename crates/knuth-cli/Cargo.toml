@@ -1,0 +1,28 @@
+[package]
+name = "knuth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dotenv = "0.15.0"
+ignore = { workspace = true }
+ai = { path = "../ai", features = [
+    "openai-completions",
+    "openai-responses",
+    "openai-codex-responses",
+] }
+knuth-core = { path = "../knuth-core" }
+knuth-runtime = { path = "../knuth-runtime" }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }

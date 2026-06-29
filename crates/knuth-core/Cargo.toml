@@ -1,0 +1,14 @@
+[package]
+name = "knuth-core"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ai = { path = "../ai" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+ignore = { workspace = true }
+thiserror = { workspace = true }
