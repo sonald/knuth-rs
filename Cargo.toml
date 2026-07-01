@@ -4,7 +4,7 @@ members = [
     "crates/ai",
     "crates/knuth-cli",
     "crates/knuth-core",
-    "crates/knuth-runtime",
+    "crates/knuth-agent",
 ]
 
 [workspace.package]
@@ -27,6 +27,8 @@ tokio = { version = "1.52.3", features = [
     "io-util",
     "tracing",
 ] }
+
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Serialization.
 serde = { version = "1", features = ["derive"] }

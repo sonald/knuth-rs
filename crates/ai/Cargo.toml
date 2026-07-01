@@ -50,7 +50,7 @@ all-providers = [
 [dependencies]
 # Async runtime + HTTP/SSE.
 tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { workspace = true }
 futures = "0.3"
 futures-core = "0.3"
 pin-project-lite = "0.2"

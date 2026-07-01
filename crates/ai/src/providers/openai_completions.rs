@@ -143,7 +143,7 @@ async fn run(
     } else {
         model.base_url.as_str()
     };
-    let url = format!("{}/chat/completions", normalize_base(base));
+    let url = crate::utils::openai_compat_url::build_chat_completions_url(base);
     let mut req = client
         .post(&url)
         .bearer_auth(api_key)
@@ -459,16 +459,6 @@ fn update_usage(usage: &mut Usage, val: &Value) {
 // Request body construction
 // ────────────────────────────────────────────────────────────────────────────────────────────
 
-fn normalize_base(base: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    // Vendors set baseUrl either to ".../v1" or to the host root. Normalise to include /v1.
-    if trimmed.ends_with("/v1") || trimmed.contains("/v1/") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
-}
-
 fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut messages = Vec::new();
     if let Some(sys) = &context.system_prompt {
@@ -688,22 +678,6 @@ mod tests {
             headers: None,
             compat: None,
         }
-    }
-
-    #[test]
-    fn base_url_normalizes_to_v1() {
-        assert_eq!(
-            normalize_base("https://api.openai.com"),
-            "https://api.openai.com/v1"
-        );
-        assert_eq!(
-            normalize_base("https://api.openai.com/v1"),
-            "https://api.openai.com/v1"
-        );
-        assert_eq!(
-            normalize_base("https://api.groq.com/openai/v1"),
-            "https://api.groq.com/openai/v1"
-        );
     }
 
     #[test]

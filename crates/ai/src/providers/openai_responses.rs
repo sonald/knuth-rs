@@ -170,7 +170,7 @@ async fn run(
     } else {
         model.base_url.as_str()
     };
-    let url = build_responses_url(base);
+    let url = crate::utils::openai_compat_url::build_responses_url(base);
     let mut req = client
         .post(&url)
         .bearer_auth(api_key)
@@ -753,18 +753,6 @@ fn user_content_to_value(content: &UserContent) -> Value {
     }
 }
 
-/// Normalize the Responses endpoint URL. The catalog sets `baseUrl` to either the host root
-/// (`https://api.openai.com`) or already includes the `/v1` prefix (`.../v1`); we must end up
-/// with exactly one `/v1` segment before `/responses`.
-pub(crate) fn build_responses_url(base: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.ends_with("/v1") || trimmed.contains("/v1/") {
-        format!("{trimmed}/responses")
-    } else {
-        format!("{trimmed}/v1/responses")
-    }
-}
-
 fn resolve_openai_compatible_api_key(model: &Model, options: &StreamOptions) -> Option<String> {
     options
         .api_key
@@ -842,27 +830,6 @@ mod tests {
             headers: None,
             compat: None,
         }
-    }
-
-    #[test]
-    fn url_does_not_double_v1() {
-        assert_eq!(
-            build_responses_url("https://api.openai.com"),
-            "https://api.openai.com/v1/responses"
-        );
-        assert_eq!(
-            build_responses_url("https://api.openai.com/v1"),
-            "https://api.openai.com/v1/responses"
-        );
-        assert_eq!(
-            build_responses_url("https://api.openai.com/v1/"),
-            "https://api.openai.com/v1/responses"
-        );
-        // Cloudflare AI Gateway sticks `/openai` segment in front of `/v1`.
-        assert_eq!(
-            build_responses_url("https://gateway.example.com/acct/gw/openai"),
-            "https://gateway.example.com/acct/gw/openai/v1/responses"
-        );
     }
 
     #[test]

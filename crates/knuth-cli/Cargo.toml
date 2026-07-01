@@ -9,7 +9,6 @@ authors.workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-dotenv = "0.15.0"
 ignore = { workspace = true }
 ai = { path = "../ai", features = [
     "openai-completions",
@@ -17,7 +16,7 @@ ai = { path = "../ai", features = [
     "openai-codex-responses",
 ] }
 knuth-core = { path = "../knuth-core" }
-knuth-runtime = { path = "../knuth-runtime" }
+knuth-agent = { path = "../knuth-agent" }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,3 +25,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
+dotenvy = "0.15.7"
+clap = { version = "4.6.1", features = ["derive", "env"] }
