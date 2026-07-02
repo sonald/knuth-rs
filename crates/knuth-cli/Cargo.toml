@@ -22,8 +22,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 dotenvy = "0.15.7"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+reedline = "0.48.0"
+crossterm = "0.29"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

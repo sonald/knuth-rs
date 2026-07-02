@@ -441,6 +441,120 @@ pub enum Message {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────
+// Human-readable summaries (`Display`). Each type renders itself so callers (e.g. logging a
+// whole conversation) can just format the outermost value without knowing its internals.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// Collapses whitespace and truncates to `max_chars` for compact one-line previews.
+fn preview(s: &str, max_chars: usize) -> String {
+    let flattened = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= max_chars {
+        flattened
+    } else {
+        let mut truncated: String = flattened.chars().take(max_chars).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+impl std::fmt::Display for TextContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", preview(&self.text, 120))
+    }
+}
+
+impl std::fmt::Display for ThinkingContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<thinking: {}>", preview(&self.thinking, 80))
+    }
+}
+
+impl std::fmt::Display for ImageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<image {}>", self.mime_type)
+    }
+}
+
+impl std::fmt::Display for ToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args = serde_json::to_string(&self.arguments).unwrap_or_default();
+        write!(f, "<tool_call {}({})>", self.name, preview(&args, 80))
+    }
+}
+
+impl std::fmt::Display for ContentBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContentBlock::Text(t) => write!(f, "{t}"),
+            ContentBlock::Thinking(t) => write!(f, "{t}"),
+            ContentBlock::Image(i) => write!(f, "{i}"),
+            ContentBlock::ToolCall(t) => write!(f, "{t}"),
+        }
+    }
+}
+
+impl std::fmt::Display for UserContentBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserContentBlock::Text(t) => write!(f, "{t}"),
+            UserContentBlock::Image(i) => write!(f, "{i}"),
+        }
+    }
+}
+
+impl std::fmt::Display for UserContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserContent::Text(s) => write!(f, "{}", preview(s, 120)),
+            UserContent::Blocks(blocks) => {
+                let joined = blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ");
+                write!(f, "{joined}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UserMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "User: {}", self.content)
+    }
+}
+
+impl std::fmt::Display for AssistantMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Assistant:")?;
+        if self.content.is_empty() {
+            write!(f, " <empty>")?;
+        }
+        for block in &self.content {
+            write!(f, " {block}")?;
+        }
+        if let Some(err) = &self.error_message {
+            write!(f, " <error: {}>", preview(err, 80))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ToolResultMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = if self.is_error { "error" } else { "ok" };
+        let joined = self.content.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ");
+        write!(f, "ToolResult[{}, {status}]: {joined}", self.tool_name)
+    }
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::User(m) => write!(f, "{m}"),
+            Message::Assistant(m) => write!(f, "{m}"),
+            Message::ToolResult(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
 // Tools / context
 // ──────────────────────────────────────────────────────────────────────────────────────────
 

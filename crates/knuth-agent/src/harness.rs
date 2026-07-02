@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use ai::{
-    ImageContent, Message, Model, StreamOptions, UserContent, UserMessage, UserRole,
+    ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock, UserMessage, UserRole,
 };
+use chrono::Utc;
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore, SessionEndReason, UserMessageIntent,
+    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore, SessionEndReason, TurnOutcome, UserMessageIntent,
 };
 use tokio::sync::mpsc::error::{SendError, TrySendError};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::debug;
 use uuid::Uuid;
 use tokio_util::sync::CancellationToken;
 use crate::AgentLoop;
@@ -30,16 +30,34 @@ pub enum AgentSessionError {
     #[error("Agent is already running")]
     AgentIsRunning,
 
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+
     #[error("Store error: {0}")]
     StoreError(#[from] EventStoreError),
 
     #[error("Failed to send event to store: {0}")]
     ChannelSendError(#[from] SendError<AgentEvent>),
+
+    #[error("Failed to send command to actor: {0}")]
+    ActorSendError(#[from] SendError<AgentCommand>),
+
+    #[error("Actor task failed: {0}")]
+    ActorTaskFailed(#[from] tokio::task::JoinError),
 }
 
 #[derive(Debug)]
 pub enum AgentCommand {
+    SetSystemPrompt(String),
     SubmitInput {
+        input: String,
+        images: Vec<ImageContent>, // save for later use
+    },
+    Followup {
+        input: String,
+        images: Vec<ImageContent>, // save for later use
+    },
+    Steer {
         input: String,
         images: Vec<ImageContent>, // save for later use
     },
@@ -47,36 +65,91 @@ pub enum AgentCommand {
         tx: mpsc::Sender<AgentEvent>,
     },
     Cancel {},
+    Stop {},
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentActorState {
     Idle,
     Running,
-    Paused,
-    WaitApproval,
     Cancelled,
+}
+
+#[derive(Debug, Default)]
+struct ConversationState {
+    messages: Vec<Message>,
+    system_prompt: String,
+}
+
+impl ConversationState {
+    fn new(system_prompt: String) -> Self {
+        Self { messages: vec![], system_prompt: system_prompt }
+    }
+
+    fn add_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
+    pub async fn apply_event(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
+        match event {
+            AgentEvent::AgentTurnEnded { assistant_message, .. } => {
+                if let Some(message) = assistant_message {
+                    self.add_message(Message::Assistant(message));
+                }
+            }
+            AgentEvent::UserMessageCommitted { content, .. } => {
+                self.add_message(Message::User(UserMessage {
+                    role: UserRole::User,
+                    content: content,
+                    timestamp: Utc::now().timestamp(),
+                }));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ConversationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ConversationState (system_prompt: {} chars, {} messages)",
+            self.system_prompt.len(),
+            self.messages.len()
+        )?;
+        for (i, message) in self.messages.iter().enumerate() {
+            write!(f, "\n  [{i}] {message}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingInput {
+    content: UserContent,
+    intent: UserMessageIntent,
 }
 
 /// internal actor for the agent session
 #[derive(Debug)]
 pub(crate) struct AgentActor {
-    pub id: Uuid,
-    pub messages: Arc<Mutex<Vec<Message>>>, // cached messages for the agent
-    pub config: AgentConfig,
-    pub shutdown_token: CancellationToken,
-    pub current_turn_cancel: Option<CancellationToken>,
+    id: Uuid,
+    conversation_state: ConversationState,
+    config: AgentConfig,
+    shutdown_token: CancellationToken,
+    current_turn_cancel: Option<CancellationToken>,
 
-    pub subscriptions: Vec<mpsc::Sender<AgentEvent>>,
+    subscriptions: Vec<mpsc::Sender<AgentEvent>>,
 
-    store_tx: mpsc::Sender<AgentEvent>,
-    store_rx: mpsc::Receiver<AgentEvent>,
+    event_tx: mpsc::Sender<AgentEvent>,
+    event_rx: mpsc::Receiver<AgentEvent>,
     store: Box<dyn EventStore>,
 
     state: AgentActorState,
-    agent_loop_task: Option<JoinHandle<Result<(), AgentLoopError>>>,
+    agent_loop_task: Option<JoinHandle<Result<TurnOutcome, AgentLoopError>>>,
 
-    pending_input_queue: VecDeque<Message>,
+    pending_input_queue: VecDeque<PendingInput>,
 }
 
 impl Drop for AgentActor {
@@ -86,12 +159,12 @@ impl Drop for AgentActor {
     }
 }
 
-async fn poll_agent_loop(task: &mut Option<JoinHandle<Result<(), AgentLoopError>>>) -> Result<(), AgentLoopError> {
+async fn poll_agent_loop(task: &mut Option<JoinHandle<Result<TurnOutcome, AgentLoopError>>>) -> Result<TurnOutcome, AgentLoopError> {
     match task {
         Some(task) => {
             match task.await {
                 Ok(inner) => { return inner; }
-                Err(e) => { return Err(AgentLoopError::StoreError(e.to_string())); }
+                Err(e) => { return Err(AgentLoopError::EventSendError(e.to_string())); }
             }
         }
         None => std::future::pending().await,
@@ -105,26 +178,26 @@ impl AgentActor {
     ) -> Self {
 
         let store = Box::new(InMemoryEventStore::new());
-        let (store_tx, store_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(100);
 
         Self {
             id: session_id,
-            messages: Arc::new(Mutex::new(vec![])),
+            conversation_state: ConversationState::new("".to_string()),
             config: config,
             shutdown_token: CancellationToken::new(),
             current_turn_cancel: None,
             subscriptions: Vec::new(),
             state: AgentActorState::Idle,
-            store_tx: store_tx,
-            store_rx: store_rx,
+            event_tx,
+            event_rx,
             store: store,
             agent_loop_task: None,
             pending_input_queue: VecDeque::new(),
         }
     }
 
-    async fn store_event(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
-        self.store_tx.send(event).await?;
+    async fn commit_event(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
+        self.persist_and_publish(event).await?;
         return Ok(());
     }
 
@@ -145,7 +218,7 @@ impl AgentActor {
     }
 
     pub async fn start(&mut self, mut cmd_rx: mpsc::Receiver<AgentCommand>) -> Result<(), AgentSessionError> {
-        self.store_event(AgentEvent::SessionStarted {
+        self.commit_event(AgentEvent::SessionStarted {
             session_id: self.id,
         })
         .await?;
@@ -154,70 +227,110 @@ impl AgentActor {
             tokio::select! {
                 maybe_command = cmd_rx.recv() => {
                     let Some(command) = maybe_command else { break SessionEndReason::Success };
-                        debug!("AgentActor: Executing command: {:?}", command);
-                        self.handle_command(command).await?;
+                    debug!("AgentActor: Executing command: {:?}", command);
+                    if let Err(e) = self.handle_command(command).await {
+                        match e {
+                            AgentSessionError::StoreError(_) => break SessionEndReason::Error,
+                            e => {
+                                let _ = self.persist_and_publish(AgentEvent::ErrorOccurred {
+                                        message: e.to_string(), details: None
+                                }).await;
+                            }
+                        }
+                    }
                 }
 
                 _ = self.shutdown_token.cancelled() => {
                     break SessionEndReason::Cancelled;
                 }
 
-                maybe_event = self.store_rx.recv() => {
+                maybe_event = self.event_rx.recv() => {
                     let Some(event) = maybe_event else { break SessionEndReason::Success };
-                    self.store.append(event.clone()).await?;
-                    self.notify_subscriptions(event).await?;
+                    self.persist_and_publish(event).await?;
                 }
 
                 result = poll_agent_loop(&mut self.agent_loop_task) => {
+                    while let Ok(event) = self.event_rx.try_recv() {
+                        self.persist_and_publish(event).await?;
+                    }
                     self.handle_turn_ended(result).await?;
                 }
-
             }
         };
 
         // drain the remaining events from the store
-        while let Ok(event) = self.store_rx.try_recv() {
-            self.store.append(event.clone()).await?;
-            self.notify_subscriptions(event).await?;
+        while let Ok(event) = self.event_rx.try_recv() {
+            debug!("Draining event: {:?}", event.name());
+            self.persist_and_publish(event).await?;
         }
 
         // write the end event to the store manually
         let end_event = AgentEvent::SessionEnded { reason };
-        self.store.append(end_event.clone()).await?;
-        self.notify_subscriptions(end_event).await?;
+        self.persist_and_publish(end_event).await?;
 
         Ok(())
     }
 
-    async fn handle_turn_ended(&mut self, result: Result<(), AgentLoopError>) -> Result<(), AgentSessionError> {
-        if let Err(e) = result {
-            match e {
-                AgentLoopError::LoopCancelled => {
-                }
-                _ => {
-                    self.store_event(AgentEvent::ErrorOccurred { message: e.to_string(), details: None }).await?;
-                    debug!("AgentActor: Error occurred in agent loop: {:?}", e);
-                }
+    async fn persist_and_publish(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
+        self.store.append(event.clone()).await?;
+        self.conversation_state.apply_event(event.clone()).await?;
+        self.notify_subscriptions(event).await?;
+        Ok(())
+    }
+
+    async fn handle_turn_ended(&mut self, result: Result<TurnOutcome, AgentLoopError>) -> Result<(), AgentSessionError> {
+        debug!("AgentActor: Turn ended, result: {:?}", result);
+        match result {
+            Ok(_) => { }
+            Err(e) => {
+                self.commit_event(AgentEvent::ErrorOccurred { message: e.to_string(), details: None }).await?;
+                debug!("AgentActor: Error occurred in agent loop: {:?}", e);
             }
         }
 
 
         self.agent_loop_task = None;
         self.current_turn_cancel = None;
+        self.state = AgentActorState::Idle;
 
-        if self.pending_input_queue.is_empty() {
-            self.state = AgentActorState::Idle;
+        self.try_dispatch_next_input().await
+    }
+
+    async fn wait_current_turn_to_finish(&mut self) -> Result<(), AgentSessionError> {
+        if self.agent_loop_task.is_none() {
             return Ok(());
         }
 
-        //TODO: handle followup input
-        return Ok(());
+        loop {
+            tokio::select! {
+                maybe_event = self.event_rx.recv() => {
+                    if let Some(event) = maybe_event {
+                        self.persist_and_publish(event).await?;
+                    }
+                }
+
+                result = poll_agent_loop(&mut self.agent_loop_task) => {
+                    while let Ok(event) = self.event_rx.try_recv() {
+                        self.persist_and_publish(event).await?;
+                    }
+
+                    self.handle_turn_ended(result).await?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn handle_command(&mut self, command: AgentCommand) -> Result<(), AgentSessionError> {
         match command {
             AgentCommand::SubmitInput { input, images } => {
-                self.submit_input(input, images).await?;
+                self.submit_input(input, images, UserMessageIntent::Normal).await?;
+            }
+            AgentCommand::Followup { input, images } => {
+                self.submit_input(input, images, UserMessageIntent::Followup).await?;
+            }
+            AgentCommand::Steer { input, images } => {
+                self.submit_input(input, images, UserMessageIntent::Normal).await?;
             }
             AgentCommand::Subscribe { tx } => self.subscribe(tx).await?,
             AgentCommand::Cancel {} => {
@@ -225,73 +338,77 @@ impl AgentActor {
                     turn_cancel.cancel();
                 }
             }
+            AgentCommand::SetSystemPrompt(prompt) => {
+                self.conversation_state.system_prompt = prompt;
+            }
+            AgentCommand::Stop {} => {
+                self.shutdown_token.cancel();
+
+                if let Some(turn_cancel) = &self.current_turn_cancel {
+                    turn_cancel.cancel();
+                }
+
+                self.wait_current_turn_to_finish().await?
+            }
         }
 
         Ok(())
     }
 
 
-    //TODO: make this a pipeline 
-    async fn assemble_system_prompt(&self) -> Result<String, AgentSessionError> {
-        let system_prompt = "You are a terse assistant. ".into();
-        Ok(system_prompt)
+    async fn submit_input(
+        &mut self,
+        input: String,
+        images: Vec<ImageContent>,
+        intent: UserMessageIntent,
+    ) -> Result<(), AgentSessionError> {
+        let content = {
+            let mut v = vec![];
+            v.push(UserContentBlock::text(input));
+            for image in images {
+                v.push(UserContentBlock::Image(image));
+            }
+            UserContent::Blocks(v)
+        };
+        self.pending_input_queue.push_back(PendingInput { content, intent: intent });
+        self.try_dispatch_next_input().await?;
+        Ok(())
     }
 
-    async fn assemble_context(&self, input: Message) -> Result<ai::Context, AgentSessionError> {
-        let mut messages = self.messages.lock().await;
-        messages.push(input);
+    async fn assemble_context(&self) -> Result<ai::Context, AgentSessionError> {
 
         let context = ai::Context {
-            system_prompt: self.assemble_system_prompt().await.ok(),
-            messages: messages.clone(),
+            system_prompt: Some(self.conversation_state.system_prompt.clone()),
+            messages: self.conversation_state.messages.clone(),
             tools: None,
         };
         Ok(context)
     }
 
-    //TODO: take care of steer/followup/etc.
-    async fn submit_input(
-        &mut self,
-        input: String,
-        _images: Vec<ImageContent>,
-    ) -> Result<(), AgentSessionError> {
-        let intent = match self.state {
-            AgentActorState::Idle =>  UserMessageIntent::Normal ,
-            AgentActorState::Running =>  UserMessageIntent::Followup,
-            _ => unimplemented!()
-        };
+    async fn try_dispatch_next_input(&mut self) -> Result<(), AgentSessionError> {
+        if self.state != AgentActorState::Idle {
+            return Ok(());
+        }
 
-        self.store_event(AgentEvent::UserMessageReceived {
-            message_id: Uuid::now_v7(),
-            content: UserContent::Text(input.clone()),
-            intent: intent,
+        let Some(input) = self.pending_input_queue.pop_front() else { return Ok(()); };
+
+        let message_id = Uuid::now_v7();
+        self.commit_event(AgentEvent::UserMessageCommitted {
+            message_id: message_id,
+            content: input.content,
+            intent: input.intent,
         })
         .await?;
 
-        //TODO: support images
-        let input = Message::User(UserMessage {
-            role: UserRole::User,
-            content: UserContent::Text(input.clone()),
-            timestamp: 0,
-        });
-
-        match self.state {
-            AgentActorState::Idle => {
-                let context = self.assemble_context(input).await?;
-                self.spawn_agent_loop(context).await?;
-                self.state = AgentActorState::Running;
-            }
-
-            AgentActorState::Running => {
-                self.pending_input_queue.push_back(input);
-            }
-            _ => unimplemented!()
-        }
+        let context = self.assemble_context().await?;
+        debug!("current conversation state: \n{}", self.conversation_state);
+        self.spawn_agent_loop(context).await?;
+        self.state = AgentActorState::Running;
         Ok(())
     }
 
     async fn spawn_agent_loop(&mut self, context: ai::Context) -> Result<(), AgentSessionError> {
-        let store_tx = self.store_tx.clone();
+        let store_tx = self.event_tx.clone();
         let turn_cancel = self.shutdown_token.child_token();
         self.current_turn_cancel = Some(turn_cancel.clone());
 
@@ -304,9 +421,9 @@ impl AgentActor {
         );
 
         self.agent_loop_task = Some(tokio::task::spawn(async move {
-            agent_loop.start_agent_loop().await?;
-            Ok(())
+            agent_loop.start_agent_loop().await
         }));
+
         Ok(())
     }
 
@@ -321,7 +438,6 @@ pub struct AgentSession {
     pub name: String,
     pub description: String,
 
-    system_prompt: String,
     actor_task: JoinHandle<Result<(), AgentSessionError>>,
     cmd_tx: mpsc::Sender<AgentCommand>,
 }
@@ -330,7 +446,6 @@ impl AgentSession {
     pub fn new(
         name: String,
         description: String,
-        system_prompt: String,
         config: AgentConfig,
     ) -> Self {
         let session_id = Uuid::now_v7();
@@ -345,7 +460,6 @@ impl AgentSession {
 
         Self {
             id: session_id,
-            system_prompt: system_prompt,
             name: name,
             description: description,
             actor_task: actor_task,
@@ -359,8 +473,7 @@ impl AgentSession {
                 input: input,
                 images: vec![],
             })
-            .await
-            .unwrap();
+            .await?;
         Ok(())
     }
 
@@ -368,10 +481,32 @@ impl AgentSession {
         let (tx, rx) = mpsc::channel(100);
         self.cmd_tx
             .send(AgentCommand::Subscribe { tx: tx })
-            .await
-            .unwrap();
+            .await?;
 
         let subscription = AgentSubscription::new(rx);
         Ok(subscription)
+    }
+
+    pub async fn set_system_prompt(&mut self, prompt: String) -> Result<(), AgentSessionError> {
+        self.cmd_tx
+            .send(AgentCommand::SetSystemPrompt(prompt))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn close(self) -> Result<(), AgentSessionError> {
+        self.cmd_tx
+            .send(AgentCommand::Stop {})
+            .await?;
+
+        let result = self.actor_task.await?;
+        return result;
+    }
+
+    pub async fn cancel_current_turn(&mut self) -> Result<(), AgentSessionError> {
+        self.cmd_tx
+            .send(AgentCommand::Cancel {})
+            .await?  ;
+        Ok(())
     }
 }

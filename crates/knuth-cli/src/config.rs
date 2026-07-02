@@ -7,10 +7,6 @@ pub struct UserSettings {
 }
 
 impl UserSettings {
-    pub fn new(model: Model, options: StreamOptions) -> Self {
-        Self { model, options }
-    }
-
     pub fn load() -> Result<Self> {
         let model = Self::load_model_from_env()?;
         let options = StreamOptions {
@@ -35,8 +31,8 @@ impl UserSettings {
             let model = Model {
                 id: model.to_string(),
                 name: model,
-                // api: Api::known(KnownApi::OpenAICompletions),
-                api: Api::known(KnownApi::OpenAIResponses),
+                api: Api::known(KnownApi::OpenAICompletions),
+                // api: Api::known(KnownApi::OpenAIResponses),
                 provider: Provider::from("custom"),
                 base_url: base_url,
                 reasoning: true,
@@ -48,7 +44,6 @@ impl UserSettings {
                 headers: None,
                 compat: None,
             };
-            // register_custom_model(model.clone());
             Some(model)
         };
 

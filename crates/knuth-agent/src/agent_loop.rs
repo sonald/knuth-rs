@@ -1,6 +1,6 @@
 use ai::{Model, StreamOptions, stream};
 use futures::StreamExt;
-use knuth_core::{AgentEvent, TurnEndReason};
+use knuth_core::{AgentEvent, TurnEndReason, TurnOutcome};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -8,11 +8,8 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentLoopError {
-    #[error("Store error: {0}")]
-    StoreError(String),
-
-    #[error("Agent loop cancelled")]
-    LoopCancelled,
+    #[error("Failed to send event to store: {0}")]
+    EventSendError(String),
 }
 
 #[derive(Debug)]
@@ -49,10 +46,10 @@ impl AgentLoop {
         self.store_tx
             .send(event)
             .await
-            .map_err(|e| AgentLoopError::StoreError(e.to_string()))
+            .map_err(|e| AgentLoopError::EventSendError(e.to_string()))
     }
 
-    pub(crate) async fn start_agent_loop(&mut self) -> Result<(), AgentLoopError> {
+    pub(crate) async fn start_agent_loop(&mut self) -> Result<TurnOutcome, AgentLoopError> {
         let mut stream = stream(&self.model, &self.context, Some(&self.options));
 
         loop {
@@ -60,13 +57,27 @@ impl AgentLoop {
                 biased;
 
                 _ = self.turn_cancel.cancelled() => {
-                    debug!("AgentActor: Agent loop cancelled");
-                    return Err(AgentLoopError::LoopCancelled);
+                    debug!("Agent loop cancelled");
+                    self.emit(AgentEvent::AgentTurnEnded {
+                        turn_id: self.turn_id,
+                        reason: TurnEndReason::Cancelled,
+                        assistant_message: None,
+                    })
+                    .await?;
+
+                    return Ok(TurnOutcome {
+                        turn_id: self.turn_id,
+                        reason: TurnEndReason::Cancelled,
+                    });
                 }
 
                 event = stream.next() => {
                     let Some(event) = event else {
-                        return Ok(())
+                        debug!("Agent loop stream ended");
+                        return Ok(TurnOutcome {
+                            turn_id: self.turn_id,
+                            reason: TurnEndReason::Success,
+                        });
                      };
                     self.handle_event(event).await?;
                 }
@@ -86,10 +97,11 @@ impl AgentLoop {
                 })
                 .await?;
             }
-            ai::AssistantMessageEvent::Done { .. } => {
+            ai::AssistantMessageEvent::Done { message, .. } => {
                 self.emit(AgentEvent::AgentTurnEnded {
                     turn_id: self.turn_id,
                     reason: TurnEndReason::Success,
+                    assistant_message: Some(message),
                 })
                 .await?;
             }
@@ -103,6 +115,7 @@ impl AgentLoop {
                 self.emit(AgentEvent::AgentTurnEnded {
                     turn_id: self.turn_id,
                     reason: TurnEndReason::Error,
+                    assistant_message: None,
                 })
                 .await?;
             }
@@ -126,9 +139,8 @@ impl AgentLoop {
             } => {
                 self.emit(AgentEvent::AssistantMessageCompleted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
-                    content,
-                    usage: partial.usage,
-                    stop_reason: partial.stop_reason,
+                    text_content: content,
+                    assistant_message: partial,
                 })
                 .await?;
             }
