@@ -44,6 +44,12 @@ pub enum AgentSessionError {
 
     #[error("Actor task failed: {0}")]
     ActorTaskFailed(#[from] tokio::task::JoinError),
+
+    #[error("Failed to load image '{path}': {source}")]
+    ImageLoadFailed {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -467,11 +473,27 @@ impl AgentSession {
         }
     }
 
-    pub async fn submit_input(&mut self, input: String) -> Result<(), AgentSessionError> {
+    async fn load_images(&self, images: Vec<String>) -> Result<Vec<ImageContent>, AgentSessionError> {
+        use base64::Engine;
+
+        let mut image_contents = vec![];
+        for path in images {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|source| AgentSessionError::ImageLoadFailed { path: path.clone(), source })?;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let mime_type = mime_type_from_path(&path);
+            image_contents.push(ImageContent { data, mime_type });
+        }
+        Ok(image_contents)
+    }
+
+    pub async fn submit_input(&mut self, input: String, images: Vec<String>) -> Result<(), AgentSessionError> {
+        let images = self.load_images(images).await?;
         self.cmd_tx
             .send(AgentCommand::SubmitInput {
                 input: input,
-                images: vec![],
+                images: images,
             })
             .await?;
         Ok(())
@@ -509,4 +531,23 @@ impl AgentSession {
             .await?  ;
         Ok(())
     }
+}
+
+fn mime_type_from_path(path: &str) -> String {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }

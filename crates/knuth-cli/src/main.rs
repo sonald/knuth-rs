@@ -30,6 +30,8 @@ enum Commands {
     Chat {
         #[arg(short('p'), long)]
         input: Option<String>,
+        #[arg(short('i'), long)]
+        images: Option<Vec<String>>,
     },
 
     Sessions {
@@ -49,10 +51,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.commands {
-        Commands::Chat { input } => {
+        Commands::Chat { input, images } => {
             match input {
                 Some(input) => {
-                    oneshot(input).await?;
+                    oneshot(input, images.unwrap_or_default()).await?;
                 }
                 None => {
                     chat_loop().await?;
@@ -71,7 +73,7 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-async fn oneshot(input: String) -> Result<()> {
+async fn oneshot(input: String, images: Vec<String>) -> Result<()> {
     let user_settings = UserSettings::load()?;
     let  system_prompt = "You are a helpful assistant.".to_string();
 
@@ -106,7 +108,7 @@ async fn oneshot(input: String) -> Result<()> {
     });
 
     session.set_system_prompt(system_prompt).await?;
-    session.submit_input(input).await?;
+    session.submit_input(input, images).await?;
     loop {
         tokio::select! {
             _ = quit_token.cancelled() => {
@@ -162,7 +164,7 @@ async fn chat_loop() -> Result<()> {
         let sig = reedline.read_line(&prompt);
         match sig {
             Ok(Signal::Success(line)) => {
-                session.submit_input(line).await?;
+                session.submit_input(line, vec![]).await?;
                 loop {
                     tokio::select! {
                         _ = turn_ended.recv() => {

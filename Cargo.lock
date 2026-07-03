@@ -1025,6 +1025,7 @@ name = "knuth-agent"
 version = "0.1.0"
 dependencies = [
  "ai",
+ "base64",
  "chrono",
  "futures",
  "knuth-core",
