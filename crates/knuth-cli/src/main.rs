@@ -49,15 +49,16 @@ async fn main() -> Result<()> {
     .init();
 
     let args = Args::parse();
+    let model = args.model;
 
     match args.commands {
         Commands::Chat { input, images } => {
             match input {
                 Some(input) => {
-                    oneshot(input, images.unwrap_or_default()).await?;
+                    oneshot(input, images.unwrap_or_default(), model.as_deref()).await?;
                 }
                 None => {
-                    chat_loop().await?;
+                    chat_loop(model.as_deref()).await?;
                 }
             }
         }
@@ -73,8 +74,8 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-async fn oneshot(input: String, images: Vec<String>) -> Result<()> {
-    let user_settings = UserSettings::load()?;
+async fn oneshot(input: String, images: Vec<String>, model: Option<&str>) -> Result<()> {
+    let user_settings = UserSettings::load(model)?;
     let  system_prompt = "You are a helpful assistant.".to_string();
 
     let mut session = AgentSession::new("test".to_string(),
@@ -94,6 +95,10 @@ async fn oneshot(input: String, images: Vec<String>) -> Result<()> {
                 }
                 AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
                     print!("{}", delta.blue());
+                }
+
+                AgentEvent::ErrorOccurred { message, .. } => {
+                    eprintln!("{}", message.red());
                 }
 
                 AgentEvent::AgentTurnEnded { .. } => {
@@ -123,8 +128,8 @@ async fn oneshot(input: String, images: Vec<String>) -> Result<()> {
 }
 
 
-async fn chat_loop() -> Result<()> {
-    let user_settings = UserSettings::load()?;
+async fn chat_loop(model: Option<&str>) -> Result<()> {
+    let user_settings = UserSettings::load(model)?;
     let  system_prompt = "You are a helpful assistant.".to_string();
 
     let mut session = AgentSession::new("test".to_string(),
@@ -142,6 +147,10 @@ async fn chat_loop() -> Result<()> {
                 }
                 AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
                     print!("{}", delta.blue());
+                }
+
+                AgentEvent::ErrorOccurred { message, .. } => {
+                    eprintln!("{}", message.red());
                 }
 
                 AgentEvent::AgentTurnEnded { .. } => {

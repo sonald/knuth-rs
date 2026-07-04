@@ -74,6 +74,7 @@ impl AgentLoop {
                 event = stream.next() => {
                     let Some(event) = event else {
                         debug!("Agent loop stream ended");
+                        //TODO: check if the last message is a text message only
                         return Ok(TurnOutcome {
                             turn_id: self.turn_id,
                             reason: TurnEndReason::Success,

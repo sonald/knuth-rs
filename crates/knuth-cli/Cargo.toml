@@ -14,6 +14,7 @@ ai = { path = "../ai", features = [
     "openai-completions",
     "openai-responses",
     "openai-codex-responses",
+    "anthropic",
 ] }
 knuth-core = { path = "../knuth-core" }
 knuth-agent = { path = "../knuth-agent" }
