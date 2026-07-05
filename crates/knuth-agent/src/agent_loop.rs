@@ -1,4 +1,4 @@
-use ai::{Model, StreamOptions, stream};
+use ai::{DoneReason, Model, StreamOptions, stream};
 use futures::StreamExt;
 use knuth_core::{AgentEvent, TurnEndReason, TurnOutcome};
 use tokio::sync::mpsc;
@@ -49,42 +49,54 @@ impl AgentLoop {
             .map_err(|e| AgentLoopError::EventSendError(e.to_string()))
     }
 
-    pub(crate) async fn start_agent_loop(&mut self) -> Result<TurnOutcome, AgentLoopError> {
+    pub(crate) async fn start_agent_loop(
+        &mut self,
+        max_turns: Option<usize>,
+    ) -> Result<TurnOutcome, AgentLoopError> {
         let mut stream = stream(&self.model, &self.context, Some(&self.options));
 
-        loop {
-            tokio::select! {
-                biased;
+        let mut current_turn = 0;
+        let max_turns = max_turns.unwrap_or(1);
 
-                _ = self.turn_cancel.cancelled() => {
-                    debug!("Agent loop cancelled");
-                    self.emit(AgentEvent::AgentTurnEnded {
-                        turn_id: self.turn_id,
-                        reason: TurnEndReason::Cancelled,
-                        assistant_message: None,
-                    })
-                    .await?;
+            loop {
+                tokio::select! {
+                    biased;
 
-                    return Ok(TurnOutcome {
-                        turn_id: self.turn_id,
-                        reason: TurnEndReason::Cancelled,
-                    });
-                }
+                    _ = self.turn_cancel.cancelled() => {
+                        debug!("Agent loop cancelled");
+                        self.emit(AgentEvent::AgentTurnEnded {
+                            turn_id: self.turn_id,
+                            reason: TurnEndReason::Cancelled,
+                            assistant_message: None,
+                        })
+                        .await?;
 
-                event = stream.next() => {
-                    let Some(event) = event else {
-                        debug!("Agent loop stream ended");
-                        //TODO: check if the last message is a text message only
                         return Ok(TurnOutcome {
                             turn_id: self.turn_id,
-                            reason: TurnEndReason::Success,
+                            reason: TurnEndReason::Cancelled,
                         });
-                     };
-                    self.handle_event(event).await?;
-                }
+                    }
 
+                    event = stream.next() => {
+                        let Some(event) = event else {
+                            debug!("Agent loop stream ended");
+                            //TODO: check if the last message is a text message only
+                            return Ok(TurnOutcome {
+                                turn_id: self.turn_id,
+                                reason: TurnEndReason::Success,
+                            });
+                        };
+                        self.handle_event(event).await?;
+                    }
+
+                }
             }
-        }
+
+
+        // Ok(TurnOutcome {
+        //     turn_id: self.turn_id,
+        //     reason: TurnEndReason::Success,
+        // })
     }
 
     async fn handle_event(
@@ -98,10 +110,19 @@ impl AgentLoop {
                 })
                 .await?;
             }
-            ai::AssistantMessageEvent::Done { message, .. } => {
+            ai::AssistantMessageEvent::Done { message, reason } => {
+                let turn_reason = match reason {
+                    DoneReason::Stop => TurnEndReason::Success,
+                    DoneReason::Length => {
+                        unimplemented!();
+                    }
+                    DoneReason::ToolUse => {
+                        unimplemented!();
+                    }
+                };
                 self.emit(AgentEvent::AgentTurnEnded {
                     turn_id: self.turn_id,
-                    reason: TurnEndReason::Success,
+                    reason: turn_reason,
                     assistant_message: Some(message),
                 })
                 .await?;
@@ -123,7 +144,7 @@ impl AgentLoop {
 
             ai::AssistantMessageEvent::TextStart { .. } => {
                 self.last_message_id = Some(Uuid::now_v7());
-                self.emit(AgentEvent::AssistantMessageStarted {
+                self.emit(AgentEvent::AssistantMessageTextStarted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                 })
                 .await?;
@@ -138,7 +159,7 @@ impl AgentLoop {
             ai::AssistantMessageEvent::TextEnd {
                 content, partial, ..
             } => {
-                self.emit(AgentEvent::AssistantMessageCompleted {
+                self.emit(AgentEvent::AssistantMessageTextCompleted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                     text_content: content,
                     assistant_message: partial,

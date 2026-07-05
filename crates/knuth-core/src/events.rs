@@ -56,14 +56,14 @@ pub enum AgentEvent {
         intent: UserMessageIntent,
     },
 
-    AssistantMessageStarted {
+    AssistantMessageTextStarted {
         message_id: Uuid,
     },
     AssistantMessageTextDelta {
         message_id: Uuid,
         delta: String,
     },
-    AssistantMessageCompleted {
+    AssistantMessageTextCompleted {
         message_id: Uuid,
         text_content: String,
         assistant_message: AssistantMessage,
@@ -114,9 +114,9 @@ impl AgentEvent {
             AgentEvent::AgentTurnStarted { .. } => "AgentTurnStarted",
             AgentEvent::AgentTurnEnded { .. } => "AgentTurnEnded",
             AgentEvent::UserMessageCommitted { .. } => "UserMessageCommitted",
-            AgentEvent::AssistantMessageStarted { .. } => "AssistantMessageStarted",
+            AgentEvent::AssistantMessageTextStarted { .. } => "AssistantMessageTextStarted",
             AgentEvent::AssistantMessageTextDelta { .. } => "AssistantMessageTextDelta",
-            AgentEvent::AssistantMessageCompleted { .. } => "AssistantMessageCompleted",
+            AgentEvent::AssistantMessageTextCompleted { .. } => "AssistantMessageTextCompleted",
             AgentEvent::AssistantMessageThinkingStarted { .. } => "AssistantMessageThinkingStarted",
             AgentEvent::AssistantMessageThinkingDelta { .. } => "AssistantMessageThinkingDelta",
             AgentEvent::AssistantMessageThinkingCompleted { .. } => {
@@ -168,7 +168,9 @@ impl std::fmt::Display for AgentEvent {
             AgentEvent::AgentTurnStarted { turn_id } => {
                 write!(f, "AgentTurnStarted(turn_id={})", short_uuid(turn_id))
             }
-            AgentEvent::AgentTurnEnded { turn_id, reason , .. } => {
+            AgentEvent::AgentTurnEnded {
+                turn_id, reason, ..
+            } => {
                 write!(
                     f,
                     "AgentTurnEnded(turn_id={}, reason={reason:?})",
@@ -184,10 +186,10 @@ impl std::fmt::Display for AgentEvent {
                     short_uuid(message_id)
                 )
             }
-            AgentEvent::AssistantMessageStarted { message_id } => {
+            AgentEvent::AssistantMessageTextStarted { message_id } => {
                 write!(
                     f,
-                    "AssistantMessageStarted(message_id={})",
+                    "AssistantMessageTextStarted(message_id={})",
                     short_uuid(message_id)
                 )
             }
@@ -198,14 +200,14 @@ impl std::fmt::Display for AgentEvent {
                     short_uuid(message_id)
                 )
             }
-            AgentEvent::AssistantMessageCompleted {
+            AgentEvent::AssistantMessageTextCompleted {
                 message_id,
                 text_content,
                 ..
             } => {
                 write!(
                     f,
-                    "AssistantMessageCompleted(message_id={}, text_content={text_content:?})",
+                    "AssistantMessageTextCompleted(message_id={}, text_content={text_content:?})",
                     short_uuid(message_id)
                 )
             }

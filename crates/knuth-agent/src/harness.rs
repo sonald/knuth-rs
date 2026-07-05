@@ -1,20 +1,22 @@
 use std::collections::VecDeque;
 
+use crate::AgentLoop;
+use crate::agent_loop::AgentLoopError;
 use ai::{
-    ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock, UserMessage, UserRole,
+    ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock, UserMessage,
+    UserRole,
 };
 use chrono::Utc;
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore, SessionEndReason, TurnOutcome, UserMessageIntent,
+    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore,
+    SessionEndReason, TurnOutcome, UserMessageIntent,
 };
-use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
-use tokio_util::sync::CancellationToken;
-use crate::AgentLoop;
-use crate::agent_loop::AgentLoopError;
 
 #[derive(Debug)]
 pub struct AgentConfig {
@@ -89,7 +91,10 @@ struct ConversationState {
 
 impl ConversationState {
     fn new(system_prompt: String) -> Self {
-        Self { messages: vec![], system_prompt: system_prompt }
+        Self {
+            messages: vec![],
+            system_prompt: system_prompt,
+        }
     }
 
     fn add_message(&mut self, message: Message) {
@@ -98,7 +103,9 @@ impl ConversationState {
 
     pub async fn apply_event(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
         match event {
-            AgentEvent::AgentTurnEnded { assistant_message, .. } => {
+            AgentEvent::AgentTurnEnded {
+                assistant_message, ..
+            } => {
                 if let Some(message) = assistant_message {
                     self.add_message(Message::Assistant(message));
                 }
@@ -165,24 +172,24 @@ impl Drop for AgentActor {
     }
 }
 
-async fn poll_agent_loop(task: &mut Option<JoinHandle<Result<TurnOutcome, AgentLoopError>>>) -> Result<TurnOutcome, AgentLoopError> {
+async fn poll_agent_loop(
+    task: &mut Option<JoinHandle<Result<TurnOutcome, AgentLoopError>>>,
+) -> Result<TurnOutcome, AgentLoopError> {
     match task {
-        Some(task) => {
-            match task.await {
-                Ok(inner) => { return inner; }
-                Err(e) => { return Err(AgentLoopError::EventSendError(e.to_string())); }
+        Some(task) => match task.await {
+            Ok(inner) => {
+                return inner;
             }
-        }
+            Err(e) => {
+                return Err(AgentLoopError::EventSendError(e.to_string()));
+            }
+        },
         None => std::future::pending().await,
     }
 }
 
 impl AgentActor {
-    pub fn new(
-        session_id: Uuid,
-        config: AgentConfig,
-    ) -> Self {
-
+    pub fn new(session_id: Uuid, config: AgentConfig) -> Self {
         let store = Box::new(InMemoryEventStore::new());
         let (event_tx, event_rx) = mpsc::channel(100);
 
@@ -208,22 +215,26 @@ impl AgentActor {
     }
 
     async fn notify_subscriptions(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
-        self.subscriptions.retain_mut(|s| match s.try_send(event.clone()) {
-            Ok(_) => true,
-            Err(TrySendError::Full(e)) => {
-                debug!("AgentActor: Failed to send event to subscription: {:?}", e);
-                true
-            }
-            Err(TrySendError::Closed(e)) => {
-                debug!("AgentActor: Subscription closed: {:?}", e);
-                false
-            }
-        });
+        self.subscriptions
+            .retain_mut(|s| match s.try_send(event.clone()) {
+                Ok(_) => true,
+                Err(TrySendError::Full(e)) => {
+                    debug!("AgentActor: Failed to send event to subscription: {:?}", e);
+                    true
+                }
+                Err(TrySendError::Closed(e)) => {
+                    debug!("AgentActor: Subscription closed: {:?}", e);
+                    false
+                }
+            });
 
         Ok(())
     }
 
-    pub async fn start(&mut self, mut cmd_rx: mpsc::Receiver<AgentCommand>) -> Result<(), AgentSessionError> {
+    pub async fn start(
+        &mut self,
+        mut cmd_rx: mpsc::Receiver<AgentCommand>,
+    ) -> Result<(), AgentSessionError> {
         self.commit_event(AgentEvent::SessionStarted {
             session_id: self.id,
         })
@@ -284,16 +295,22 @@ impl AgentActor {
         Ok(())
     }
 
-    async fn handle_turn_ended(&mut self, result: Result<TurnOutcome, AgentLoopError>) -> Result<(), AgentSessionError> {
+    async fn handle_turn_ended(
+        &mut self,
+        result: Result<TurnOutcome, AgentLoopError>,
+    ) -> Result<(), AgentSessionError> {
         debug!("AgentActor: Turn ended, result: {:?}", result);
         match result {
-            Ok(_) => { }
+            Ok(_) => {}
             Err(e) => {
-                self.commit_event(AgentEvent::ErrorOccurred { message: e.to_string(), details: None }).await?;
+                self.commit_event(AgentEvent::ErrorOccurred {
+                    message: e.to_string(),
+                    details: None,
+                })
+                .await?;
                 debug!("AgentActor: Error occurred in agent loop: {:?}", e);
             }
         }
-
 
         self.agent_loop_task = None;
         self.current_turn_cancel = None;
@@ -330,13 +347,16 @@ impl AgentActor {
     async fn handle_command(&mut self, command: AgentCommand) -> Result<(), AgentSessionError> {
         match command {
             AgentCommand::SubmitInput { input, images } => {
-                self.submit_input(input, images, UserMessageIntent::Normal).await?;
+                self.submit_input(input, images, UserMessageIntent::Normal)
+                    .await?;
             }
             AgentCommand::Followup { input, images } => {
-                self.submit_input(input, images, UserMessageIntent::Followup).await?;
+                self.submit_input(input, images, UserMessageIntent::Followup)
+                    .await?;
             }
             AgentCommand::Steer { input, images } => {
-                self.submit_input(input, images, UserMessageIntent::Normal).await?;
+                self.submit_input(input, images, UserMessageIntent::Normal)
+                    .await?;
             }
             AgentCommand::Subscribe { tx } => self.subscribe(tx).await?,
             AgentCommand::Cancel {} => {
@@ -361,7 +381,6 @@ impl AgentActor {
         Ok(())
     }
 
-
     async fn submit_input(
         &mut self,
         input: String,
@@ -376,13 +395,15 @@ impl AgentActor {
             }
             UserContent::Blocks(v)
         };
-        self.pending_input_queue.push_back(PendingInput { content, intent: intent });
+        self.pending_input_queue.push_back(PendingInput {
+            content,
+            intent: intent,
+        });
         self.try_dispatch_next_input().await?;
         Ok(())
     }
 
     async fn assemble_context(&self) -> Result<ai::Context, AgentSessionError> {
-
         let context = ai::Context {
             system_prompt: Some(self.conversation_state.system_prompt.clone()),
             messages: self.conversation_state.messages.clone(),
@@ -396,7 +417,9 @@ impl AgentActor {
             return Ok(());
         }
 
-        let Some(input) = self.pending_input_queue.pop_front() else { return Ok(()); };
+        let Some(input) = self.pending_input_queue.pop_front() else {
+            return Ok(());
+        };
 
         let message_id = Uuid::now_v7();
         self.commit_event(AgentEvent::UserMessageCommitted {
@@ -427,7 +450,7 @@ impl AgentActor {
         );
 
         self.agent_loop_task = Some(tokio::task::spawn(async move {
-            agent_loop.start_agent_loop().await
+            agent_loop.start_agent_loop(Some(10)).await
         }));
 
         Ok(())
@@ -449,11 +472,7 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub fn new(
-        name: String,
-        description: String,
-        config: AgentConfig,
-    ) -> Self {
+    pub fn new(name: String, description: String, config: AgentConfig) -> Self {
         let session_id = Uuid::now_v7();
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
@@ -473,14 +492,20 @@ impl AgentSession {
         }
     }
 
-    async fn load_images(&self, images: Vec<String>) -> Result<Vec<ImageContent>, AgentSessionError> {
+    async fn load_images(
+        &self,
+        images: Vec<String>,
+    ) -> Result<Vec<ImageContent>, AgentSessionError> {
         use base64::Engine;
 
         let mut image_contents = vec![];
         for path in images {
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|source| AgentSessionError::ImageLoadFailed { path: path.clone(), source })?;
+            let bytes = tokio::fs::read(&path).await.map_err(|source| {
+                AgentSessionError::ImageLoadFailed {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mime_type = mime_type_from_path(&path);
             image_contents.push(ImageContent { data, mime_type });
@@ -488,7 +513,11 @@ impl AgentSession {
         Ok(image_contents)
     }
 
-    pub async fn submit_input(&mut self, input: String, images: Vec<String>) -> Result<(), AgentSessionError> {
+    pub async fn submit_input(
+        &mut self,
+        input: String,
+        images: Vec<String>,
+    ) -> Result<(), AgentSessionError> {
         let images = self.load_images(images).await?;
         self.cmd_tx
             .send(AgentCommand::SubmitInput {
@@ -501,9 +530,7 @@ impl AgentSession {
 
     pub async fn subscribe(&mut self) -> Result<AgentSubscription, AgentSessionError> {
         let (tx, rx) = mpsc::channel(100);
-        self.cmd_tx
-            .send(AgentCommand::Subscribe { tx: tx })
-            .await?;
+        self.cmd_tx.send(AgentCommand::Subscribe { tx: tx }).await?;
 
         let subscription = AgentSubscription::new(rx);
         Ok(subscription)
@@ -517,18 +544,14 @@ impl AgentSession {
     }
 
     pub async fn close(self) -> Result<(), AgentSessionError> {
-        self.cmd_tx
-            .send(AgentCommand::Stop {})
-            .await?;
+        self.cmd_tx.send(AgentCommand::Stop {}).await?;
 
         let result = self.actor_task.await?;
         return result;
     }
 
     pub async fn cancel_current_turn(&mut self) -> Result<(), AgentSessionError> {
-        self.cmd_tx
-            .send(AgentCommand::Cancel {})
-            .await?  ;
+        self.cmd_tx.send(AgentCommand::Cancel {}).await?;
         Ok(())
     }
 }

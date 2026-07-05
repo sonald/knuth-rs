@@ -507,7 +507,11 @@ impl std::fmt::Display for UserContent {
         match self {
             UserContent::Text(s) => write!(f, "{}", preview(s, 120)),
             UserContent::Blocks(blocks) => {
-                let joined = blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ");
+                let joined = blocks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
                 write!(f, "{joined}")
             }
         }
@@ -539,7 +543,12 @@ impl std::fmt::Display for AssistantMessage {
 impl std::fmt::Display for ToolResultMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let status = if self.is_error { "error" } else { "ok" };
-        let joined = self.content.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ");
+        let joined = self
+            .content
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
         write!(f, "ToolResult[{}, {status}]: {joined}", self.tool_name)
     }
 }

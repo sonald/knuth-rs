@@ -1,11 +1,15 @@
 use ai::{
-    get_model, Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider,
-    StreamOptions,
+    Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
+    get_model,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use std::{collections::HashMap, env, fs, path::PathBuf};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 const CONFIG_DIR_NAME: &str = "knuth";
 const CONFIG_FILE_NAME: &str = "knuth.yaml";
@@ -16,8 +20,12 @@ pub struct UserSettings {
 }
 
 impl UserSettings {
-    pub fn load(model_override: Option<&str>) -> Result<Self> {
-        let config = load_file_config(env_value("KNUTH_CONFIG"))?;
+    pub fn load(model_override: Option<&str>, config_override: Option<&Path>) -> Result<Self> {
+        let config = load_file_config(
+            config_override
+                .map(Path::to_path_buf)
+                .or_else(|| env_value("KNUTH_CONFIG").map(PathBuf::from)),
+        )?;
         let model = Self::load_model_from_env(model_override, &config)?;
         let options = load_options(&config);
         Ok(Self { model, options })
@@ -65,7 +73,7 @@ struct FileThinking {
     budget_tokens: Option<u32>,
 }
 
-fn load_file_config(path_override: Option<String>) -> Result<FileConfig> {
+fn load_file_config(path_override: Option<PathBuf>) -> Result<FileConfig> {
     let explicit = path_override.is_some();
     let path = match path_override {
         Some(path) => PathBuf::from(path),
@@ -74,10 +82,7 @@ fn load_file_config(path_override: Option<String>) -> Result<FileConfig> {
 
     if !path.exists() {
         if explicit {
-            return Err(anyhow!(
-                "KNUTH_CONFIG points to missing file: {}",
-                path.display()
-            ));
+            return Err(anyhow!("config file does not exist: {}", path.display()));
         }
         return Ok(FileConfig::default());
     }
@@ -284,11 +289,7 @@ fn env_value(name: &str) -> Option<String> {
 
 fn nonempty(value: String) -> Option<String> {
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn nonempty_ref(value: &String) -> Option<String> {

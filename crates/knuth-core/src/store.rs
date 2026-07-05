@@ -120,9 +120,7 @@ pub trait EventStore: Send + Sync + Debug {
             if event.parent_hash != expected_parent_hash {
                 return Err(EventStoreError::RangeFailed(format!(
                     "Broken hash chain at seq {}: expected parent {:?}, got {:?}",
-                    event.stream_seq,
-                    expected_parent_hash,
-                    event.parent_hash,
+                    event.stream_seq, expected_parent_hash, event.parent_hash,
                 )));
             }
 
@@ -131,9 +129,7 @@ pub trait EventStore: Send + Sync + Debug {
             if event.hash != expected_hash {
                 return Err(EventStoreError::RangeFailed(format!(
                     "Invalid event hash at seq {}: expected {}, got {}",
-                    event.stream_seq,
-                    expected_hash,
-                    event.hash,
+                    event.stream_seq, expected_hash, event.hash,
                 )));
             }
 
