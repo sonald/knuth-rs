@@ -1,4 +1,4 @@
-//! TODO: 1:1 port of `packages/ai/src/providers/images/openrouter.ts`.
+//! OpenRouter image generation placeholder. The Rust images API is explicitly unsupported.
 
 use crate::types::ImagesModel;
 
@@ -7,6 +7,6 @@ pub struct ImagesEntry;
 
 impl ImagesEntry {
     pub async fn generate(&self, _model: &ImagesModel) -> Result<(), String> {
-        Err("openrouter-images not yet implemented".into())
+        Err("image generation is not supported in the Rust ai crate".into())
     }
 }

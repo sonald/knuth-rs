@@ -56,7 +56,7 @@ impl<S> AwsEventStream<S> {
         let headers_end = headers_start + headers_len;
         let payload_end = total_len - 4; // trailing message CRC
         if headers_end > frame.len() || payload_end > frame.len() || headers_end > payload_end {
-            return Some(EventStreamMessage::default());
+            return Some(malformed_message());
         }
 
         let mut msg = EventStreamMessage {
@@ -65,6 +65,13 @@ impl<S> AwsEventStream<S> {
         };
         decode_headers(&frame[headers_start..headers_end], &mut msg);
         Some(msg)
+    }
+}
+
+fn malformed_message() -> EventStreamMessage {
+    EventStreamMessage {
+        exception_type: Some("malformed-eventstream-frame".into()),
+        ..Default::default()
     }
 }
 
@@ -208,5 +215,20 @@ mod tests {
         let mut s = AwsEventStream::new(futures::stream::empty::<Result<Bytes, reqwest::Error>>());
         s.buf.extend_from_slice(&bytes[..8]); // truncated
         assert!(s.try_decode().is_none());
+    }
+
+    #[test]
+    fn malformed_frame_returns_exception_message() {
+        let mut bytes = frame("messageStop", b"{}");
+        bytes[4..8].copy_from_slice(&999u32.to_be_bytes());
+        let mut s = AwsEventStream::new(futures::stream::empty::<Result<Bytes, reqwest::Error>>());
+        s.buf.extend_from_slice(&bytes);
+
+        let msg = s.try_decode().expect("malformed frame marker");
+        assert_eq!(
+            msg.exception_type.as_deref(),
+            Some("malformed-eventstream-frame")
+        );
+        assert!(msg.event_type.is_none());
     }
 }

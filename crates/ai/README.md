@@ -33,7 +33,8 @@ adaptive thinking variants, image generation).
 | Cross-provider transform_messages | implemented (image downgrade, thinking, id normalize, synthetic results) |
 | Context-overflow detection (`overflow.rs`) | implemented — all provider error patterns |
 | Anthropic OAuth (PKCE) | implemented — authorize URL, local listener, exchange, refresh |
-| OpenAI Codex / Copilot OAuth, Images | stub |
+| OpenAI Codex / Copilot OAuth | stub |
+| Images | unsupported — `images(...)` returns an explicit error |
 
 Mock-SSE end-to-end tests (`tests/anthropic_sse_e2e.rs`) prove the shared HTTP→SSE→event pipeline
 against a local server (no API key). `scripts/regen_models.sh` regenerates the model catalog from
@@ -54,7 +55,7 @@ src/
   stream.rs                      stream() / streamSimple() / complete()
   api_registry.rs                registerApiProvider / getApiProvider
   models.rs / models_generated.rs
-  images.rs / image_models.rs
+  images.rs / image_models.rs      image generation model metadata; generation unsupported
   env_api_keys.rs
   oauth.rs
   session_resources.rs

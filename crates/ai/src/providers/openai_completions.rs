@@ -473,7 +473,11 @@ fn build_request_body(model: &Model, context: &Context, options: &StreamOptions)
         "stream_options": { "include_usage": true },
     });
     if let Some(max) = options.max_tokens {
-        body["max_tokens"] = json!(max);
+        if uses_max_tokens_field(model) {
+            body["max_tokens"] = json!(max);
+        } else {
+            body["max_completion_tokens"] = json!(max);
+        }
     }
     if let Some(t) = options.temperature {
         body["temperature"] = json!(t);
@@ -487,6 +491,19 @@ fn build_request_body(model: &Model, context: &Context, options: &StreamOptions)
         body["reasoning_effort"] = effort.clone();
     }
     body
+}
+
+fn uses_max_tokens_field(model: &Model) -> bool {
+    match model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.get("maxTokensField"))
+        .and_then(|field| field.as_str())
+    {
+        Some("max_tokens") => true,
+        Some("max_completion_tokens") => false,
+        _ => !model.reasoning && !model.id.starts_with('o'),
+    }
 }
 
 fn serialize_tools(tools: &[Tool]) -> Vec<Value> {
@@ -678,6 +695,78 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn reasoning_models_use_max_completion_tokens() {
+        let mut m = mk_model();
+        m.id = "o3-mini".into();
+        m.reasoning = true;
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("hi".into()),
+                timestamp: 0,
+            })],
+            tools: None,
+        };
+        let opts = StreamOptions {
+            max_tokens: Some(123),
+            ..Default::default()
+        };
+        let body = build_request_body(&m, &ctx, &opts);
+
+        assert_eq!(body["max_completion_tokens"], 123);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn o_series_models_use_max_completion_tokens() {
+        let mut m = mk_model();
+        m.id = "o3-mini".into();
+        m.reasoning = false;
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("hi".into()),
+                timestamp: 0,
+            })],
+            tools: None,
+        };
+        let opts = StreamOptions {
+            max_tokens: Some(123),
+            ..Default::default()
+        };
+        let body = build_request_body(&m, &ctx, &opts);
+
+        assert_eq!(body["max_completion_tokens"], 123);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn compat_can_force_legacy_max_tokens_field() {
+        let mut m = mk_model();
+        m.reasoning = true;
+        m.compat = Some(json!({ "maxTokensField": "max_tokens" }));
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("hi".into()),
+                timestamp: 0,
+            })],
+            tools: None,
+        };
+        let opts = StreamOptions {
+            max_tokens: Some(123),
+            ..Default::default()
+        };
+        let body = build_request_body(&m, &ctx, &opts);
+
+        assert_eq!(body["max_tokens"], 123);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

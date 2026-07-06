@@ -434,11 +434,11 @@ fn convert_messages(msgs: &[Message]) -> Vec<Value> {
                     }
                 }
                 let mut msg = json!({ "role": "assistant" });
-                msg["content"] = if text.is_empty() {
-                    json!("")
-                } else {
-                    json!(text)
-                };
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                } else if tool_calls.is_empty() {
+                    msg["content"] = json!("");
+                }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
                 }
@@ -496,6 +496,35 @@ fn push_error(sender: &mut AssistantMessageEventSender, model: &Model, msg: Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_only_tool_call_omits_empty_content() {
+        let mut args = Map::new();
+        args.insert("q".into(), json!("x"));
+        let messages = convert_messages(&[Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "abcdef123".into(),
+                name: "search".into(),
+                arguments: args,
+                thought_signature: None,
+            })],
+            api: Api::known(KnownApi::MistralConversations),
+            provider: Provider::from("mistral"),
+            model: "mistral-large".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        })]);
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(messages[0].get("content").is_none());
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "abcdef123");
+    }
 
     #[test]
     fn tool_call_id_normalizes_to_len_9() {

@@ -39,7 +39,7 @@ pub struct SignedRequest {
 }
 
 pub fn sign(req: &SigningRequest<'_>) -> SignedRequest {
-    let date = &req.amz_date[..8]; // YYYYMMDD
+    let date = req.amz_date.get(..8).unwrap_or(req.amz_date); // YYYYMMDD when valid.
     let payload_hash = hex::encode(Sha256::digest(req.payload));
 
     // Compose all headers we'll sign. Caller headers + host + x-amz-date + content-hash +
@@ -269,6 +269,26 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "x-amz-security-token" && v == "token123")
         );
+    }
+
+    #[test]
+    fn short_amz_date_does_not_panic() {
+        let url = url::Url::parse("https://example.amazonaws.com/").unwrap();
+        let req = SigningRequest {
+            method: "GET",
+            url: &url,
+            headers: &[],
+            payload: b"",
+            region: "us-east-1",
+            service: "service",
+            access_key: "AKIDEXAMPLE",
+            secret_key: "secret",
+            session_token: None,
+            amz_date: "bad",
+        };
+
+        let signed = sign(&req);
+        assert!(signed.authorization.contains("Credential=AKIDEXAMPLE/bad/"));
     }
 
     #[test]

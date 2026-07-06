@@ -5,11 +5,11 @@
 //! This exercises the same SSE machinery every provider shares, so a regression here would also
 //! affect OpenAI Responses / Completions.
 
-use futures::StreamExt;
-use pie_ai::{
+use ai::{
     Api, AssistantMessageEvent, ContentBlock, Context, ErrorReason, KnownApi, Message, Model,
     ModelCost, Provider, StopReason, StreamOptions, UserContent, UserMessage, UserRole, stream,
 };
+use futures::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -179,7 +179,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .and_then(|v| v.as_str()),
         Some("sf")
     );
-    assert_eq!(done_reason, Some(pie_ai::DoneReason::ToolUse));
+    assert_eq!(done_reason, Some(ai::DoneReason::ToolUse));
 }
 
 #[tokio::test]
@@ -202,6 +202,44 @@ async fn http_error_becomes_error_event() {
         }
     }
     assert_eq!(error_msg.as_deref(), Some("overloaded"));
+}
+
+#[tokio::test]
+async fn refusal_stop_reason_becomes_error_event() {
+    let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_refusal\",\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    let base = serve_once(body).await;
+    let model = anthropic_model(base);
+    let opts = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+
+    let mut s = stream(&model, &user_ctx("nope"), Some(&opts));
+    let mut saw_error = false;
+    let mut saw_done = false;
+    while let Some(ev) = s.next().await {
+        match ev {
+            AssistantMessageEvent::Error { error, .. } => {
+                saw_error = true;
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert!(
+                    error
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("refusal")
+                );
+            }
+            AssistantMessageEvent::Done { .. } => saw_done = true,
+            _ => {}
+        }
+    }
+
+    assert!(saw_error, "refusal should emit an error event");
+    assert!(!saw_done, "refusal must not be reported as Done");
 }
 
 #[tokio::test]

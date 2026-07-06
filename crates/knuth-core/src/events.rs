@@ -6,6 +6,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnEndReason {
     Success,
+    Length,
+    ToolUse,
     Error,
     Cancelled,
 }

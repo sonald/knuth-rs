@@ -48,6 +48,7 @@ struct Compat {
     supports_long_cache_retention: bool,
     send_session_affinity_headers: bool,
     supports_cache_control_on_tools: bool,
+    allow_empty_signature: bool,
     #[allow(dead_code)]
     supports_eager_tool_input_streaming: bool,
 }
@@ -74,6 +75,7 @@ fn resolve_compat(model: &Model) -> Compat {
             is_fireworks || is_cf_anthropic,
         ),
         supports_cache_control_on_tools: read_bool("supportsCacheControlOnTools", !is_fireworks),
+        allow_empty_signature: read_bool("allowEmptySignature", false),
         supports_eager_tool_input_streaming: read_bool(
             "supportsEagerToolInputStreaming",
             !is_fireworks,
@@ -344,6 +346,16 @@ fn handle_sse(
             }
         }
         "message_stop" => {
+            if partial.stop_reason == StopReason::Error {
+                if partial.error_message.is_none() {
+                    partial.error_message = Some("anthropic refusal".into());
+                }
+                sender.push(AssistantMessageEvent::Error {
+                    reason: ErrorReason::Error,
+                    error: partial.clone(),
+                });
+                return false;
+            }
             let reason = match partial.stop_reason {
                 StopReason::ToolUse => DoneReason::ToolUse,
                 StopReason::Length => DoneReason::Length,
@@ -541,7 +553,7 @@ fn map_stop_reason(s: &str) -> StopReason {
         "end_turn" => StopReason::Stop,
         "max_tokens" => StopReason::Length,
         "tool_use" => StopReason::ToolUse,
-        "refusal" => StopReason::Stop,
+        "refusal" => StopReason::Error,
         _ => StopReason::Stop,
     }
 }
@@ -555,19 +567,19 @@ fn ensure_block(partial: &mut AssistantMessage, idx: usize, default: ContentBloc
 
 fn update_usage(usage: &mut Usage, val: &Value) {
     if let Some(n) = val.get("input_tokens").and_then(|v| v.as_u64()) {
-        usage.input += n;
+        usage.input = n;
     }
     if let Some(n) = val.get("output_tokens").and_then(|v| v.as_u64()) {
-        usage.output += n;
+        usage.output = n;
     }
     if let Some(n) = val.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-        usage.cache_read += n;
+        usage.cache_read = n;
     }
     if let Some(n) = val
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
     {
-        usage.cache_write += n;
+        usage.cache_write = n;
     }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
@@ -585,7 +597,7 @@ fn build_request_body(
     let retention = options.cache_retention.unwrap_or(CacheRetention::Short);
     let cache_control = build_cache_control(retention, compat);
 
-    let messages = convert_messages(&context.messages, cache_control.as_ref());
+    let messages = convert_messages(&context.messages, cache_control.as_ref(), compat);
 
     let mut body = json!({
         "model": model.id,
@@ -661,12 +673,14 @@ fn serialize_tools(tools: &[Tool], cc: Option<&Value>, compat: &Compat) -> Vec<V
         .collect()
 }
 
-fn convert_messages(msgs: &[Message], cc: Option<&Value>) -> Vec<Value> {
+fn convert_messages(msgs: &[Message], cc: Option<&Value>, compat: &Compat) -> Vec<Value> {
     let last_user_idx = msgs
         .iter()
         .rposition(|m| matches!(m, Message::User(_) | Message::ToolResult(_)));
     let mut out = Vec::with_capacity(msgs.len());
-    for (i, m) in msgs.iter().enumerate() {
+    let mut i = 0;
+    while i < msgs.len() {
+        let m = &msgs[i];
         let apply_cc = cc.filter(|_| Some(i) == last_user_idx);
         match m {
             Message::User(u) => {
@@ -674,26 +688,39 @@ fn convert_messages(msgs: &[Message], cc: Option<&Value>) -> Vec<Value> {
                 out.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant(a) => {
-                let arr: Vec<Value> = a.content.iter().map(content_block_to_value).collect();
+                let arr: Vec<Value> = a
+                    .content
+                    .iter()
+                    .filter_map(|b| content_block_to_value(b, compat))
+                    .collect();
                 out.push(json!({ "role": "assistant", "content": arr }));
             }
-            Message::ToolResult(tr) => {
-                let inner: Vec<Value> = tr.content.iter().map(user_block_to_value).collect();
-                let mut result_block = json!({
-                    "type": "tool_result",
-                    "tool_use_id": tr.tool_call_id,
-                    "is_error": tr.is_error,
-                    "content": inner,
-                });
-                if let Some(cc) = apply_cc {
-                    result_block["cache_control"] = cc.clone();
+            Message::ToolResult(_) => {
+                let start = i;
+                let mut blocks = Vec::new();
+                while let Some(Message::ToolResult(tr)) = msgs.get(i) {
+                    let inner: Vec<Value> = tr.content.iter().map(user_block_to_value).collect();
+                    let mut result_block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": tr.tool_call_id,
+                        "is_error": tr.is_error,
+                        "content": inner,
+                    });
+                    if cc.is_some() && Some(i) == last_user_idx {
+                        result_block["cache_control"] = cc.unwrap().clone();
+                    }
+                    blocks.push(result_block);
+                    i += 1;
                 }
                 out.push(json!({
                     "role": "user",
-                    "content": [result_block],
+                    "content": blocks,
                 }));
+                debug_assert!(i > start);
+                continue;
             }
         }
+        i += 1;
     }
     out
 }
@@ -727,26 +754,43 @@ fn user_block_to_value(b: &UserContentBlock) -> Value {
     }
 }
 
-fn content_block_to_value(b: &ContentBlock) -> Value {
+fn content_block_to_value(b: &ContentBlock, compat: &Compat) -> Option<Value> {
     match b {
-        ContentBlock::Text(t) => json!({ "type": "text", "text": t.text }),
+        ContentBlock::Text(t) => Some(json!({ "type": "text", "text": t.text })),
         ContentBlock::Thinking(t) => {
-            let mut v = json!({ "type": "thinking", "thinking": t.thinking });
-            if let Some(sig) = &t.thinking_signature {
-                v["signature"] = json!(sig);
+            if t.redacted {
+                return t
+                    .thinking_signature
+                    .as_ref()
+                    .filter(|sig| !sig.is_empty())
+                    .map(|sig| json!({ "type": "redacted_thinking", "data": sig }));
             }
-            v
+            if let Some(sig) = t.thinking_signature.as_ref().filter(|sig| !sig.is_empty()) {
+                return Some(json!({
+                    "type": "thinking",
+                    "thinking": t.thinking,
+                    "signature": sig,
+                }));
+            }
+            if compat.allow_empty_signature {
+                return Some(json!({
+                    "type": "thinking",
+                    "thinking": t.thinking,
+                    "signature": "",
+                }));
+            }
+            Some(json!({ "type": "text", "text": t.thinking }))
         }
-        ContentBlock::Image(i) => json!({
+        ContentBlock::Image(i) => Some(json!({
             "type": "image",
             "source": { "type": "base64", "media_type": i.mime_type, "data": i.data },
-        }),
-        ContentBlock::ToolCall(tc) => json!({
+        })),
+        ContentBlock::ToolCall(tc) => Some(json!({
             "type": "tool_use",
             "id": tc.id,
             "name": tc.name,
             "input": tc.arguments,
-        }),
+        })),
     }
 }
 
@@ -797,6 +841,161 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn cumulative_usage_replaces_delta_values() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 1,
+                "cache_creation_input_tokens": 2,
+            }),
+        );
+        update_usage(&mut usage, &json!({ "output_tokens": 2 }));
+        update_usage(
+            &mut usage,
+            &json!({
+                "output_tokens": 5,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+            }),
+        );
+
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_read, 3);
+        assert_eq!(usage.cache_write, 4);
+        assert_eq!(usage.total_tokens, 22);
+    }
+
+    #[test]
+    fn redacted_thinking_serializes_as_redacted_thinking() {
+        let messages = convert_messages(
+            &[Message::Assistant(AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "[Reasoning redacted]".into(),
+                    thinking_signature: Some("opaque-data".into()),
+                    redacted: true,
+                })],
+                api: Api::known(KnownApi::AnthropicMessages),
+                provider: Provider::from("anthropic"),
+                model: "claude-test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            })],
+            None,
+            &resolve_compat(&mk_model()),
+        );
+
+        assert_eq!(messages[0]["content"][0]["type"], "redacted_thinking");
+        assert_eq!(messages[0]["content"][0]["data"], "opaque-data");
+        assert!(messages[0]["content"][0].get("thinking").is_none());
+        assert!(messages[0]["content"][0].get("signature").is_none());
+    }
+
+    #[test]
+    fn thinking_without_signature_downgrades_to_text_by_default() {
+        let messages = convert_messages(
+            &[Message::Assistant(AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "private thought".into(),
+                    thinking_signature: None,
+                    redacted: false,
+                })],
+                api: Api::known(KnownApi::AnthropicMessages),
+                provider: Provider::from("anthropic"),
+                model: "claude-test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            })],
+            None,
+            &resolve_compat(&mk_model()),
+        );
+
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][0]["text"], "private thought");
+    }
+
+    #[test]
+    fn compat_can_preserve_empty_thinking_signature() {
+        let mut m = mk_model();
+        m.compat = Some(json!({ "allowEmptySignature": true }));
+        let messages = convert_messages(
+            &[Message::Assistant(AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "provider accepts this".into(),
+                    thinking_signature: None,
+                    redacted: false,
+                })],
+                api: Api::known(KnownApi::AnthropicMessages),
+                provider: Provider::from("anthropic"),
+                model: "claude-test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            })],
+            None,
+            &resolve_compat(&m),
+        );
+
+        assert_eq!(messages[0]["content"][0]["type"], "thinking");
+        assert_eq!(messages[0]["content"][0]["signature"], "");
+    }
+
+    #[test]
+    fn consecutive_tool_results_merge_into_one_user_message() {
+        let messages = convert_messages(
+            &[
+                Message::ToolResult(ToolResultMessage {
+                    role: ToolResultRole::ToolResult,
+                    tool_call_id: "tool_1".into(),
+                    tool_name: "one".into(),
+                    content: vec![UserContentBlock::text("first")],
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    role: ToolResultRole::ToolResult,
+                    tool_call_id: "tool_2".into(),
+                    tool_name: "two".into(),
+                    content: vec![UserContentBlock::text("second")],
+                    details: None,
+                    is_error: true,
+                    timestamp: 0,
+                }),
+            ],
+            None,
+            &resolve_compat(&mk_model()),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[0]["content"][0]["tool_use_id"], "tool_1");
+        assert_eq!(messages[0]["content"][1]["tool_use_id"], "tool_2");
+        assert_eq!(messages[0]["content"][1]["is_error"], true);
     }
 
     #[test]

@@ -1,14 +1,33 @@
-//! Top-level images API. 1:1 stub of `packages/ai/src/images.ts`.
+//! Top-level images API. Image generation is not implemented in this Rust port yet.
 
-use crate::images_api_registry::get_images_api_provider;
 use crate::types::{AssistantImages, ImagesContext, ImagesModel};
 
 pub async fn images(
-    model: &ImagesModel,
-    context: &ImagesContext,
+    _model: &ImagesModel,
+    _context: &ImagesContext,
 ) -> Result<AssistantImages, String> {
-    crate::providers::images::register_builtins::ensure();
-    let entry = get_images_api_provider(&model.api)
-        .ok_or_else(|| format!("No images API registered for: {}", model.api.0))?;
-    entry.generate(model, context).await
+    Err("image generation is not supported in the Rust ai crate".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ImagesApi, ImagesProvider, ModelCost};
+
+    #[tokio::test]
+    async fn images_returns_clear_unsupported_error() {
+        let model = ImagesModel {
+            id: "image-model".into(),
+            name: "Image Model".into(),
+            api: ImagesApi("openrouter-images".into()),
+            provider: ImagesProvider("openrouter".into()),
+            base_url: String::new(),
+            input: vec![],
+            output: vec![],
+            cost: ModelCost::default(),
+            headers: None,
+        };
+        let err = images(&model, &ImagesContext::default()).await.unwrap_err();
+        assert!(err.contains("not supported"));
+    }
 }

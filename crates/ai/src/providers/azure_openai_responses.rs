@@ -3,7 +3,7 @@
 //!
 //! Azure speaks the same Responses wire protocol as OpenAI, so it reuses
 //! [`openai_responses::consume_responses_sse`] and `build_request_body`. Azure-specific:
-//! - URL: `{base}/openai/v1/responses?api-version={ver}` (resource-name host)
+//! - URL: `{base}/openai/v1/responses` (resource-name host)
 //! - Auth via `api-key` header instead of Bearer
 //! - deployment-name resolution (option → AZURE_OPENAI_DEPLOYMENT_NAME_MAP → model id)
 //!
@@ -21,8 +21,6 @@ use crate::providers::openai_responses::{
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
-
-const DEFAULT_AZURE_API_VERSION: &str = "v1";
 
 #[derive(Default)]
 pub struct AzureOpenAIResponsesProvider {}
@@ -98,6 +96,26 @@ fn resolve_deployment_name(model: &Model, options: &StreamOptions) -> String {
     model.id.clone()
 }
 
+fn azure_responses_url(base_url: &str, options: &StreamOptions) -> String {
+    let base = base_url.trim_end_matches('/');
+    let root = if base.ends_with("/openai/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/openai/v1")
+    };
+    let mut url = format!("{root}/responses");
+    if let Some(api_version) = options
+        .provider_extras
+        .get("azure_api_version")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        url.push_str("?api-version=");
+        url.push_str(api_version);
+    }
+    url
+}
+
 async fn run(
     model: Model,
     context: Context,
@@ -140,13 +158,7 @@ async fn run(
         }
     };
 
-    let api_version = options
-        .provider_extras
-        .get("azure_api_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_AZURE_API_VERSION);
-    let base = model.base_url.trim_end_matches('/');
-    let url = format!("{base}/openai/v1/responses?api-version={api_version}");
+    let url = azure_responses_url(&model.base_url, &options);
 
     let mut req = client
         .post(&url)
@@ -227,5 +239,29 @@ mod tests {
         opts.provider_extras
             .insert("azure_deployment_name".into(), json!("my-deploy"));
         assert_eq!(resolve_deployment_name(&m, &opts), "my-deploy");
+    }
+
+    #[test]
+    fn default_url_uses_v1_without_api_version() {
+        let opts = StreamOptions::default();
+        assert_eq!(
+            azure_responses_url("https://my-resource.openai.azure.com", &opts),
+            "https://my-resource.openai.azure.com/openai/v1/responses"
+        );
+        assert_eq!(
+            azure_responses_url("https://my-resource.openai.azure.com/openai/v1/", &opts),
+            "https://my-resource.openai.azure.com/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn explicit_api_version_is_preserved() {
+        let mut opts = StreamOptions::default();
+        opts.provider_extras
+            .insert("azure_api_version".into(), json!("preview"));
+        assert_eq!(
+            azure_responses_url("https://my-resource.openai.azure.com", &opts),
+            "https://my-resource.openai.azure.com/openai/v1/responses?api-version=preview"
+        );
     }
 }

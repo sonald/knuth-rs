@@ -71,13 +71,18 @@ fn to_credentials(t: TokenResponse) -> OAuthCredentials {
     }
 }
 
+fn oauth_client() -> Result<reqwest::Client, String> {
+    crate::utils::node_http_proxy::build_client(Some(30_000))
+        .map_err(|e| format!("http client: {e}"))
+}
+
 /// Exchange an authorization code for tokens.
 pub async fn exchange_authorization_code(
     code: &str,
     state: &str,
     verifier: &str,
 ) -> Result<OAuthCredentials, String> {
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let resp = client
         .post(TOKEN_URL)
         .json(&serde_json::json!({
@@ -109,7 +114,7 @@ pub async fn refresh(creds: &OAuthCredentials) -> Result<OAuthCredentials, Strin
         .refresh_token
         .as_ref()
         .ok_or_else(|| "no refresh token available".to_string())?;
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let resp = client
         .post(TOKEN_URL)
         .json(&serde_json::json!({

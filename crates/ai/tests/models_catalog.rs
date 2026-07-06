@@ -1,7 +1,7 @@
 //! Smoke test for `models_generated.rs`. Validates the JSON catalog parses, the loader
 //! produces a non-empty list, and a handful of well-known models resolve through `get_model`.
 
-use pie_ai::{Provider, get_model, list_apis, list_models};
+use ai::{Provider, get_model, list_apis, list_models};
 
 #[test]
 fn catalog_is_populated() {

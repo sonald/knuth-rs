@@ -21,6 +21,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 use crate::api_registry::ApiProvider;
 use crate::types::*;
@@ -230,6 +231,7 @@ pub(crate) async fn consume_responses_sse(
     abort_token: Option<&tokio_util::sync::CancellationToken>,
 ) {
     let mut partial = empty_partial(model);
+    let mut state = StreamState::default();
     sender.push(AssistantMessageEvent::Start {
         partial: partial.clone(),
     });
@@ -253,17 +255,18 @@ pub(crate) async fn consume_responses_sse(
                 return;
             }
             Ok(ev) => {
-                if !handle_event(&ev, &mut partial, sender) {
+                if !handle_event(&ev, &mut partial, &mut state, sender) {
                     return;
                 }
             }
         }
     }
 
-    partial.stop_reason = StopReason::Stop;
-    sender.push(AssistantMessageEvent::Done {
-        reason: DoneReason::Stop,
-        message: partial,
+    partial.stop_reason = StopReason::Error;
+    partial.error_message = Some("openai-responses stream ended before terminal event".into());
+    sender.push(AssistantMessageEvent::Error {
+        reason: ErrorReason::Error,
+        error: partial,
     });
 }
 
@@ -271,9 +274,17 @@ pub(crate) async fn consume_responses_sse(
 // SSE → event translation
 // ────────────────────────────────────────────────────────────────────────────────────────────
 
+#[derive(Default)]
+struct StreamState {
+    item_to_content: HashMap<String, usize>,
+    output_to_content: HashMap<usize, usize>,
+    tool_arg_buffers: HashMap<usize, String>,
+}
+
 fn handle_event(
     ev: &crate::utils::sse::SseEvent,
     partial: &mut AssistantMessage,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) -> bool {
     let Ok(payload): Result<Value, _> = serde_json::from_str(&ev.data) else {
@@ -290,14 +301,16 @@ fn handle_event(
                 partial.response_id = Some(id.to_string());
             }
         }
-        "response.output_item.added" => on_output_item_added(&payload, partial, sender),
-        "response.output_item.done" => {}
+        "response.output_item.added" => on_output_item_added(&payload, partial, state, sender),
+        "response.output_item.done" => on_output_item_done(&payload, partial, state, sender),
         "response.output_text.delta" => on_text_delta(&payload, partial, sender),
         "response.output_text.done" => on_text_done(&payload, partial, sender),
         "response.reasoning_summary_text.delta" => on_thinking_delta(&payload, partial, sender),
-        "response.reasoning_summary_text.done" => on_thinking_done(&payload, partial, sender),
-        "response.function_call_arguments.delta" => on_tool_args_delta(&payload, partial, sender),
-        "response.function_call_arguments.done" => on_tool_args_done(&payload, partial, sender),
+        "response.reasoning_summary_text.done" => on_thinking_done(&payload, partial),
+        "response.function_call_arguments.delta" => {
+            on_tool_args_delta(&payload, partial, state, sender)
+        }
+        "response.function_call_arguments.done" => on_tool_args_done(&payload, partial, state),
         "response.completed" => {
             if let Some(u) = payload.pointer("/response/usage") {
                 update_usage(&mut partial.usage, u);
@@ -311,6 +324,17 @@ fn handle_event(
             };
             sender.push(AssistantMessageEvent::Done {
                 reason,
+                message: partial.clone(),
+            });
+            return false;
+        }
+        "response.incomplete" => {
+            if let Some(u) = payload.pointer("/response/usage") {
+                update_usage(&mut partial.usage, u);
+            }
+            partial.stop_reason = StopReason::Length;
+            sender.push(AssistantMessageEvent::Done {
+                reason: DoneReason::Length,
                 message: partial.clone(),
             });
             return false;
@@ -338,22 +362,26 @@ fn handle_event(
 fn on_output_item_added(
     payload: &Value,
     partial: &mut AssistantMessage,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
     let item = &payload["item"];
+    let output_index = payload["output_index"].as_u64().map(|n| n as usize);
     match item["type"].as_str().unwrap_or("") {
         "reasoning" => {
             let idx = partial.content.len();
             partial
                 .content
                 .push(ContentBlock::Thinking(ThinkingContent::default()));
+            remember_item_index(item, output_index, idx, state);
             sender.push(AssistantMessageEvent::ThinkingStart {
                 content_index: idx,
                 partial: partial.clone(),
             });
         }
         "function_call" => {
-            let id = item["call_id"].as_str().unwrap_or("").to_string();
+            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+            let id = responses_tool_call_id(&call_id, item["id"].as_str());
             let name = item["name"].as_str().unwrap_or("").to_string();
             let idx = partial.content.len();
             partial.content.push(ContentBlock::ToolCall(ToolCall {
@@ -362,12 +390,139 @@ fn on_output_item_added(
                 arguments: Map::new(),
                 thought_signature: None,
             }));
+            remember_item_index(item, output_index, idx, state);
+            if let Some(args) = item["arguments"].as_str().filter(|s| !s.is_empty()) {
+                state.tool_arg_buffers.insert(idx, args.to_string());
+            }
             sender.push(AssistantMessageEvent::ToolCallStart {
                 content_index: idx,
                 partial: partial.clone(),
             });
         }
         _ => {}
+    }
+}
+
+fn on_output_item_done(
+    payload: &Value,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) {
+    let item = &payload["item"];
+    match item["type"].as_str().unwrap_or("") {
+        "reasoning" => {
+            let Some(idx) = content_index_for_event(payload, state)
+                .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::Thinking(_))))
+            else {
+                return;
+            };
+            let summary = item["summary"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            let content = item["content"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            let mut final_text = None;
+            if let Some(ContentBlock::Thinking(tc)) = partial.content.get_mut(idx) {
+                if !summary.is_empty() || !content.is_empty() {
+                    tc.thinking = if summary.is_empty() { content } else { summary };
+                }
+                tc.thinking_signature = Some(item.to_string());
+                final_text = Some(tc.thinking.clone());
+            }
+            if let Some(content) = final_text {
+                sender.push(AssistantMessageEvent::ThinkingEnd {
+                    content_index: idx,
+                    content,
+                    partial: partial.clone(),
+                });
+            }
+        }
+        "function_call" => {
+            let Some(idx) = content_index_for_event(payload, state)
+                .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
+            else {
+                return;
+            };
+            let raw = item["arguments"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| state.tool_arg_buffers.remove(&idx))
+                .unwrap_or_default();
+            if let Ok(Value::Object(map)) = crate::utils::json_parse::parse_partial_json(&raw) {
+                if let Some(ContentBlock::ToolCall(tc)) = partial.content.get_mut(idx) {
+                    tc.arguments = map;
+                }
+            }
+            if let Some(ContentBlock::ToolCall(tc)) = partial.content.get(idx).cloned() {
+                sender.push(AssistantMessageEvent::ToolCallEnd {
+                    content_index: idx,
+                    tool_call: tc,
+                    partial: partial.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remember_item_index(
+    item: &Value,
+    output_index: Option<usize>,
+    content_index: usize,
+    state: &mut StreamState,
+) {
+    if let Some(id) = item["id"].as_str().filter(|s| !s.is_empty()) {
+        state.item_to_content.insert(id.to_string(), content_index);
+    }
+    if let Some(index) = output_index {
+        state.output_to_content.insert(index, content_index);
+    }
+}
+
+fn content_index_for_event(payload: &Value, state: &StreamState) -> Option<usize> {
+    payload["item_id"]
+        .as_str()
+        .and_then(|id| state.item_to_content.get(id).copied())
+        .or_else(|| {
+            payload["output_index"]
+                .as_u64()
+                .and_then(|n| state.output_to_content.get(&(n as usize)).copied())
+        })
+        .or_else(|| {
+            payload["item"]["id"]
+                .as_str()
+                .and_then(|id| state.item_to_content.get(id).copied())
+        })
+}
+
+fn find_last_block(
+    partial: &AssistantMessage,
+    pred: impl Fn(&ContentBlock) -> bool,
+) -> Option<usize> {
+    partial.content.iter().rposition(pred)
+}
+
+fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
+    match item_id.filter(|id| !id.is_empty()) {
+        Some(item_id) => format!("{call_id}|{item_id}"),
+        None => call_id.to_string(),
     }
 }
 
@@ -452,11 +607,7 @@ fn on_thinking_delta(
     });
 }
 
-fn on_thinking_done(
-    payload: &Value,
-    partial: &mut AssistantMessage,
-    sender: &mut AssistantMessageEventSender,
-) {
+fn on_thinking_done(payload: &Value, partial: &mut AssistantMessage) {
     if let Some(idx) = partial
         .content
         .iter()
@@ -466,25 +617,27 @@ fn on_thinking_done(
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        sender.push(AssistantMessageEvent::ThinkingEnd {
-            content_index: idx,
-            content,
-            partial: partial.clone(),
-        });
+        if let Some(ContentBlock::Thinking(tc)) = partial.content.get_mut(idx) {
+            tc.thinking = content;
+        }
     }
 }
 
 fn on_tool_args_delta(
     payload: &Value,
     partial: &mut AssistantMessage,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    if let Some(idx) = partial
-        .content
-        .iter()
-        .rposition(|b| matches!(b, ContentBlock::ToolCall(_)))
+    if let Some(idx) = content_index_for_event(payload, state)
+        .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
     {
+        state
+            .tool_arg_buffers
+            .entry(idx)
+            .or_default()
+            .push_str(&delta);
         sender.push(AssistantMessageEvent::ToolCallDelta {
             content_index: idx,
             delta,
@@ -493,30 +646,18 @@ fn on_tool_args_delta(
     }
 }
 
-fn on_tool_args_done(
-    payload: &Value,
-    partial: &mut AssistantMessage,
-    sender: &mut AssistantMessageEventSender,
-) {
-    let Some(idx) = partial
-        .content
-        .iter()
-        .rposition(|b| matches!(b, ContentBlock::ToolCall(_)))
+fn on_tool_args_done(payload: &Value, partial: &mut AssistantMessage, state: &mut StreamState) {
+    let Some(idx) = content_index_for_event(payload, state)
+        .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
     else {
         return;
     };
     let raw = payload["arguments"].as_str().unwrap_or("");
+    state.tool_arg_buffers.insert(idx, raw.to_string());
     if let Ok(Value::Object(map)) = crate::utils::json_parse::parse_partial_json(raw) {
         if let Some(ContentBlock::ToolCall(tc)) = partial.content.get_mut(idx) {
             tc.arguments = map;
         }
-    }
-    if let Some(ContentBlock::ToolCall(tc)) = partial.content.get(idx).cloned() {
-        sender.push(AssistantMessageEvent::ToolCallEnd {
-            content_index: idx,
-            tool_call: tc,
-            partial: partial.clone(),
-        });
     }
 }
 
@@ -689,22 +830,34 @@ pub(crate) fn convert_messages(
                         // Servers that consume reasoning items merge them into
                         // the *following* assistant message, so this must be
                         // emitted before the message / function_call items.
-                        ContentBlock::Thinking(th)
-                            if replay_reasoning && !th.thinking.is_empty() =>
-                        {
-                            out.push(json!({
-                                "type": "reasoning",
-                                "summary": [{ "type": "summary_text", "text": th.thinking }],
-                            }));
+                        ContentBlock::Thinking(th) if replay_reasoning => {
+                            if let Some(raw) = th
+                                .thinking_signature
+                                .as_ref()
+                                .and_then(|sig| serde_json::from_str::<Value>(sig).ok())
+                                .filter(|v| v["type"] == "reasoning")
+                            {
+                                out.push(raw);
+                            } else if !th.thinking.is_empty() {
+                                out.push(json!({
+                                    "type": "reasoning",
+                                    "summary": [{ "type": "summary_text", "text": th.thinking }],
+                                }));
+                            }
                         }
                         ContentBlock::Thinking(_) => {}
                         ContentBlock::ToolCall(tc) => {
-                            function_calls.push(json!({
+                            let (call_id, item_id) = split_responses_tool_call_id(&tc.id);
+                            let mut call = json!({
                                 "type": "function_call",
-                                "call_id": tc.id,
+                                "call_id": call_id,
                                 "name": tc.name,
                                 "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                            }));
+                            });
+                            if let Some(item_id) = item_id {
+                                call["id"] = json!(item_id);
+                            }
+                            function_calls.push(call);
                         }
                         ContentBlock::Image(_) => {}
                     }
@@ -725,13 +878,20 @@ pub(crate) fn convert_messages(
                     .collect();
                 out.push(json!({
                     "type": "function_call_output",
-                    "call_id": tr.tool_call_id,
+                    "call_id": split_responses_tool_call_id(&tr.tool_call_id).0,
                     "output": text_parts.join("\n"),
                 }));
             }
         }
     }
     out
+}
+
+fn split_responses_tool_call_id(id: &str) -> (&str, Option<&str>) {
+    match id.split_once('|') {
+        Some((call_id, item_id)) => (call_id, Some(item_id)),
+        None => (id, None),
+    }
 }
 
 fn user_content_to_value(content: &UserContent) -> Value {
@@ -813,6 +973,9 @@ pub(crate) fn push_error(sender: &mut AssistantMessageEventSender, model: &Model
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn mk_model() -> Model {
         Model {
@@ -920,6 +1083,30 @@ mod tests {
         })
     }
 
+    fn sse_event(kind: &str, payload: Value) -> crate::utils::sse::SseEvent {
+        crate::utils::sse::SseEvent {
+            event: Some(kind.into()),
+            data: payload.to_string(),
+        }
+    }
+
+    fn assistant_message(content: Vec<ContentBlock>) -> Message {
+        Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content,
+            api: Api::known(KnownApi::OpenAIResponses),
+            provider: Provider::from("openai"),
+            model: "gpt-5".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
     #[test]
     fn thinking_replayed_as_reasoning_item_when_compat_requires() {
         // ds4 (DeepSeek V4 local server) does byte-exact KV prefix matching on
@@ -952,6 +1139,90 @@ mod tests {
             reasoning_idx < assistant_idx,
             "reasoning item must precede the assistant message it belongs to"
         );
+    }
+
+    #[test]
+    fn reasoning_item_done_is_captured_and_replayed() {
+        let m = mk_model();
+        let (_stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] },
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{ "type": "summary_text", "text": "checked" }],
+                        "encrypted_content": "enc",
+                    },
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+
+        let Some(ContentBlock::Thinking(thinking)) = partial.content.first() else {
+            panic!("expected thinking block");
+        };
+        assert_eq!(thinking.thinking, "checked");
+        assert_eq!(
+            serde_json::from_str::<Value>(thinking.thinking_signature.as_deref().unwrap()).unwrap()
+                ["encrypted_content"],
+            "enc"
+        );
+
+        let input = convert_messages(
+            &[assistant_message(vec![ContentBlock::Thinking(
+                thinking.clone(),
+            )])],
+            None,
+            true,
+        );
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "enc");
+    }
+
+    #[test]
+    fn empty_summary_reasoning_signature_is_replayed() {
+        let raw = json!({
+            "type": "reasoning",
+            "id": "rs_empty",
+            "summary": [],
+            "encrypted_content": "enc",
+        });
+        let input = convert_messages(
+            &[assistant_message(vec![ContentBlock::Thinking(
+                ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some(raw.to_string()),
+                    redacted: false,
+                },
+            )])],
+            None,
+            true,
+        );
+
+        assert_eq!(input, vec![raw]);
     }
 
     #[test]
@@ -1024,5 +1295,186 @@ mod tests {
         assert_eq!(fc["call_id"], "call_123");
         assert_eq!(fc["name"], "calc");
         assert!(fc["arguments"].as_str().unwrap().contains("\"x\":1"));
+    }
+
+    #[test]
+    fn tool_call_id_preserves_response_item_id_for_replay() {
+        let m = mk_model();
+        let (_stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "calc",
+                        "arguments": "",
+                    },
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+
+        let Some(ContentBlock::ToolCall(tool_call)) = partial.content.first() else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tool_call.id, "call_1|fc_1");
+
+        let input = convert_messages(
+            &[assistant_message(vec![ContentBlock::ToolCall(
+                tool_call.clone(),
+            )])],
+            None,
+            false,
+        );
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["id"], "fc_1");
+    }
+
+    #[test]
+    fn tool_argument_deltas_route_by_item_id() {
+        let m = mk_model();
+        let (_stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (output_index, item_id, call_id, name) in [
+            (0, "fc_1", "call_1", "first"),
+            (1, "fc_2", "call_2", "second"),
+        ] {
+            handle_event(
+                &sse_event(
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": "",
+                        },
+                    }),
+                ),
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+
+        handle_event(
+            &sse_event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "delta": "{\"x\":",
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_2",
+                    "delta": "{\"y\":",
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.function_call_arguments.done",
+                json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "arguments": "{\"x\":1}",
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.function_call_arguments.done",
+                json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_2",
+                    "arguments": "{\"y\":2}",
+                }),
+            ),
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+
+        let args: Vec<_> = partial
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(tc) => Some(tc.arguments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args[0]["x"], 1);
+        assert_eq!(args[1]["y"], 2);
+    }
+
+    async fn serve_once(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn eof_before_terminal_event_emits_error() {
+        let body = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let url = serve_once(body).await;
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+
+        consume_responses_sse(resp, &m, &mut sender, None).await;
+        drop(sender);
+
+        let mut saw_error = false;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Error { error, .. } = event {
+                saw_error = true;
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert!(error.error_message.unwrap().contains("terminal event"));
+            }
+        }
+        assert!(saw_error);
     }
 }
