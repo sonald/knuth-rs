@@ -19,12 +19,6 @@ pub enum SessionEndReason {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnOutcome {
-    pub turn_id: Uuid,
-    pub reason: TurnEndReason,
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserMessageIntent {
     Normal,
@@ -57,33 +51,32 @@ pub enum AgentEvent {
     },
 
     UserMessageCommitted {
-        message_id: Uuid,
         content: UserContent,
         intent: UserMessageIntent,
     },
 
     AssistantMessageTextStarted {
-        message_id: Uuid,
+        content_index: usize,
     },
     AssistantMessageTextDelta {
-        message_id: Uuid,
+        content_index: usize,
         delta: String,
     },
     AssistantMessageTextCompleted {
-        message_id: Uuid,
+        content_index: usize,
         text_content: String,
         assistant_message: AssistantMessage,
     },
 
     AssistantMessageThinkingStarted {
-        message_id: Uuid,
+        content_index: usize,
     },
     AssistantMessageThinkingDelta {
-        message_id: Uuid,
+        content_index: usize,
         delta: String,
     },
     AssistantMessageThinkingCompleted {
-        message_id: Uuid,
+        content_index: usize,
         content: String,
     },
 
@@ -167,7 +160,16 @@ fn short_string(s: &str) -> impl std::fmt::Display {
     if s.len() <= 32 {
         return s.to_owned();
     }
-    format!("…{}", s.chars().rev().take(32).collect::<String>().chars().rev().collect::<String>())
+    format!(
+        "…{}",
+        s.chars()
+            .rev()
+            .take(32)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    )
 }
 
 impl std::fmt::Display for AgentEvent {
@@ -195,62 +197,56 @@ impl std::fmt::Display for AgentEvent {
                 )
             }
             AgentEvent::UserMessageCommitted {
-                message_id, intent, ..
+                intent, ..
             } => {
                 write!(
                     f,
-                    "UserMessageCommitted(message_id={}, intent={intent:?})",
-                    short_uuid(message_id)
+                    "UserMessageCommitted(intent={intent:?})",
                 )
             }
-            AgentEvent::AssistantMessageTextStarted { message_id } => {
+            AgentEvent::AssistantMessageTextStarted { content_index } => {
                 write!(
                     f,
-                    "AssistantMessageTextStarted(message_id={})",
-                    short_uuid(message_id)
+                    "AssistantMessageTextStarted(#{content_index})",
                 )
             }
-            AgentEvent::AssistantMessageTextDelta { message_id, delta } => {
+            AgentEvent::AssistantMessageTextDelta { content_index, delta } => {
                 write!(
                     f,
-                    "AssistantMessageTextDelta(message_id={}, delta={delta:?})",
-                    short_uuid(message_id)
+                    "AssistantMessageTextDelta(#{content_index}, delta={})",
+                    short_string(delta)
                 )
             }
             AgentEvent::AssistantMessageTextCompleted {
-                message_id,
+                content_index,
                 text_content,
                 ..
             } => {
                 write!(
                     f,
-                    "AssistantMessageTextCompleted(message_id={}, text_content={})",
-                    short_uuid(message_id),
+                    "AssistantMessageTextCompleted(#{content_index}, text_content={})",
                     short_string(text_content)
                 )
             }
-            AgentEvent::AssistantMessageThinkingStarted { message_id } => {
+            AgentEvent::AssistantMessageThinkingStarted { content_index } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingStarted(message_id={})",
-                    short_uuid(message_id)
+                    "AssistantMessageThinkingStarted(#{content_index})",
                 )
             }
-            AgentEvent::AssistantMessageThinkingDelta { message_id, delta } => {
+            AgentEvent::AssistantMessageThinkingDelta { content_index, delta } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingDelta(message_id={}, delta={delta:?})",
-                    short_uuid(message_id)
+                    "AssistantMessageThinkingDelta(#{content_index}, delta={delta:?})",
                 )
             }
             AgentEvent::AssistantMessageThinkingCompleted {
-                message_id,
+                content_index,
                 content,
             } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingCompleted(message_id={}, content={})",
-                    short_uuid(message_id),
+                    "AssistantMessageThinkingCompleted(#{content_index}, content={})",
                     short_string(content)
                 )
             }

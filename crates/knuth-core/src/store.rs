@@ -76,13 +76,26 @@ impl StoredEvent {
     }
 }
 
+fn short_hash(s: &str) -> String {
+    format!( "{}", s.chars().take(8).collect::<String>())
+}
+
+
+impl std::fmt::Display for StoredEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}: {}: ts: {}, hash: {}, parent_hash: {}",
+        self.stream_seq, self.event, self.timestamp, short_hash(&self.hash),
+         self.parent_hash.as_deref().map(|h| short_hash(h)).unwrap_or_default())
+    }
+}
+
 pub struct AgentSubscription {
-    rx: mpsc::Receiver<AgentEvent>,
+    rx: mpsc::Receiver<StoredEvent>,
     pub id: Uuid,
 }
 
 impl AgentSubscription {
-    pub fn new(rx: mpsc::Receiver<AgentEvent>) -> Self {
+    pub fn new(rx: mpsc::Receiver<StoredEvent>) -> Self {
         Self {
             rx,
             id: Uuid::now_v7(),
@@ -91,7 +104,7 @@ impl AgentSubscription {
 }
 
 impl Stream for AgentSubscription {
-    type Item = AgentEvent;
+    type Item = StoredEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)

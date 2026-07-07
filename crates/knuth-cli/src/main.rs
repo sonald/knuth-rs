@@ -106,7 +106,7 @@ async fn oneshot(
 
     tokio::spawn(async move {
         while let Some(event) = subscription.next().await {
-            match event {
+            match event.event {
                 AgentEvent::AssistantMessageTextDelta { delta, .. } => {
                     print!("{}", delta.green());
                 }
@@ -165,7 +165,7 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
     let mut subscription = session.subscribe(None).await?;
     tokio::spawn(async move {
         while let Some(event) = subscription.next().await {
-            match event {
+            match event.event {
                 AgentEvent::AssistantMessageTextDelta { delta, .. } => {
                     print!("{}", delta.green());
                 }

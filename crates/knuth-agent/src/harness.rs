@@ -1,19 +1,19 @@
+use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
-use async_trait::async_trait;
 
-use crate::{Actor, ActorContext, ActorRuntime, AgentTurnRunner, spawn_actor};
 use crate::agent_loop::AgentTurnLoopError;
+use crate::{Actor, ActorContext, ActorRuntime, AgentTurnRunner, spawn_actor};
 use ai::{
-    ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock, UserMessage,
-    UserRole,
+    AssistantMessage, ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock,
+    UserMessage, UserRole,
 };
-use chrono::Utc;
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore, SessionEndReason, StoredEvent, TurnOutcome, UserMessageIntent,
+    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore,
+    SessionEndReason, StoredEvent, TurnEndReason, UserMessageIntent,
 };
-use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
@@ -84,9 +84,10 @@ impl ConversationState {
     pub fn apply_event(&mut self, event: StoredEvent) {
         match event.event {
             AgentEvent::AgentTurnEnded {
-                assistant_message: Some(message), ..
+                assistant_message: Some(assistant_message),
+                ..
             } => {
-                self.add_message(Message::Assistant(message));
+                self.add_message(Message::Assistant(assistant_message));
             }
             AgentEvent::UserMessageCommitted { content, .. } => {
                 self.add_message(Message::User(UserMessage {
@@ -126,13 +127,17 @@ struct PendingInput {
 
 pub enum AgentActorMessage {
     Command(AgentCommand),
-    Turn(TurnMessage)
+    Turn(Uuid, TurnMessage),
 }
 
 #[derive(Debug)]
 pub enum TurnMessage {
     Event(AgentEvent),
-    Finished(Result<TurnOutcome, AgentTurnLoopError>),
+    Finished {
+        reason: TurnEndReason,
+        error: Option<AgentTurnLoopError>,
+        assistant_message: Option<AssistantMessage>,
+    },
 }
 
 pub enum AgentCommand {
@@ -141,14 +146,13 @@ pub enum AgentCommand {
         intent: UserMessageIntent,
         input: String,
         images: Vec<ImageContent>, // save for later use
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), AgentSessionError>>,
     },
     Subscribe {
         from_seq: Option<u64>,
         reply: oneshot::Sender<AgentSubscription>,
     },
     Cancel {},
-    Stop {},
 }
 
 impl std::fmt::Display for AgentCommand {
@@ -158,7 +162,6 @@ impl std::fmt::Display for AgentCommand {
             AgentCommand::SubmitInput { .. } => write!(f, "SubmitInput"),
             AgentCommand::Subscribe { .. } => write!(f, "Subscribe"),
             AgentCommand::Cancel {} => write!(f, "Cancel"),
-            AgentCommand::Stop {} => write!(f, "Stop"),
         }
     }
 }
@@ -170,13 +173,12 @@ pub(crate) struct AgentActor {
     conversation_state: ConversationState,
     config: AgentConfig,
 
-    subscriptions: Vec<mpsc::Sender<AgentEvent>>,
+    subscriptions: Vec<mpsc::Sender<StoredEvent>>,
     store: Box<dyn EventStore>,
 
     state: AgentActorState,
 
     pending_input_queue: VecDeque<PendingInput>,
-
 }
 
 #[async_trait]
@@ -184,7 +186,12 @@ impl Actor for AgentActor {
     type Message = AgentActorMessage;
 
     async fn on_start(&mut self, ctx: &mut ActorContext<Self::Message>) {
-        match self.persist_and_publish(AgentEvent::SessionStarted { session_id: self.id }).await {
+        match self
+            .persist_and_publish(AgentEvent::SessionStarted {
+                session_id: self.id,
+            })
+            .await
+        {
             Ok(_) => {
                 debug!("Session started");
             }
@@ -194,8 +201,12 @@ impl Actor for AgentActor {
             }
         }
     }
-    
-    async fn handle(&mut self, message: Self::Message, ctx: &mut ActorContext<Self::Message>) -> ControlFlow<()> {
+
+    async fn handle(
+        &mut self,
+        message: Self::Message,
+        ctx: &mut ActorContext<Self::Message>,
+    ) -> ControlFlow<()> {
         match message {
             AgentActorMessage::Command(command) => {
                 debug!("Handling command: {}", command);
@@ -203,28 +214,58 @@ impl Actor for AgentActor {
                     match e {
                         AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
                         e => {
-                            let _ = self.persist_and_publish(AgentEvent::ErrorOccurred {
-                                    message: e.to_string(), details: None
-                            }).await;
+                            let _ = self
+                                .persist_and_publish(AgentEvent::ErrorOccurred {
+                                    message: e.to_string(),
+                                    details: None,
+                                })
+                                .await;
                         }
                     }
                 }
-            },
-
-            AgentActorMessage::Turn(TurnMessage::Event(event)) => {
-                let _ = self.persist_and_publish(event).await;
             }
-            AgentActorMessage::Turn(TurnMessage::Finished(result)) => {
-                //TODO: Turn should send Finished event
-                let _ = self.handle_turn_ended(result, ctx).await;
-            },
+
+            AgentActorMessage::Turn(_, TurnMessage::Event(event)) => {
+                if let Err(e) = self.persist_and_publish(event).await {
+                    match e {
+                        AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
+                        e => {
+                            let _ = self
+                                .persist_and_publish(AgentEvent::ErrorOccurred {
+                                    message: e.to_string(),
+                                    details: None,
+                                })
+                                .await;
+                        }
+                    }
+
+                }
+            }
+
+            AgentActorMessage::Turn(
+                turn_id,
+                TurnMessage::Finished {
+                    reason,
+                    error,
+                    assistant_message,
+                },
+            ) => {
+                let _ = self
+                    .handle_turn_ended(turn_id, reason, error, assistant_message, ctx)
+                    .await;
+            }
         }
         ControlFlow::Continue(())
     }
 
     async fn on_stop(&mut self, _ctx: &mut ActorContext<Self::Message>) {
         //TODO: reason comes from handle() break result
-        match self.persist_and_publish(AgentEvent::SessionEnded { reason: SessionEndReason::Success }).await {
+        match self
+            .persist_and_publish(AgentEvent::SessionEnded {
+                reason: SessionEndReason::Success,
+            })
+            .await
+        {
             Ok(_) => {
                 debug!("Session ended");
             }
@@ -250,70 +291,80 @@ impl AgentActor {
         }
     }
 
-    async fn notify_subscriptions(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
+    fn notify_subscriptions(&mut self, event: StoredEvent) {
         self.subscriptions
             .retain_mut(|s| match s.try_send(event.clone()) {
                 Ok(_) => true,
                 Err(TrySendError::Full(e)) => {
-                    debug!("AgentActor: Failed to send event to subscription: {:?}", e);
-                    true
+                    debug!("AgentActor: Failed to send event to subscription: {}, remove subscription", e);
+                    false
                 }
                 Err(TrySendError::Closed(e)) => {
-                    debug!("AgentActor: Subscription closed: {:?}", e);
+                    debug!("AgentActor: Subscription closed: {}, remove subscription", e);
                     false
                 }
             });
-
-        Ok(())
     }
 
     async fn persist_and_publish(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
         let stored = self.store.append(event.clone()).await?;
-        self.conversation_state.apply_event(stored);
-        self.notify_subscriptions(event).await?;
+        self.conversation_state.apply_event(stored.clone());
+        self.notify_subscriptions(stored);
+
         Ok(())
     }
 
     async fn handle_turn_ended(
         &mut self,
-        result: Result<TurnOutcome, AgentTurnLoopError>,
+        turn_id: Uuid,
+        reason: TurnEndReason,
+        error: Option<AgentTurnLoopError>,
+        assistant_message: Option<AssistantMessage>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        debug!("AgentActor: Turn ended, result: {:?}", result);
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                self.persist_and_publish(AgentEvent::ErrorOccurred {
-                    message: e.to_string(),
-                    details: None,
-                })
-                .await?;
-                debug!("AgentActor: Error occurred in agent loop: {:?}", e);
-            }
+        debug!("AgentActor: Turn ended, reason: {:?}", reason);
+
+        if let Some(error) = error {
+            self.persist_and_publish(AgentEvent::ErrorOccurred {
+                message: error.to_string(),
+                details: None,
+            })
+            .await?;
+            debug!("AgentActor: Error occurred in agent loop: {:?}", error);
         }
 
-        self.state = AgentActorState::Idle;
+        self.persist_and_publish(AgentEvent::AgentTurnEnded {
+            turn_id,
+            reason,
+            assistant_message,
+        })
+        .await?;
 
+        self.state = AgentActorState::Idle;
         self.try_dispatch_next_input(ctx).await
     }
 
-
-    async fn handle_command(&mut self, command: AgentCommand, ctx: &mut ActorContext<AgentActorMessage>) -> Result<(), AgentSessionError> {
+    async fn handle_command(
+        &mut self,
+        command: AgentCommand,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
         match command {
-            AgentCommand::SubmitInput { intent, input, images, reply } => {
-                self.submit_input(input, images, intent, ctx).await?;
-                reply.send(()).unwrap();
+            AgentCommand::SubmitInput {
+                intent,
+                input,
+                images,
+                reply,
+            } => {
+                let result = self.submit_input(input, images, intent, ctx).await;
+                let _ = reply.send(result);
             }
             AgentCommand::Subscribe { reply, from_seq } => self.subscribe(reply, from_seq).await?,
             AgentCommand::SetSystemPrompt(prompt) => {
-                self.persist_and_publish(AgentEvent::SystemPromptSet { prompt: prompt }).await?;
+                self.persist_and_publish(AgentEvent::SystemPromptSet { prompt: prompt })
+                    .await?;
             }
-            AgentCommand::Cancel {} => {
-            }
-            AgentCommand::Stop {} => {
-                // self.shutdown_token.cancel();
-
-            }
+            AgentCommand::Cancel {} => {}
         }
 
         Ok(())
@@ -351,7 +402,10 @@ impl AgentActor {
         Ok(context)
     }
 
-    async fn try_dispatch_next_input(&mut self, ctx: &mut ActorContext<AgentActorMessage>) -> Result<(), AgentSessionError> {
+    async fn try_dispatch_next_input(
+        &mut self,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
         if matches!(self.state, AgentActorState::Running(_)) {
             return Ok(());
         }
@@ -360,9 +414,7 @@ impl AgentActor {
             return Ok(());
         };
 
-        let message_id = Uuid::now_v7();
         self.persist_and_publish(AgentEvent::UserMessageCommitted {
-            message_id: message_id,
             content: input.content,
             intent: input.intent,
         })
@@ -374,9 +426,15 @@ impl AgentActor {
         Ok(())
     }
 
-    async fn spawn_turn(&mut self, context: ai::Context, actor_ctx: &mut ActorContext<AgentActorMessage>) -> Result<(), AgentSessionError> {
+    async fn spawn_turn(
+        &mut self,
+        context: ai::Context,
+        actor_ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
         let Some(store_tx) = actor_ctx.ugprade() else {
-            return Err(AgentSessionError::InvalidState("Actor context is not upgraded".to_string()));
+            return Err(AgentSessionError::InvalidState(
+                "Actor context is not upgraded".to_string(),
+            ));
         };
         let turn_cancel = actor_ctx.shutdown.child_token();
 
@@ -388,11 +446,14 @@ impl AgentActor {
             turn_cancel.clone(),
         );
 
-        tokio::task::spawn(async move {
-            let result = current_turn.start_turn_loop(Some(10)).await;
-            current_turn.emit(TurnMessage::Finished(result)).await.unwrap();
-        });
+        self.persist_and_publish(AgentEvent::AgentTurnStarted {
+            turn_id: current_turn.turn_id(),
+        })
+        .await?;
 
+        tokio::task::spawn(async move {
+            let _ = current_turn.start_turn_loop(Some(10)).await;
+        });
 
         self.state = AgentActorState::Running(turn_cancel);
 
@@ -400,7 +461,11 @@ impl AgentActor {
     }
 
     //TODO: impl from_seq
-    async fn subscribe(&mut self, reply: oneshot::Sender<AgentSubscription>, _from_seq: Option<u64>) -> Result<(), AgentSessionError> {
+    async fn subscribe(
+        &mut self,
+        reply: oneshot::Sender<AgentSubscription>,
+        _from_seq: Option<u64>,
+    ) -> Result<(), AgentSessionError> {
         let (tx, rx) = mpsc::channel(100);
         self.subscriptions.push(tx);
         let _ = reply.send(AgentSubscription::new(rx));
@@ -458,7 +523,8 @@ impl AgentSession {
     ) -> Result<(), AgentSessionError> {
         let (reply, receiver) = oneshot::channel();
         let images = self.load_images(images).await?;
-        self.runtime.handle()
+        self.runtime
+            .handle()
             .send(AgentActorMessage::Command(AgentCommand::SubmitInput {
                 intent: UserMessageIntent::Normal,
                 reply: reply,
@@ -467,31 +533,45 @@ impl AgentSession {
             }))
             .await?;
 
-        let _ = receiver.await.unwrap();
-        Ok(())
+        receiver.await?
     }
 
-    pub async fn subscribe(&mut self, from_seq: Option<u64>) -> Result<AgentSubscription, AgentSessionError> {
+    pub async fn subscribe(
+        &mut self,
+        from_seq: Option<u64>,
+    ) -> Result<AgentSubscription, AgentSessionError> {
         let (reply, receiver) = oneshot::channel();
-        self.runtime.handle().send(AgentActorMessage::Command(AgentCommand::Subscribe { reply, from_seq})).await?;
+        self.runtime
+            .handle()
+            .send(AgentActorMessage::Command(AgentCommand::Subscribe {
+                reply,
+                from_seq,
+            }))
+            .await?;
 
         Ok(receiver.await?)
     }
 
     pub async fn set_system_prompt(&mut self, prompt: String) -> Result<(), AgentSessionError> {
-        self.runtime.handle()
-            .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(prompt)))
+        self.runtime
+            .handle()
+            .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(
+                prompt,
+            )))
             .await?;
         Ok(())
     }
 
     pub async fn close(self) -> Result<(), AgentSessionError> {
-        self.runtime.handle().send(AgentActorMessage::Command(AgentCommand::Stop {})).await?;
+        self.runtime.shutdown().await;
         Ok(())
     }
 
     pub async fn cancel_current_turn(&mut self) -> Result<(), AgentSessionError> {
-        self.runtime.handle().send(AgentActorMessage::Command(AgentCommand::Cancel {})).await?;
+        self.runtime
+            .handle()
+            .send(AgentActorMessage::Command(AgentCommand::Cancel {}))
+            .await?;
         Ok(())
     }
 }
