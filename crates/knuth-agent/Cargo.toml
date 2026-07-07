@@ -17,4 +17,5 @@ thiserror = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 base64 = "0.22"

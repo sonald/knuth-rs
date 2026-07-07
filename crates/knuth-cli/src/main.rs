@@ -90,19 +90,20 @@ async fn oneshot(
     let user_settings = UserSettings::load(model, config)?;
     let system_prompt = "You are a helpful assistant.".to_string();
 
-    let mut session = AgentSession::new(
+    let mut session = AgentSession::build(
         "test".to_string(),
         "test".to_string(),
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
         },
-    );
+    ).await;
 
     let quit_token = tokio_util::sync::CancellationToken::new();
     let quit_token_clone = quit_token.clone();
 
-    let mut subscription = session.subscribe().await?;
+    let mut subscription = session.subscribe(None).await?;
+
     tokio::spawn(async move {
         while let Some(event) = subscription.next().await {
             match event {
@@ -122,14 +123,17 @@ async fn oneshot(
                 }
                 _ => {
                     let msg = format!("{}", event);
-                    debug!("{}", msg.dark_yellow());
+                    debug!("Ev: {}", msg.dark_yellow());
                 }
             }
         }
+
+        debug!("Session ended");
     });
 
     session.set_system_prompt(system_prompt).await?;
     session.submit_input(input, images).await?;
+
     loop {
         tokio::select! {
             _ = quit_token.cancelled() => {
@@ -147,18 +151,18 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
     let user_settings = UserSettings::load(model, config)?;
     let system_prompt = "You are a helpful assistant.".to_string();
 
-    let mut session = AgentSession::new(
+    let mut session = AgentSession::build(
         "test".to_string(),
         "test".to_string(),
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
         },
-    );
+    ).await;
 
     let (turn_ended_tx, mut turn_ended) = tokio::sync::mpsc::channel(2);
 
-    let mut subscription = session.subscribe().await?;
+    let mut subscription = session.subscribe(None).await?;
     tokio::spawn(async move {
         while let Some(event) = subscription.next().await {
             match event {

@@ -42,6 +42,10 @@ pub enum AgentEvent {
         reason: SessionEndReason,
     },
 
+    SystemPromptSet {
+        prompt: String,
+    },
+
     AgentTurnStarted {
         turn_id: Uuid,
     },
@@ -129,6 +133,7 @@ impl AgentEvent {
             AgentEvent::ToolExecutionUpdated { .. } => "ToolExecutionUpdated",
             AgentEvent::ToolExecutionEnded { .. } => "ToolExecutionEnded",
             AgentEvent::ErrorOccurred { .. } => "ErrorOccurred",
+            AgentEvent::SystemPromptSet { .. } => "SystemPromptSet",
         }
     }
 }
@@ -158,9 +163,19 @@ fn short_uuid(id: &Uuid) -> impl std::fmt::Display {
     format!("…{}", &s[s.len() - 8..])
 }
 
+fn short_string(s: &str) -> impl std::fmt::Display {
+    if s.len() <= 32 {
+        return s.to_owned();
+    }
+    format!("…{}", s.chars().rev().take(32).collect::<String>().chars().rev().collect::<String>())
+}
+
 impl std::fmt::Display for AgentEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AgentEvent::SystemPromptSet { prompt } => {
+                write!(f, "SystemPromptSet(prompt={})", short_string(prompt))
+            }
             AgentEvent::SessionStarted { session_id } => {
                 write!(f, "SessionStarted(session_id={})", short_uuid(session_id))
             }
@@ -209,8 +224,9 @@ impl std::fmt::Display for AgentEvent {
             } => {
                 write!(
                     f,
-                    "AssistantMessageTextCompleted(message_id={}, text_content={text_content:?})",
-                    short_uuid(message_id)
+                    "AssistantMessageTextCompleted(message_id={}, text_content={})",
+                    short_uuid(message_id),
+                    short_string(text_content)
                 )
             }
             AgentEvent::AssistantMessageThinkingStarted { message_id } => {
@@ -233,8 +249,9 @@ impl std::fmt::Display for AgentEvent {
             } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingCompleted(message_id={}, content={content:?})",
-                    short_uuid(message_id)
+                    "AssistantMessageThinkingCompleted(message_id={}, content={})",
+                    short_uuid(message_id),
+                    short_string(content)
                 )
             }
             AgentEvent::ToolCallRequested {

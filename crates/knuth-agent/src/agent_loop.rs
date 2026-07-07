@@ -6,104 +6,109 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::{AgentActorMessage, TurnMessage};
+
 #[derive(Debug, thiserror::Error)]
-pub enum AgentLoopError {
+pub enum AgentTurnLoopError {
     #[error("Failed to send event to store: {0}")]
     EventSendError(String),
 }
 
 #[derive(Debug)]
-pub struct AgentLoop {
+pub struct AgentTurnRunner {
     model: Model,
     options: StreamOptions,
-    store_tx: mpsc::Sender<AgentEvent>,
+    store_tx: mpsc::Sender<AgentActorMessage>,
     context: ai::Context,
-    turn_cancel: CancellationToken,
     turn_id: Uuid,
     last_message_id: Option<Uuid>,
+    cancel_token: CancellationToken,
+
+    has_tool_calls: bool
 }
 
-impl AgentLoop {
+impl AgentTurnRunner {
     pub fn new(
         model: Model,
         options: StreamOptions,
-        store_tx: mpsc::Sender<AgentEvent>,
+        store_tx: mpsc::Sender<AgentActorMessage>,
         context: ai::Context,
-        turn_cancel: CancellationToken,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             model,
             options,
             store_tx,
             context,
-            turn_cancel,
             turn_id: Uuid::now_v7(),
             last_message_id: None,
+            has_tool_calls: false,
+            cancel_token,
         }
     }
 
-    async fn emit(&mut self, event: AgentEvent) -> Result<(), AgentLoopError> {
+    pub async fn emit(&mut self, event: TurnMessage) -> Result<(), AgentTurnLoopError> {
         self.store_tx
-            .send(event)
+            .send(AgentActorMessage::Turn(event))
             .await
-            .map_err(|e| AgentLoopError::EventSendError(e.to_string()))
+            .map_err(|e| AgentTurnLoopError::EventSendError(e.to_string()))
     }
 
-    pub(crate) async fn start_agent_loop(
+    pub(crate) async fn start_turn_loop(
         &mut self,
-        _max_turns: Option<usize>,
-    ) -> Result<TurnOutcome, AgentLoopError> {
+        max_turns: Option<usize>,
+    ) -> Result<TurnOutcome, AgentTurnLoopError> {
         let mut stream = stream(&self.model, &self.context, Some(&self.options));
 
-        loop {
-            tokio::select! {
-                biased;
+        let mut turn = 0;
+        let max_turns = max_turns.unwrap_or(1);
 
-                _ = self.turn_cancel.cancelled() => {
-                    debug!("Agent loop cancelled");
-                    self.emit(AgentEvent::AgentTurnEnded {
-                        turn_id: self.turn_id,
-                        reason: TurnEndReason::Cancelled,
-                        assistant_message: None,
-                    })
-                    .await?;
+        while turn < max_turns {
+            loop {
+                tokio::select! {
+                    biased;
 
-                    return Ok(TurnOutcome {
-                        turn_id: self.turn_id,
-                        reason: TurnEndReason::Cancelled,
-                    });
-                }
-
-                event = stream.next() => {
-                    let Some(event) = event else {
-                        debug!("Agent loop stream ended");
-                        //TODO: check if the last message is a text message only
+                    _ = self.cancel_token.cancelled() => {
                         return Ok(TurnOutcome {
                             turn_id: self.turn_id,
-                            reason: TurnEndReason::Success,
+                            reason: TurnEndReason::Cancelled,
                         });
-                    };
-                    self.handle_event(event).await?;
-                }
+                    }
 
+                    event = stream.next() => {
+                        let Some(event) = event else { debug!("stream ended, breaking"); break; };
+                        self.handle_event(event).await?;
+                    }
+
+                }
             }
+
+            if !self.has_tool_calls {
+                break;
+            }
+
+            turn += 1;
         }
 
-        // Ok(TurnOutcome {
-        //     turn_id: self.turn_id,
-        //     reason: TurnEndReason::Success,
-        // })
+        if self.has_tool_calls {
+            //TODO: 
+        }
+
+        Ok(TurnOutcome {
+            turn_id: self.turn_id,
+            reason: TurnEndReason::Success,
+        })
     }
 
     async fn handle_event(
         &mut self,
         event: ai::AssistantMessageEvent,
-    ) -> Result<(), AgentLoopError> {
+    ) -> Result<(), AgentTurnLoopError> {
         match event {
             ai::AssistantMessageEvent::Start { .. } => {
-                self.emit(AgentEvent::AgentTurnStarted {
+                self.emit(TurnMessage::Event(AgentEvent::AgentTurnStarted {
                     turn_id: self.turn_id,
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::Done { message, reason } => {
@@ -112,81 +117,81 @@ impl AgentLoop {
                     DoneReason::Length => TurnEndReason::Length,
                     DoneReason::ToolUse => TurnEndReason::ToolUse,
                 };
-                self.emit(AgentEvent::AgentTurnEnded {
+                self.emit(TurnMessage::Event(AgentEvent::AgentTurnEnded {
                     turn_id: self.turn_id,
                     reason: turn_reason,
                     assistant_message: Some(message),
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::Error { error, .. } => {
-                self.emit(AgentEvent::ErrorOccurred {
+                self.emit(TurnMessage::Event(AgentEvent::ErrorOccurred {
                     message: error.error_message.unwrap_or("Unknown error".to_string()),
                     details: None,
-                })
+                }))
                 .await?;
 
-                self.emit(AgentEvent::AgentTurnEnded {
+                self.emit(TurnMessage::Event(AgentEvent::AgentTurnEnded {
                     turn_id: self.turn_id,
                     reason: TurnEndReason::Error,
                     assistant_message: None,
-                })
+                }))
                 .await?;
             }
 
             ai::AssistantMessageEvent::TextStart { .. } => {
                 self.last_message_id = Some(Uuid::now_v7());
-                self.emit(AgentEvent::AssistantMessageTextStarted {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageTextStarted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::TextDelta { delta, .. } => {
-                self.emit(AgentEvent::AssistantMessageTextDelta {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageTextDelta {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                     delta,
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::TextEnd {
                 content, partial, ..
             } => {
-                self.emit(AgentEvent::AssistantMessageTextCompleted {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageTextCompleted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                     text_content: content,
                     assistant_message: partial,
-                })
+                }))
                 .await?;
             }
 
             ai::AssistantMessageEvent::ThinkingStart { .. } => {
                 self.last_message_id = Some(Uuid::now_v7());
-                self.emit(AgentEvent::AssistantMessageThinkingStarted {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageThinkingStarted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                self.emit(AgentEvent::AssistantMessageThinkingDelta {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageThinkingDelta {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                     delta,
-                })
+                }))
                 .await?;
             }
             ai::AssistantMessageEvent::ThinkingEnd { content, .. } => {
-                self.emit(AgentEvent::AssistantMessageThinkingCompleted {
+                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageThinkingCompleted {
                     message_id: self.last_message_id.expect("last_message_id not set"),
                     content,
-                })
+                }))
                 .await?;
             }
 
             ai::AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
-                self.emit(AgentEvent::ToolCallRequested {
+                self.emit(TurnMessage::Event(AgentEvent::ToolCallRequested {
                     tool_call_id: tool_call.id.clone(),
                     name: tool_call.name.clone(),
                     arguments: tool_call.arguments.clone(),
-                })
+                }))
                 .await?;
             }
 
@@ -242,8 +247,8 @@ mod tests {
         }
     }
 
-    fn mk_loop(store_tx: mpsc::Sender<AgentEvent>) -> AgentLoop {
-        AgentLoop::new(
+    fn mk_loop(store_tx: mpsc::Sender<AgentActorMessage>) -> AgentTurnRunner {
+        AgentTurnRunner::new(
             mk_model(),
             StreamOptions::default(),
             store_tx,
@@ -270,11 +275,11 @@ mod tests {
             .await
             .unwrap();
 
-        let Some(AgentEvent::AgentTurnEnded {
+        let Some(AgentActorMessage::Turn(TurnMessage::Event(AgentEvent::AgentTurnEnded {
             reason,
             assistant_message,
             ..
-        }) = rx.recv().await
+        }))) = rx.recv().await
         else {
             panic!("expected AgentTurnEnded");
         };
@@ -304,11 +309,11 @@ mod tests {
             .await
             .unwrap();
 
-        let Some(AgentEvent::AgentTurnEnded {
+        let Some(AgentActorMessage::Turn(TurnMessage::Event(AgentEvent::AgentTurnEnded {
             reason,
             assistant_message,
             ..
-        }) = rx.recv().await
+        }))) = rx.recv().await
         else {
             panic!("expected AgentTurnEnded");
         };
