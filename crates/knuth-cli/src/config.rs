@@ -1,10 +1,10 @@
 use ai::{
-    Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
-    get_model,
+    get_model, Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider,
+    StreamOptions,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     env, fs,
@@ -13,6 +13,8 @@ use std::{
 
 const CONFIG_DIR_NAME: &str = "knuth";
 const CONFIG_FILE_NAME: &str = "knuth.yaml";
+const AUTH_FILE_NAME: &str = "auth.json";
+const CODEX_ACCOUNT_EXTRA: &str = "chatgpt_account_id";
 
 pub struct UserSettings {
     pub model: Model,
@@ -21,13 +23,14 @@ pub struct UserSettings {
 
 impl UserSettings {
     pub fn load(model_override: Option<&str>, config_override: Option<&Path>) -> Result<Self> {
-        let config = load_file_config(
+        let (config, config_path) = load_file_config(
             config_override
                 .map(Path::to_path_buf)
                 .or_else(|| env_value("KNUTH_CONFIG").map(PathBuf::from)),
         )?;
         let model = Self::load_model_from_env(model_override, &config)?;
-        let options = load_options(&config);
+        let mut options = load_options(&config);
+        load_codex_auth_json(&model, &mut options, &config_path)?;
         Ok(Self { model, options })
     }
 
@@ -73,7 +76,7 @@ struct FileThinking {
     budget_tokens: Option<u32>,
 }
 
-fn load_file_config(path_override: Option<PathBuf>) -> Result<FileConfig> {
+fn load_file_config(path_override: Option<PathBuf>) -> Result<(FileConfig, PathBuf)> {
     let explicit = path_override.is_some();
     let path = match path_override {
         Some(path) => PathBuf::from(path),
@@ -84,13 +87,14 @@ fn load_file_config(path_override: Option<PathBuf>) -> Result<FileConfig> {
         if explicit {
             return Err(anyhow!("config file does not exist: {}", path.display()));
         }
-        return Ok(FileConfig::default());
+        return Ok((FileConfig::default(), path));
     }
 
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    serde_yaml::from_str(&text)
-        .with_context(|| format!("failed to parse config file {}", path.display()))
+    let config = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    Ok((config, path))
 }
 
 fn default_config_file() -> Result<PathBuf> {
@@ -135,6 +139,119 @@ where
     #[cfg(not(any(unix, target_os = "windows")))]
     {
         env_var("HOME").map(|home| PathBuf::from(home).join(".config"))
+    }
+}
+
+fn default_auth_file(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join(AUTH_FILE_NAME))
+}
+
+fn load_codex_auth_json(
+    model: &Model,
+    options: &mut StreamOptions,
+    config_path: &Path,
+) -> Result<()> {
+    if model.api.0 != KnownApi::OpenAICodexResponses.as_str() {
+        return Ok(());
+    }
+
+    let needs_token = options.api_key.is_none() && env_value("CODEX_AUTH_TOKEN").is_none();
+    let needs_account = !has_chatgpt_account_id(&options.provider_extras)
+        && env_value("CODEX_ACCOUNT_ID").is_none();
+    if !needs_token && !needs_account {
+        return Ok(());
+    }
+
+    let Some(path) = default_auth_file(config_path) else {
+        return Ok(());
+    };
+    apply_codex_auth_json(&path, options, needs_token, needs_account)
+}
+
+fn apply_codex_auth_json(
+    path: &Path,
+    options: &mut StreamOptions,
+    needs_token: bool,
+    needs_account: bool,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Codex auth file {}", path.display()))?;
+    let auth: Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse Codex auth file {}", path.display()))?;
+
+    if needs_token {
+        let token = auth
+            .get("access_token")
+            .and_then(Value::as_str)
+            .and_then(nonempty_str)
+            .ok_or_else(|| anyhow!("Codex auth file {} is missing access_token", path.display()))?;
+        ensure_codex_auth_not_expired(&auth, path)?;
+        options.api_key = Some(token);
+    }
+
+    if needs_account {
+        if let Some(account_id) = auth
+            .get("account_id")
+            .and_then(Value::as_str)
+            .and_then(nonempty_str)
+        {
+            options
+                .provider_extras
+                .insert(CODEX_ACCOUNT_EXTRA.to_string(), json!(account_id));
+        }
+    }
+
+    Ok(())
+}
+
+fn has_chatgpt_account_id(provider_extras: &HashMap<String, Value>) -> bool {
+    provider_extras
+        .get(CODEX_ACCOUNT_EXTRA)
+        .and_then(Value::as_str)
+        .and_then(nonempty_str)
+        .is_some()
+}
+
+fn ensure_codex_auth_not_expired(auth: &Value, path: &Path) -> Result<()> {
+    let Some(raw_expires_at) = auth.get("expires_at") else {
+        return Ok(());
+    };
+    let expires_at = parse_expires_at_millis(raw_expires_at)
+        .ok_or_else(|| anyhow!("Codex auth file {} has invalid expires_at", path.display()))?;
+    if expires_at <= chrono::Utc::now().timestamp_millis() {
+        return Err(anyhow!(
+            "Codex auth file {} is expired; refresh it or set CODEX_AUTH_TOKEN",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_expires_at_millis(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64().map(normalize_epoch_millis),
+        Value::String(s) => s
+            .parse::<i64>()
+            .ok()
+            .map(normalize_epoch_millis)
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis())
+            }),
+        _ => None,
+    }
+}
+
+fn normalize_epoch_millis(value: i64) -> i64 {
+    if value < 10_000_000_000 {
+        value * 1000
+    } else {
+        value
     }
 }
 
@@ -289,7 +406,15 @@ fn env_value(name: &str) -> Option<String> {
 
 fn nonempty(value: String) -> Option<String> {
     let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn nonempty_str(value: &str) -> Option<String> {
+    nonempty(value.to_string())
 }
 
 fn nonempty_ref(value: &String) -> Option<String> {
@@ -299,6 +424,44 @@ fn nonempty_ref(value: &String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| (*name, env::var(name).ok()))
+                .collect();
+            for (name, value) in vars {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn bare_model_with_base_url_uses_openai_responses() {
@@ -445,6 +608,95 @@ options:
         assert_eq!(options.cache_retention, Some(CacheRetention::Long));
         assert_eq!(options.reasoning_effort.unwrap(), "high");
         assert_eq!(options.thinking.unwrap().budget_tokens, Some(8192));
+    }
+
+    #[test]
+    fn codex_model_reads_auth_json_next_to_config_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("knuth.yaml");
+        fs::write(
+            &config_path,
+            r#"
+model: chatgpt/gpt-5.4-mini
+base_url: https://aicoding.2233.ai
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("auth.json"),
+            r#"{
+  "access_token": "codex-access",
+  "account_id": "account-123",
+  "expires_at": 4102444800000,
+  "id_token": "ignored",
+  "refresh_token": "ignored"
+}"#,
+        )
+        .unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("KNUTH_MODEL", None),
+            ("KNUTH_BASE_URL", None),
+            ("KNUTH_API_KEY", None),
+            ("CODEX_AUTH_TOKEN", None),
+            ("CODEX_ACCOUNT_ID", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_PROVIDER", None),
+            ("KNUTH_API", None),
+        ]);
+
+        let settings = UserSettings::load(None, Some(&config_path)).unwrap();
+
+        assert_eq!(settings.options.api_key.as_deref(), Some("codex-access"));
+        assert_eq!(
+            settings.options.provider_extras["chatgpt_account_id"],
+            json!("account-123")
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_auth_json_without_expires_at_is_accepted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("knuth.yaml");
+        fs::write(
+            &config_path,
+            r#"
+model: chatgpt/gpt-5.4-mini
+base_url: https://aicoding.2233.ai
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("auth.json"),
+            r#"{
+  "access_token": "codex-access",
+  "account_id": "account-123"
+}"#,
+        )
+        .unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("KNUTH_MODEL", None),
+            ("KNUTH_BASE_URL", None),
+            ("KNUTH_API_KEY", None),
+            ("CODEX_AUTH_TOKEN", None),
+            ("CODEX_ACCOUNT_ID", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_PROVIDER", None),
+            ("KNUTH_API", None),
+        ]);
+
+        let settings = UserSettings::load(None, Some(&config_path)).unwrap();
+
+        assert_eq!(settings.options.api_key.as_deref(), Some("codex-access"));
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
