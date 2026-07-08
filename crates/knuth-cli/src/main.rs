@@ -12,7 +12,7 @@ use config::UserSettings;
 
 use clap::{Parser, Subcommand};
 use crossterm::style::Stylize;
-use tracing::debug;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -121,6 +121,13 @@ async fn oneshot(
                 AgentEvent::AgentTurnEnded { .. } => {
                     quit_token_clone.cancel();
                 }
+
+                AgentEvent::ToolExecutionStarted { tool_name, arguments, ..} => {
+                    println!("{}", format!("* ToolRequest {}({})", tool_name, serde_json::to_string(&arguments).unwrap()).cyan());
+                }
+                AgentEvent::ToolExecutionEnded { result, .. } => {
+                    println!("{}", format!("* Result: {}", result).cyan());
+                }
                 _ => {
                     let msg = format!("{}", event);
                     debug!("Ev: {}", msg.dark_yellow());
@@ -137,7 +144,7 @@ async fn oneshot(
     loop {
         tokio::select! {
             _ = quit_token.cancelled() => {
-                println!("Quitting...");
+                info!("Quitting...");
                 session.close().await?;
                 break;
             }
@@ -179,6 +186,12 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
 
                 AgentEvent::AgentTurnEnded { .. } => {
                     turn_ended_tx.send(()).await.unwrap();
+                }
+                AgentEvent::ToolExecutionStarted { tool_name, arguments, ..} => {
+                    println!("{}", format!("* Exec {}({})", tool_name, serde_json::to_string(&arguments).unwrap()).cyan());
+                }
+                AgentEvent::ToolExecutionEnded { result, .. } => {
+                    println!("{}", format!("* Result:\n{}", result).cyan());
                 }
                 _ => {
                     let msg = format!("{}", event);

@@ -1,6 +1,6 @@
 use ai::{AssistantMessage, DoneReason, Model, StreamOptions, stream};
 use futures::StreamExt;
-use knuth_core::{AgentEvent, TurnEndReason};
+use knuth_core::{AgentEvent, ModelStepEndReason};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{AgentActorMessage, TurnMessage};
 
 #[derive(Debug, thiserror::Error)]
-pub enum AgentTurnLoopError {
+pub enum AgentStepLoopError {
     #[error("Failed to send event to store: {0}")]
     EventSendError(String),
 
@@ -18,21 +18,20 @@ pub enum AgentTurnLoopError {
 }
 
 #[derive(Debug)]
-pub struct AgentTurnRunner {
+pub struct AgentStepRunner {
     model: Model,
     options: StreamOptions,
     store_tx: mpsc::Sender<AgentActorMessage>,
     context: ai::Context,
-    turn_id: Uuid,
+    step_id: Uuid,
     last_message_id: Option<Uuid>,
     cancel_token: CancellationToken,
 
-    has_tool_calls: bool,
-    turn_reason: TurnEndReason,
+    step_reason: ModelStepEndReason,
     assistant_message: Option<AssistantMessage>,
 }
 
-impl AgentTurnRunner {
+impl AgentStepRunner {
     pub fn new(
         model: Model,
         options: StreamOptions,
@@ -45,80 +44,60 @@ impl AgentTurnRunner {
             options,
             store_tx,
             context,
-            turn_id: Uuid::now_v7(),
+            step_id: Uuid::now_v7(),
             last_message_id: None,
-            has_tool_calls: false,
             cancel_token,
-            turn_reason: TurnEndReason::Success,
+            step_reason: ModelStepEndReason::Success,
             assistant_message: None,
         }
     }
 
-    pub fn turn_id(&self) -> Uuid {
-        self.turn_id
+    pub fn step_id(&self) -> Uuid {
+        self.step_id
     }
 
-    pub async fn emit(&mut self, event: TurnMessage) -> Result<(), AgentTurnLoopError> {
+    pub async fn emit(&mut self, event: TurnMessage) -> Result<(), AgentStepLoopError> {
         self.store_tx
-            .send(AgentActorMessage::Turn(self.turn_id, event))
+            .send(AgentActorMessage::Turn(self.step_id, event))
             .await
-            .map_err(|e| AgentTurnLoopError::EventSendError(e.to_string()))
+            .map_err(|e| AgentStepLoopError::EventSendError(e.to_string()))
     }
 
-    pub(crate) async fn start_turn_loop(
-        &mut self,
-        max_turns: Option<usize>,
-    ) -> Result<(), AgentTurnLoopError> {
+    pub(crate) async fn start_step(&mut self) -> Result<(), AgentStepLoopError> {
         let mut stream = stream(&self.model, &self.context, Some(&self.options));
 
-        let mut turn = 0;
-        let max_turns = max_turns.unwrap_or(1);
+        self.emit(TurnMessage::Event(AgentEvent::ModelStepStarted {
+            step_id: self.step_id,
+        }))
+        .await?;
 
-        let mut error = None;
 
-        'outer: while turn < max_turns {
-            loop {
-                tokio::select! {
-                    biased;
+        loop {
+            tokio::select! {
+                biased;
 
-                    _ = self.cancel_token.cancelled() => {
-                        self.turn_reason = TurnEndReason::Cancelled;
-                        break 'outer;
+                _ = self.cancel_token.cancelled() => {
+                    self.step_reason = ModelStepEndReason::Cancelled;
+                    break;
+                }
+
+                event = stream.next() => {
+                    let Some(event) = event else {
+                        debug!("stream ended, breaking");
+                        break;
+                    };
+
+                    if let Err(e) = self.handle_event(event).await {
+                        self.step_reason = ModelStepEndReason::Error(e.to_string());
+                        break;
                     }
-
-                    event = stream.next() => {
-                        let Some(event) = event else {
-                            debug!("stream ended, breaking");
-                            break;
-                        };
-
-                        if let Err(e) = self.handle_event(event).await {
-                            self.turn_reason = TurnEndReason::Error;
-                            error = Some(e);
-                            break 'outer;
-                        }
-                    }
-
                 }
             }
-
-            if !self.has_tool_calls {
-                break;
-            }
-
-            turn += 1;
         }
 
-        if self.has_tool_calls {
-            //TODO:
-        }
-
-        self.emit(TurnMessage::Finished {
-            reason: self.turn_reason.clone(),
-            error,
-            assistant_message: self.assistant_message.clone(),
-        })
-        .await?;
+        self.emit(TurnMessage::Event(AgentEvent::ModelStepEnded { 
+            step_id: self.step_id, reason: self.step_reason.clone(), assistant_message: self.assistant_message.clone() 
+        })).await?;
 
         Ok(())
     }
@@ -126,19 +105,20 @@ impl AgentTurnRunner {
     async fn handle_event(
         &mut self,
         event: ai::AssistantMessageEvent,
-    ) -> Result<(), AgentTurnLoopError> {
+    ) -> Result<(), AgentStepLoopError> {
         match event {
             ai::AssistantMessageEvent::Start { .. } => {}
             ai::AssistantMessageEvent::Done { message, reason } => {
-                self.turn_reason = match reason {
-                    DoneReason::Stop => TurnEndReason::Success,
-                    DoneReason::Length => TurnEndReason::Length,
-                    DoneReason::ToolUse => TurnEndReason::ToolUse,
+                self.step_reason = match reason {
+                    DoneReason::Stop => ModelStepEndReason::Success,
+                    DoneReason::Length => ModelStepEndReason::Length,
+                    DoneReason::ToolUse => ModelStepEndReason::ToolUse,
                 };
                 self.assistant_message = Some(message);
+                debug!("Done reason: {:?}", reason);
             }
             ai::AssistantMessageEvent::Error { error, .. } => {
-                return Err(AgentTurnLoopError::LLMError(
+                return Err(AgentStepLoopError::LLMError(
                     error.error_message.unwrap_or("Unknown error".to_string()),
                 ));
             }
@@ -199,14 +179,7 @@ impl AgentTurnRunner {
                 .await?;
             }
 
-            ai::AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
-                self.has_tool_calls = true;
-                self.emit(TurnMessage::Event(AgentEvent::ToolCallRequested {
-                    tool_call_id: tool_call.id.clone(),
-                    name: tool_call.name.clone(),
-                    arguments: tool_call.arguments.clone(),
-                }))
-                .await?;
+            ai::AssistantMessageEvent::ToolCallEnd { .. } => {
             }
 
             ai::AssistantMessageEvent::ToolCallStart { .. } => {}
@@ -262,8 +235,8 @@ mod tests {
         }
     }
 
-    fn mk_loop(store_tx: mpsc::Sender<AgentActorMessage>) -> AgentTurnRunner {
-        AgentTurnRunner::new(
+    fn mk_loop(store_tx: mpsc::Sender<AgentActorMessage>) -> AgentStepRunner {
+        AgentStepRunner::new(
             mk_model(),
             StreamOptions::default(),
             store_tx,
@@ -290,7 +263,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(agent_loop.turn_reason, TurnEndReason::Length);
+        assert_eq!(agent_loop.step_reason, ModelStepEndReason::Length);
         assert_eq!(
             agent_loop.assistant_message.unwrap().stop_reason,
             StopReason::Length
@@ -319,7 +292,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(agent_loop.turn_reason, TurnEndReason::ToolUse);
+        assert_eq!(agent_loop.step_reason, ModelStepEndReason::ToolUse);
         assert_eq!(
             agent_loop.assistant_message.unwrap().stop_reason,
             StopReason::ToolUse
@@ -334,24 +307,23 @@ mod tests {
         let message = mk_message(StopReason::Length, vec![ContentBlock::text("partial")]);
         set_faux_responses(vec![message]);
 
-        agent_loop.start_turn_loop(Some(1)).await.unwrap();
+        agent_loop.start_step().await.unwrap();
         clear_faux_responses();
 
         while let Some(message) = rx.recv().await {
             if let AgentActorMessage::Turn(
-                turn_id,
+                step_id,
                 TurnMessage::Finished {
                     reason,
-                    error,
                     assistant_message,
                 },
-            ) = message
-            {
-                assert_eq!(turn_id, agent_loop.turn_id());
-                assert_eq!(reason, TurnEndReason::Length);
-                assert!(error.is_none());
+            ) = message {
+                assert_eq!(step_id, agent_loop.step_id());
+                assert_eq!(reason, ModelStepEndReason::Length);
                 assert_eq!(assistant_message.unwrap().stop_reason, StopReason::Length);
                 return;
+            } else {
+                panic!("expected Turn message");
             }
         }
 

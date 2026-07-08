@@ -4,11 +4,11 @@ use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TurnEndReason {
+pub enum ModelStepEndReason {
     Success,
     Length,
     ToolUse,
-    Error,
+    Error(String),
     Cancelled,
 }
 
@@ -46,7 +46,15 @@ pub enum AgentEvent {
 
     AgentTurnEnded {
         turn_id: Uuid,
-        reason: TurnEndReason,
+    },
+
+    ModelStepStarted {
+        step_id: Uuid,
+    },
+
+    ModelStepEnded {
+        step_id: Uuid,
+        reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
     },
 
@@ -80,14 +88,10 @@ pub enum AgentEvent {
         content: String,
     },
 
-    ToolCallRequested {
-        tool_call_id: String,
-        name: String,
-        #[serde(default)]
-        arguments: serde_json::Map<String, serde_json::Value>,
-    },
     ToolExecutionStarted {
         tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
     },
     ToolExecutionUpdated {
         tool_call_id: String,
@@ -95,7 +99,8 @@ pub enum AgentEvent {
     },
     ToolExecutionEnded {
         tool_call_id: String,
-        result: serde_json::Value,
+        tool_name: String,
+        result: String,
     },
 
     ErrorOccurred {
@@ -112,6 +117,8 @@ impl AgentEvent {
             AgentEvent::SessionEnded { .. } => "SessionEnded",
             AgentEvent::AgentTurnStarted { .. } => "AgentTurnStarted",
             AgentEvent::AgentTurnEnded { .. } => "AgentTurnEnded",
+            AgentEvent::ModelStepStarted { .. } => "ModelStepStarted",
+            AgentEvent::ModelStepEnded { .. } => "ModelStepEnded",
             AgentEvent::UserMessageCommitted { .. } => "UserMessageCommitted",
             AgentEvent::AssistantMessageTextStarted { .. } => "AssistantMessageTextStarted",
             AgentEvent::AssistantMessageTextDelta { .. } => "AssistantMessageTextDelta",
@@ -121,7 +128,6 @@ impl AgentEvent {
             AgentEvent::AssistantMessageThinkingCompleted { .. } => {
                 "AssistantMessageThinkingCompleted"
             }
-            AgentEvent::ToolCallRequested { .. } => "ToolCallRequested",
             AgentEvent::ToolExecutionStarted { .. } => "ToolExecutionStarted",
             AgentEvent::ToolExecutionUpdated { .. } => "ToolExecutionUpdated",
             AgentEvent::ToolExecutionEnded { .. } => "ToolExecutionEnded",
@@ -187,14 +193,14 @@ impl std::fmt::Display for AgentEvent {
             AgentEvent::AgentTurnStarted { turn_id } => {
                 write!(f, "AgentTurnStarted(turn_id={})", short_uuid(turn_id))
             }
-            AgentEvent::AgentTurnEnded {
-                turn_id, reason, ..
-            } => {
-                write!(
-                    f,
-                    "AgentTurnEnded(turn_id={}, reason={reason:?})",
-                    short_uuid(turn_id)
-                )
+            AgentEvent::AgentTurnEnded { turn_id } => {
+                write!(f, "AgentTurnEnded(turn_id={})", short_uuid(turn_id))
+            }
+            AgentEvent::ModelStepStarted { step_id } => {
+                write!(f, "ModelStepStarted(step_id={})", short_uuid(step_id))
+            }
+            AgentEvent::ModelStepEnded { step_id, reason, .. } => {
+                write!(f, "ModelStepEnded(step_id={}, reason={reason:?})", short_uuid(step_id))
             }
             AgentEvent::UserMessageCommitted {
                 intent, ..
@@ -250,18 +256,8 @@ impl std::fmt::Display for AgentEvent {
                     short_string(content)
                 )
             }
-            AgentEvent::ToolCallRequested {
-                tool_call_id,
-                name,
-                arguments,
-            } => {
-                write!(
-                    f,
-                    "ToolCallRequested(tool_call_id={tool_call_id}, name={name}, arguments={arguments:?})"
-                )
-            }
-            AgentEvent::ToolExecutionStarted { tool_call_id } => {
-                write!(f, "ToolExecutionStarted(tool_call_id={tool_call_id})")
+            AgentEvent::ToolExecutionStarted { tool_call_id, tool_name, arguments } => {
+                write!(f, "ToolExecutionStarted(tool_call_id={tool_call_id}, tool_name={tool_name}, arguments={arguments:?})")
             }
             AgentEvent::ToolExecutionUpdated {
                 tool_call_id,
@@ -274,11 +270,12 @@ impl std::fmt::Display for AgentEvent {
             }
             AgentEvent::ToolExecutionEnded {
                 tool_call_id,
+                tool_name,
                 result,
             } => {
                 write!(
                     f,
-                    "ToolExecutionEnded(tool_call_id={tool_call_id}, result={result})"
+                    "ToolExecutionEnded(tool_call_id={tool_call_id}, tool_name={tool_name}, result={result})"
                 )
             }
             AgentEvent::ErrorOccurred { message, details } => {

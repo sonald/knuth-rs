@@ -2,15 +2,13 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
-use crate::agent_loop::AgentTurnLoopError;
-use crate::{Actor, ActorContext, ActorRuntime, AgentTurnRunner, spawn_actor};
+use crate::{Actor, ActorContext, ActorRuntime, AgentTool, AgentStepRunner, BashTool, ToolInput, ToolOutcome, spawn_actor};
 use ai::{
-    AssistantMessage, ImageContent, Message, Model, StreamOptions, UserContent, UserContentBlock,
-    UserMessage, UserRole,
+    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolResultMessage, ToolResultRole, UserContent, UserContentBlock, UserMessage, UserRole,
 };
 use knuth_core::{
     AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore,
-    SessionEndReason, StoredEvent, TurnEndReason, UserMessageIntent,
+    SessionEndReason, StoredEvent, ModelStepEndReason, UserMessageIntent,
 };
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{mpsc, oneshot};
@@ -83,16 +81,31 @@ impl ConversationState {
 
     pub fn apply_event(&mut self, event: StoredEvent) {
         match event.event {
-            AgentEvent::AgentTurnEnded {
+            AgentEvent::ModelStepEnded {
+                reason,
                 assistant_message: Some(assistant_message),
                 ..
-            } => {
+            } if matches!(reason, ModelStepEndReason::Success | ModelStepEndReason::Length | ModelStepEndReason::ToolUse) => {
                 self.add_message(Message::Assistant(assistant_message));
             }
             AgentEvent::UserMessageCommitted { content, .. } => {
                 self.add_message(Message::User(UserMessage {
                     role: UserRole::User,
                     content: content,
+                    timestamp: event.timestamp.timestamp(),
+                }));
+            }
+            AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result,} => {
+                debug!("append ToolExecutionEnded event to conversation state");
+
+                let content = vec![UserContentBlock::text(result)];
+                self.add_message(Message::ToolResult(ToolResultMessage {
+                    role: ToolResultRole::ToolResult,
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    details: None,
+                    is_error: false,
                     timestamp: event.timestamp.timestamp(),
                 }));
             }
@@ -134,8 +147,7 @@ pub enum AgentActorMessage {
 pub enum TurnMessage {
     Event(AgentEvent),
     Finished {
-        reason: TurnEndReason,
-        error: Option<AgentTurnLoopError>,
+        reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
     },
 }
@@ -211,48 +223,30 @@ impl Actor for AgentActor {
             AgentActorMessage::Command(command) => {
                 debug!("Handling command: {}", command);
                 if let Err(e) = self.handle_command(command, ctx).await {
-                    match e {
-                        AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
-                        e => {
-                            let _ = self
-                                .persist_and_publish(AgentEvent::ErrorOccurred {
-                                    message: e.to_string(),
-                                    details: None,
-                                })
-                                .await;
-                        }
-                    }
+                    return self.handle_session_error(e).await;
+                }
+            }
+
+            AgentActorMessage::Turn(_, TurnMessage::Event(AgentEvent::ModelStepEnded {
+                 step_id, reason, assistant_message 
+            })) => {
+                debug!("Model step ended, reason: {:?}", reason);
+                if let Err(e) = self.handle_step_ended(step_id, reason, assistant_message, ctx).await {
+                    return self.handle_session_error(e).await;
                 }
             }
 
             AgentActorMessage::Turn(_, TurnMessage::Event(event)) => {
-                if let Err(e) = self.persist_and_publish(event).await {
-                    match e {
-                        AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
-                        e => {
-                            let _ = self
-                                .persist_and_publish(AgentEvent::ErrorOccurred {
-                                    message: e.to_string(),
-                                    details: None,
-                                })
-                                .await;
-                        }
-                    }
-
+                if let Err(e) = self.persist_and_publish(event.clone()).await {
+                    return self.handle_session_error(e).await;
                 }
             }
 
             AgentActorMessage::Turn(
-                turn_id,
-                TurnMessage::Finished {
-                    reason,
-                    error,
-                    assistant_message,
-                },
+                _,
+                TurnMessage::Finished { ..},
             ) => {
-                let _ = self
-                    .handle_turn_ended(turn_id, reason, error, assistant_message, ctx)
-                    .await;
+
             }
         }
         ControlFlow::Continue(())
@@ -306,6 +300,48 @@ impl AgentActor {
             });
     }
 
+    async fn execute_tool(&mut self, tool_call_id: String, name: String, arguments: ToolInput) -> Result<(), AgentSessionError> {
+        self.persist_and_publish(AgentEvent::ToolExecutionStarted { tool_call_id: tool_call_id.clone(), tool_name: name.clone(), arguments: arguments.clone() }).await?;
+
+        if name == BashTool::schema().name {
+            let bash_tool = BashTool {};
+            let result = bash_tool.invoke(arguments).await;
+            let tool_name = BashTool::schema().name;
+            debug!("tool result: {:?}", result);
+
+            match result {
+                Ok(ToolOutcome::Success(result)) => {
+                    let result = result.get("output").unwrap().as_str().unwrap().to_string();
+                    self.persist_and_publish(AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result }).await?;
+                }
+                Err(e) => {
+                    self.persist_and_publish(AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result: e.to_string() }).await?;
+                }
+            }
+        } else {
+            self.persist_and_publish(AgentEvent::ToolExecutionEnded {
+                 tool_call_id, tool_name: name.clone(), result: format!("Invalid tool name: {}", name) 
+            }).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_session_error(&mut self, error: AgentSessionError) -> ControlFlow<()> {
+        match error {
+            AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
+            e => {
+                let _ = self
+                    .persist_and_publish(AgentEvent::ErrorOccurred {
+                        message: e.to_string(),
+                        details: None,
+                    })
+                    .await;
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
     async fn persist_and_publish(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
         let stored = self.store.append(event.clone()).await?;
         self.conversation_state.apply_event(stored.clone());
@@ -314,34 +350,73 @@ impl AgentActor {
         Ok(())
     }
 
-    async fn handle_turn_ended(
+    async fn process_pending_tool_calls(&mut self, assistant_message: &Option<AssistantMessage>) -> Result<(), AgentSessionError> {
+        let tool_call_events: Vec<_> = assistant_message
+            .as_ref()
+            .map(|msg| {
+                msg.content
+                    .iter()
+                    .filter_map(|content| match content {
+                        ContentBlock::ToolCall(tool_call) => Some(tool_call),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for e in tool_call_events {
+            self.execute_tool(e.id.clone(), e.name.clone(), e.arguments.clone().into()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_step_ended(
         &mut self,
-        turn_id: Uuid,
-        reason: TurnEndReason,
-        error: Option<AgentTurnLoopError>,
+        step_id: Uuid,
+        reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        debug!("AgentActor: Turn ended, reason: {:?}", reason);
+        debug!("Model step ended, reason: {:?}", reason);
 
-        if let Some(error) = error {
+        if let ModelStepEndReason::Error(error) = &reason {
             self.persist_and_publish(AgentEvent::ErrorOccurred {
                 message: error.to_string(),
                 details: None,
             })
             .await?;
-            debug!("AgentActor: Error occurred in agent loop: {:?}", error);
+            debug!("Error occurred in model step: {:?}", error);
+            return Ok(());
         }
 
-        self.persist_and_publish(AgentEvent::AgentTurnEnded {
-            turn_id,
-            reason,
-            assistant_message,
+        let has_tool_call = if let Some(msg) = &assistant_message {
+            msg.content.iter().any(|content| {
+                matches!(content, ContentBlock::ToolCall(_))
+            })
+        } else {
+            false
+        };
+
+        self.persist_and_publish(AgentEvent::ModelStepEnded {
+            step_id,
+            reason: reason.clone(),
+            assistant_message: assistant_message.clone(),
         })
         .await?;
 
         self.state = AgentActorState::Idle;
-        self.try_dispatch_next_input(ctx).await
+
+        if has_tool_call {
+            self.process_pending_tool_calls(&assistant_message).await?;
+            self.continue_step(ctx).await
+        } else {
+            self.persist_and_publish(AgentEvent::AgentTurnEnded {
+                turn_id: Uuid::now_v7(), //TODO: need to get the turn id from turn start
+            }).await?;
+
+            self.try_dispatch_next_input(ctx).await
+        }
     }
 
     async fn handle_command(
@@ -394,12 +469,24 @@ impl AgentActor {
     }
 
     async fn assemble_context(&self) -> Result<ai::Context, AgentSessionError> {
+        let tools = Some(vec![BashTool::schema()]);
         let context = ai::Context {
             system_prompt: Some(self.conversation_state.system_prompt.clone()),
             messages: self.conversation_state.messages.clone(),
-            tools: None,
+            tools,
         };
         Ok(context)
+    }
+
+    async fn continue_step(
+        &mut self,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+
+        let context = self.assemble_context().await?;
+        debug!("current conversation state: \n{}", self.conversation_state);
+        self.spawn_model_step(context, ctx).await?;
+        Ok(())
     }
 
     async fn try_dispatch_next_input(
@@ -414,6 +501,11 @@ impl AgentActor {
             return Ok(());
         };
 
+        self.persist_and_publish(AgentEvent::AgentTurnStarted {
+            turn_id: Uuid::now_v7(),
+        })
+        .await?;
+
         self.persist_and_publish(AgentEvent::UserMessageCommitted {
             content: input.content,
             intent: input.intent,
@@ -422,11 +514,11 @@ impl AgentActor {
 
         let context = self.assemble_context().await?;
         debug!("current conversation state: \n{}", self.conversation_state);
-        self.spawn_turn(context, ctx).await?;
+        self.spawn_model_step(context, ctx).await?;
         Ok(())
     }
 
-    async fn spawn_turn(
+    async fn spawn_model_step(
         &mut self,
         context: ai::Context,
         actor_ctx: &mut ActorContext<AgentActorMessage>,
@@ -436,26 +528,21 @@ impl AgentActor {
                 "Actor context is not upgraded".to_string(),
             ));
         };
-        let turn_cancel = actor_ctx.shutdown.child_token();
+        let step_cancel = actor_ctx.shutdown.child_token();
 
-        let mut current_turn = AgentTurnRunner::new(
+        let mut current_step = AgentStepRunner::new(
             self.config.model.clone(),
             self.config.options.clone(),
             store_tx,
             context,
-            turn_cancel.clone(),
+            step_cancel.clone(),
         );
 
-        self.persist_and_publish(AgentEvent::AgentTurnStarted {
-            turn_id: current_turn.turn_id(),
-        })
-        .await?;
-
         tokio::task::spawn(async move {
-            let _ = current_turn.start_turn_loop(Some(10)).await;
+            let _ = current_step.start_step().await;
         });
 
-        self.state = AgentActorState::Running(turn_cancel);
+        self.state = AgentActorState::Running(step_cancel);
 
         Ok(())
     }

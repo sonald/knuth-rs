@@ -18,4 +18,5 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+once_cell = { workspace = true }
 base64 = "0.22"
