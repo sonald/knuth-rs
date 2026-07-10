@@ -240,7 +240,7 @@ async fn run(
         None
     };
 
-    let body = build_request_body(&context, &options);
+    let body = build_request_body(&model, &context, &options);
     let payload = match serde_json::to_vec(&body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -595,32 +595,42 @@ async fn consume(
                         partial: partial.clone(),
                     });
                 } else if let Some(rc) = delta.get("reasoningContent") {
-                    if let Some(text) = rc.get("text").and_then(|v| v.as_str()) {
-                        let pos = *index_map.entry(bidx).or_insert_with(|| {
+                    let text = rc.get("text").and_then(|v| v.as_str());
+                    let signature = rc.get("signature").and_then(|v| v.as_str());
+                    if text.is_some() || signature.is_some() {
+                        let (pos, created) = if let Some(pos) = index_map.get(&bidx).copied() {
+                            (pos, false)
+                        } else {
                             let p = partial.content.len();
                             partial
                                 .content
                                 .push(ContentBlock::Thinking(ThinkingContent::default()));
-                            p
-                        });
-                        let is_first = matches!(
-                            partial.content.get(pos),
-                            Some(ContentBlock::Thinking(t)) if t.thinking.is_empty()
-                        );
-                        if is_first {
+                            index_map.insert(bidx, p);
+                            (p, true)
+                        };
+                        if created {
                             sender.push(AssistantMessageEvent::ThinkingStart {
                                 content_index: pos,
                                 partial: partial.clone(),
                             });
                         }
                         if let Some(ContentBlock::Thinking(t)) = partial.content.get_mut(pos) {
-                            t.thinking.push_str(text);
+                            if let Some(text) = text {
+                                t.thinking.push_str(text);
+                            }
+                            if let Some(signature) = signature {
+                                t.thinking_signature
+                                    .get_or_insert_default()
+                                    .push_str(signature);
+                            }
                         }
-                        sender.push(AssistantMessageEvent::ThinkingDelta {
-                            content_index: pos,
-                            delta: text.to_string(),
-                            partial: partial.clone(),
-                        });
+                        if let Some(text) = text {
+                            sender.push(AssistantMessageEvent::ThinkingDelta {
+                                content_index: pos,
+                                delta: text.to_string(),
+                                partial: partial.clone(),
+                            });
+                        }
                     }
                 } else if let Some(input) = delta.pointer("/toolUse/input").and_then(|v| v.as_str())
                 {
@@ -680,7 +690,11 @@ async fn consume(
             }
             Some("messageStop") => {
                 saw_terminal = true;
-                partial.stop_reason = map_stop_reason(payload["stopReason"].as_str().unwrap_or(""));
+                let provider_reason = payload["stopReason"].as_str().unwrap_or("");
+                partial.stop_reason = map_stop_reason(provider_reason);
+                if partial.stop_reason == StopReason::Error {
+                    partial.error_message = Some(format!("bedrock stop reason: {provider_reason}"));
+                }
             }
             Some("metadata") => {
                 if let Some(u) = payload.get("usage") {
@@ -706,6 +720,13 @@ async fn consume(
     let reason = match partial.stop_reason {
         StopReason::ToolUse => DoneReason::ToolUse,
         StopReason::Length => DoneReason::Length,
+        StopReason::Error => {
+            sender.push(AssistantMessageEvent::Error {
+                reason: ErrorReason::Error,
+                error: partial,
+            });
+            return;
+        }
         _ => DoneReason::Stop,
     };
     sender.push(AssistantMessageEvent::Done {
@@ -717,9 +738,9 @@ async fn consume(
 fn map_stop_reason(s: &str) -> StopReason {
     match s {
         "end_turn" | "stop_sequence" => StopReason::Stop,
-        "max_tokens" => StopReason::Length,
+        "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
         "tool_use" => StopReason::ToolUse,
-        _ => StopReason::Stop,
+        _ => StopReason::Error,
     }
 }
 
@@ -737,8 +758,8 @@ fn update_usage(usage: &mut Usage, u: &Value) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
-fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
-    let mut body = json!({ "messages": convert_messages(&context.messages) });
+fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+    let mut body = json!({ "messages": convert_messages(model, &context.messages) });
     let nova_high = options
         .provider_extras
         .get("bedrock_additional_model_request_fields")
@@ -792,7 +813,12 @@ fn serialize_tools(tools: &[Tool]) -> Vec<Value> {
         .collect()
 }
 
-fn convert_messages(msgs: &[Message]) -> Vec<Value> {
+fn supports_reasoning_signature(model: &Model) -> bool {
+    model.id.to_ascii_lowercase().contains("anthropic.claude")
+        || model.name.to_ascii_lowercase().contains("claude")
+}
+
+fn convert_messages(model: &Model, msgs: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
         match m {
@@ -808,6 +834,32 @@ fn convert_messages(msgs: &[Message]) -> Vec<Value> {
                 for b in &a.content {
                     match b {
                         ContentBlock::Text(t) => content.push(json!({ "text": t.text })),
+                        ContentBlock::Thinking(t) if !t.thinking.trim().is_empty() => {
+                            if supports_reasoning_signature(model) {
+                                if let Some(signature) = t
+                                    .thinking_signature
+                                    .as_deref()
+                                    .filter(|signature| !signature.is_empty())
+                                {
+                                    content.push(json!({
+                                        "reasoningContent": {
+                                            "reasoningText": {
+                                                "text": t.thinking,
+                                                "signature": signature,
+                                            }
+                                        }
+                                    }));
+                                } else {
+                                    content.push(json!({ "text": t.thinking }));
+                                }
+                            } else {
+                                content.push(json!({
+                                    "reasoningContent": {
+                                        "reasoningText": { "text": t.thinking }
+                                    }
+                                }));
+                            }
+                        }
                         ContentBlock::ToolCall(tc) => content.push(json!({
                             "toolUse": { "toolUseId": tc.id, "name": tc.name, "input": tc.arguments }
                         })),
@@ -886,6 +938,8 @@ mod tests {
 
     #[test]
     fn body_has_converse_shape() {
+        let model = crate::get_model(&Provider::from("amazon-bedrock"), "amazon.nova-lite-v1:0")
+            .expect("built-in Nova model");
         let ctx = Context {
             system_prompt: Some("sys".into()),
             messages: vec![Message::User(UserMessage {
@@ -903,7 +957,7 @@ mod tests {
             max_tokens: Some(512),
             ..Default::default()
         };
-        let body = build_request_body(&ctx, &opts);
+        let body = build_request_body(&model, &ctx, &opts);
         assert_eq!(body["system"][0]["text"], "sys");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hi");
@@ -913,6 +967,8 @@ mod tests {
 
     #[test]
     fn tool_result_converts() {
+        let model = crate::get_model(&Provider::from("amazon-bedrock"), "amazon.nova-lite-v1:0")
+            .expect("built-in Nova model");
         let msgs = vec![Message::ToolResult(ToolResultMessage {
             role: ToolResultRole::ToolResult,
             tool_call_id: "tu_1".into(),
@@ -922,7 +978,7 @@ mod tests {
             is_error: false,
             timestamp: 0,
         })];
-        let out = convert_messages(&msgs);
+        let out = convert_messages(&model, &msgs);
         assert_eq!(out[0]["content"][0]["toolResult"]["toolUseId"], "tu_1");
         assert_eq!(out[0]["content"][0]["toolResult"]["status"], "success");
     }
@@ -1011,7 +1067,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = build_request_body(&context, &translated);
+        let body = build_request_body(&model, &context, &translated);
 
         assert_eq!(body["inferenceConfig"]["maxTokens"], 321);
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");

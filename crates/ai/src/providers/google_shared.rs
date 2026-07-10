@@ -31,8 +31,7 @@ pub fn map_stop_reason(reason: &str) -> StopReason {
     match reason {
         "STOP" => StopReason::Stop,
         "MAX_TOKENS" => StopReason::Length,
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" => StopReason::Error,
-        _ => StopReason::Stop,
+        _ => StopReason::Error,
     }
 }
 

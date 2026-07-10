@@ -15,6 +15,7 @@ use ai::{Api, AssistantMessage, ContentBlock, Message, StopReason, ThinkingConte
     feature = "openai-completions",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
+    feature = "google",
     feature = "google-vertex",
     all(
         feature = "cloudflare",
@@ -28,6 +29,7 @@ use ai::{SimpleStreamOptions, ThinkingLevel, stream_simple};
     feature = "openai-completions",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
+    feature = "google",
     feature = "google-vertex",
     all(
         feature = "cloudflare",
@@ -245,7 +247,11 @@ fn header_values<'a>(request: &'a str, target: &str) -> Vec<&'a str> {
         .collect()
 }
 
-#[cfg(any(feature = "amazon-bedrock", feature = "google-vertex"))]
+#[cfg(any(
+    feature = "amazon-bedrock",
+    feature = "google",
+    feature = "google-vertex"
+))]
 async fn stream_to_done(
     model: &ai::Model,
     context: &Context,
@@ -263,6 +269,281 @@ async fn stream_to_done(
         }
     }
     done.expect("expected normally terminated stream")
+}
+
+#[cfg(any(
+    feature = "amazon-bedrock",
+    feature = "google",
+    feature = "google-vertex"
+))]
+fn captured_request_json(request: &str) -> serde_json::Value {
+    serde_json::from_str(
+        request
+            .split_once("\r\n\r\n")
+            .expect("captured request body")
+            .1,
+    )
+    .expect("valid captured request JSON")
+}
+
+#[cfg(any(feature = "google", feature = "google-vertex"))]
+const GOOGLE_SIGNATURE_SSE: &[u8] = br#"data: {"responseId":"signature-response","candidates":[{"content":{"parts":[{"thought":true,"text":"plan","thoughtSignature":"dGhpbmtpbmc="},{"text":"answer","thoughtSignature":"dGV4dA=="},{"text":"plain"},{"text":"","thoughtSignature":"ZW1wdHk="}]},"finishReason":"STOP"}]}
+
+"#;
+
+#[cfg(any(feature = "google", feature = "google-vertex"))]
+const GOOGLE_DONE_SSE: &[u8] = br#"data: {"responseId":"vertex-response","candidates":[{"content":{"parts":[{"text":"vertex ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":20,"toolUsePromptTokenCount":5,"candidatesTokenCount":10,"thoughtsTokenCount":5}}
+
+"#;
+
+#[cfg(any(feature = "google", feature = "google-vertex"))]
+async fn assert_google_signature_round_trip(
+    api: KnownApi,
+    provider: &str,
+    options: &StreamOptions,
+) {
+    let first_user = ai::Message::User(ai::UserMessage {
+        role: ai::UserRole::User,
+        content: ai::UserContent::Text("first turn".into()),
+        timestamp: 0,
+    });
+    let first_context = Context {
+        messages: vec![first_user.clone()],
+        ..Default::default()
+    };
+    let (base_url, first_request) =
+        support::serve_capture_once(GOOGLE_SIGNATURE_SSE, "text/event-stream").await;
+    let model = support::model(api.clone(), provider, "gemini-test", base_url);
+
+    let assistant = stream_to_done(&model, &first_context, options).await;
+    let _ = first_request.await.expect("first captured request");
+    match assistant.content.as_slice() {
+        [
+            ai::ContentBlock::Thinking(thinking),
+            ai::ContentBlock::Text(text),
+            ai::ContentBlock::Text(plain),
+            ai::ContentBlock::Text(empty),
+        ] => {
+            assert_eq!(thinking.thinking, "plan");
+            assert_eq!(thinking.thinking_signature.as_deref(), Some("dGhpbmtpbmc="));
+            assert_eq!(text.text, "answer");
+            assert_eq!(text.text_signature.as_deref(), Some("dGV4dA=="));
+            assert_eq!(plain.text, "plain");
+            assert_eq!(plain.text_signature, None);
+            assert!(empty.text.is_empty());
+            assert_eq!(empty.text_signature.as_deref(), Some("ZW1wdHk="));
+        }
+        content => panic!("unexpected signed Google content blocks: {content:?}"),
+    }
+
+    let next_user = ai::Message::User(ai::UserMessage {
+        role: ai::UserRole::User,
+        content: ai::UserContent::Text("second turn".into()),
+        timestamp: 1,
+    });
+    let next_context = Context {
+        messages: vec![first_user, ai::Message::Assistant(assistant), next_user],
+        ..Default::default()
+    };
+    let (base_url, next_request) =
+        support::serve_capture_once(GOOGLE_DONE_SSE, "text/event-stream").await;
+    let model = support::model(api, provider, "gemini-test", base_url);
+    let _ = stream_to_done(&model, &next_context, options).await;
+    let request = next_request.await.expect("next captured request").request;
+    let body = captured_request_json(&request);
+
+    assert_eq!(
+        body["contents"][1]["parts"],
+        serde_json::json!([
+            {
+                "thought": true,
+                "text": "plan",
+                "thoughtSignature": "dGhpbmtpbmc="
+            },
+            { "text": "answer", "thoughtSignature": "dGV4dA==" },
+            { "text": "plain" },
+            { "text": "", "thoughtSignature": "ZW1wdHk=" }
+        ])
+    );
+}
+
+#[cfg(feature = "google")]
+#[tokio::test]
+async fn google_public_stream_replays_text_thinking_and_empty_part_signatures() {
+    assert_google_signature_round_trip(
+        KnownApi::GoogleGenerativeAi,
+        "google",
+        &StreamOptions {
+            api_key: Some("google-test-key".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_public_stream_replays_text_thinking_and_empty_part_signatures() {
+    let _lock = support::env_lock().lock().await;
+    let _project = EnvVarGuard::set("GOOGLE_VERTEX_PROJECT", "signature-project");
+    let _location = EnvVarGuard::set("GOOGLE_VERTEX_LOCATION", "us-central1");
+
+    assert_google_signature_round_trip(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        &StreamOptions {
+            api_key: Some("vertex-test-token".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[cfg(feature = "amazon-bedrock")]
+fn bedrock_reasoning_body(signature_chunks: &[&str]) -> &'static [u8] {
+    let mut body = Vec::new();
+    for text in ["plan ", "carefully"] {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "contentBlockIndex": 0,
+            "delta": { "reasoningContent": { "text": text } }
+        }))
+        .unwrap();
+        body.extend(support::aws_eventstream_frame(
+            "contentBlockDelta",
+            &payload,
+        ));
+    }
+    for signature in signature_chunks {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "contentBlockIndex": 0,
+            "delta": { "reasoningContent": { "signature": signature } }
+        }))
+        .unwrap();
+        body.extend(support::aws_eventstream_frame(
+            "contentBlockDelta",
+            &payload,
+        ));
+    }
+    body.extend(support::aws_eventstream_frame(
+        "contentBlockStop",
+        br#"{"contentBlockIndex":0}"#,
+    ));
+    body.extend(support::aws_eventstream_frame(
+        "contentBlockDelta",
+        br#"{"contentBlockIndex":1,"delta":{"text":"answer"}}"#,
+    ));
+    body.extend(support::aws_eventstream_frame(
+        "contentBlockStop",
+        br#"{"contentBlockIndex":1}"#,
+    ));
+    body.extend(support::aws_eventstream_frame(
+        "messageStop",
+        br#"{"stopReason":"end_turn"}"#,
+    ));
+    Box::leak(body.into_boxed_slice())
+}
+
+#[cfg(feature = "amazon-bedrock")]
+async fn assert_bedrock_reasoning_round_trip(
+    model_id: &str,
+    signature_chunks: &[&str],
+    expected_signature: Option<&str>,
+) {
+    let first_user = ai::Message::User(ai::UserMessage {
+        role: ai::UserRole::User,
+        content: ai::UserContent::Text("first turn".into()),
+        timestamp: 0,
+    });
+    let first_context = Context {
+        messages: vec![first_user.clone()],
+        ..Default::default()
+    };
+    let options = StreamOptions {
+        api_key: Some("bedrock-bearer".into()),
+        ..Default::default()
+    };
+    let (base_url, first_request) = support::serve_capture_once(
+        bedrock_reasoning_body(signature_chunks),
+        "application/vnd.amazon.eventstream",
+    )
+    .await;
+    let model = support::model(
+        KnownApi::BedrockConverseStream,
+        "amazon-bedrock",
+        model_id,
+        base_url,
+    );
+
+    let assistant = stream_to_done(&model, &first_context, &options).await;
+    let _ = first_request.await.expect("first captured request");
+    match assistant.content.as_slice() {
+        [
+            ai::ContentBlock::Thinking(thinking),
+            ai::ContentBlock::Text(text),
+        ] => {
+            assert_eq!(thinking.thinking, "plan carefully");
+            assert_eq!(thinking.thinking_signature.as_deref(), expected_signature);
+            assert_eq!(text.text, "answer");
+        }
+        content => panic!("unexpected Bedrock reasoning blocks: {content:?}"),
+    }
+
+    let next_context = Context {
+        messages: vec![
+            first_user,
+            ai::Message::Assistant(assistant),
+            ai::Message::User(ai::UserMessage {
+                role: ai::UserRole::User,
+                content: ai::UserContent::Text("second turn".into()),
+                timestamp: 1,
+            }),
+        ],
+        ..Default::default()
+    };
+    let (base_url, next_request) =
+        support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
+            .await;
+    let model = support::model(
+        KnownApi::BedrockConverseStream,
+        "amazon-bedrock",
+        model_id,
+        base_url,
+    );
+    let _ = stream_to_done(&model, &next_context, &options).await;
+    let request = next_request.await.expect("next captured request").request;
+    let body = captured_request_json(&request);
+    let reasoning_text = match expected_signature {
+        Some(signature) => serde_json::json!({
+            "reasoningContent": {
+                "reasoningText": {
+                    "text": "plan carefully",
+                    "signature": signature
+                }
+            }
+        }),
+        None => serde_json::json!({
+            "reasoningContent": {
+                "reasoningText": { "text": "plan carefully" }
+            }
+        }),
+    };
+
+    assert_eq!(
+        body["messages"][1]["content"],
+        serde_json::json!([reasoning_text, { "text": "answer" }])
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_public_stream_replays_claude_and_nova_reasoning_in_block_order() {
+    assert_bedrock_reasoning_round_trip(
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        &["claude-", "signature"],
+        Some("claude-signature"),
+    )
+    .await;
+    assert_bedrock_reasoning_round_trip("amazon.nova-2-lite-v1:0", &[], None).await;
 }
 
 #[cfg(any(feature = "amazon-bedrock", feature = "google-vertex"))]
@@ -813,11 +1094,6 @@ async fn bedrock_simple_reasoning_fails_closed_for_unmapped_builtin_model() {
 }
 
 #[cfg(feature = "google-vertex")]
-const VERTEX_DONE_SSE: &[u8] = br#"data: {"responseId":"vertex-response","candidates":[{"content":{"parts":[{"text":"vertex ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":20,"toolUsePromptTokenCount":5,"candidatesTokenCount":10,"thoughtsTokenCount":5}}
-
-"#;
-
-#[cfg(feature = "google-vertex")]
 #[tokio::test]
 async fn vertex_can_select_adc_when_access_token_absent() {
     let _lock = support::env_lock().lock().await;
@@ -847,7 +1123,7 @@ async fn vertex_can_select_adc_when_access_token_absent() {
     let _location = EnvVarGuard::set("GOOGLE_VERTEX_LOCATION", "europe-west4");
 
     let (base_url, model_request) =
-        support::serve_capture_once(VERTEX_DONE_SSE, "text/event-stream").await;
+        support::serve_capture_once(GOOGLE_DONE_SSE, "text/event-stream").await;
     let mut model = support::model(
         KnownApi::GoogleVertex,
         "google-vertex",
@@ -984,7 +1260,7 @@ async fn vertex_auth_priority_is_options_then_env_then_adc() {
     );
 
     let (base_url, captured) =
-        support::serve_capture_once(VERTEX_DONE_SSE, "text/event-stream").await;
+        support::serve_capture_once(GOOGLE_DONE_SSE, "text/event-stream").await;
     let model = support::model(
         KnownApi::GoogleVertex,
         "google-vertex",
@@ -1002,7 +1278,7 @@ async fn vertex_auth_priority_is_options_then_env_then_adc() {
     );
 
     let (base_url, captured) =
-        support::serve_capture_once(VERTEX_DONE_SSE, "text/event-stream").await;
+        support::serve_capture_once(GOOGLE_DONE_SSE, "text/event-stream").await;
     let model = support::model(
         KnownApi::GoogleVertex,
         "google-vertex",
@@ -1038,7 +1314,7 @@ async fn vertex_explicit_project_overrides_service_account_project() {
     );
     let _location = EnvVarGuard::set("GOOGLE_VERTEX_LOCATION", "us-central1");
     let (base_url, model_request) =
-        support::serve_capture_once(VERTEX_DONE_SSE, "text/event-stream").await;
+        support::serve_capture_once(GOOGLE_DONE_SSE, "text/event-stream").await;
     let model = support::model(
         KnownApi::GoogleVertex,
         "google-vertex",

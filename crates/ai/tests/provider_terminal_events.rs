@@ -1,11 +1,11 @@
 mod support;
 
-#[cfg(feature = "mistral")]
-use ai::ContentBlock;
 use ai::{
     AssistantMessageEvent, Context, KnownApi, Message, StopReason, StreamOptions, UserContent,
     UserMessage, UserRole, stream,
 };
+#[cfg(feature = "mistral")]
+use ai::{ContentBlock, SimpleStreamOptions, ThinkingLevel, stream_simple};
 use futures::StreamExt;
 #[cfg(feature = "google-vertex")]
 use support::EnvVarGuard;
@@ -20,6 +20,32 @@ fn context() -> Context {
         })],
         tools: None,
     }
+}
+
+#[cfg(any(feature = "google", feature = "amazon-bedrock", feature = "mistral"))]
+async fn terminal_event(
+    api: KnownApi,
+    provider: &str,
+    model_id: &str,
+    base_url: String,
+) -> AssistantMessageEvent {
+    let model = support::model(api, provider, model_id, base_url);
+    let options = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &context(), Some(&options));
+    let mut terminal = None;
+    while let Some(event) = events.next().await {
+        if event.is_terminal() {
+            assert!(
+                terminal.is_none(),
+                "provider emitted multiple terminal events"
+            );
+            terminal = Some(event);
+        }
+    }
+    terminal.expect("provider terminal event")
 }
 
 async fn assert_eof_is_error(
@@ -135,6 +161,184 @@ async fn mistral_eof_before_done_or_finish_reason_is_error() {
     .await;
 
     assert_eof_is_error(KnownApi::MistralConversations, "mistral", base_url, true).await;
+}
+
+#[cfg(feature = "mistral")]
+fn mistral_terminal_sse(reason: &str) -> &'static [u8] {
+    let payload = serde_json::json!({
+        "id": "mistral-terminal",
+        "choices": [{ "delta": {}, "finish_reason": reason }]
+    });
+    Box::leak(
+        format!("data: {payload}\n\ndata: [DONE]\n\n")
+            .into_bytes()
+            .into_boxed_slice(),
+    )
+}
+
+#[cfg(feature = "mistral")]
+#[tokio::test]
+async fn mistral_finish_reasons_keep_success_mappings_and_fail_closed() {
+    for (provider_reason, expected_reason, expected_stop) in [
+        ("stop", ai::DoneReason::Stop, StopReason::Stop),
+        ("length", ai::DoneReason::Length, StopReason::Length),
+        ("model_length", ai::DoneReason::Length, StopReason::Length),
+        ("tool_calls", ai::DoneReason::ToolUse, StopReason::ToolUse),
+    ] {
+        let base_url =
+            support::serve_once(mistral_terminal_sse(provider_reason), "text/event-stream").await;
+        match terminal_event(
+            KnownApi::MistralConversations,
+            "mistral",
+            "mistral-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Done { reason, message } => {
+                assert_eq!(reason, expected_reason, "provider reason {provider_reason}");
+                assert_eq!(
+                    message.stop_reason, expected_stop,
+                    "provider reason {provider_reason}"
+                );
+            }
+            event => panic!("expected Done for {provider_reason}, got {event:?}"),
+        }
+    }
+
+    for provider_reason in ["error", "future_mistral_failure"] {
+        let base_url =
+            support::serve_once(mistral_terminal_sse(provider_reason), "text/event-stream").await;
+        match terminal_event(
+            KnownApi::MistralConversations,
+            "mistral",
+            "mistral-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Error { error, .. } => {
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert!(
+                    error
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains(provider_reason)),
+                    "raw finish reason was not retained: {:?}",
+                    error.error_message
+                );
+            }
+            event => panic!("expected Error for {provider_reason}, got {event:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "mistral")]
+#[tokio::test]
+async fn mistral_stream_simple_preserves_interleaved_reasoning_and_text_chunks() {
+    const BODY: &[u8] = br#"data: {"id":"mistral-reasoning","choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"plan "}]},{"type":"text","text":"answer "}]},"finish_reason":null}]}
+
+data: {"id":"mistral-reasoning","choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"reconsider"}]},{"type":"text","text":"done"}]},"finish_reason":null}]}
+
+data: {"id":"mistral-reasoning","choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+    let (base_url, captured) = support::serve_capture_once(BODY, "text/event-stream").await;
+    let mut model = support::model(
+        KnownApi::MistralConversations,
+        "mistral",
+        "mistral-small-latest",
+        base_url,
+    );
+    model.reasoning = true;
+    let options = SimpleStreamOptions {
+        base: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        reasoning: Some(ThinkingLevel::High),
+        ..Default::default()
+    };
+    let mut events = stream_simple(&model, &context(), Some(&options));
+    let mut starts = Vec::new();
+    let mut deltas = Vec::new();
+    let mut ends = Vec::new();
+    let mut message = None;
+    while let Some(event) = events.next().await {
+        match event {
+            AssistantMessageEvent::ThinkingStart { content_index, .. } => {
+                starts.push(("thinking", content_index));
+            }
+            AssistantMessageEvent::TextStart { content_index, .. } => {
+                starts.push(("text", content_index));
+            }
+            AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+                ..
+            } => deltas.push(("thinking", content_index, delta)),
+            AssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => deltas.push(("text", content_index, delta)),
+            AssistantMessageEvent::ThinkingEnd { content_index, .. } => {
+                ends.push(("thinking", content_index));
+            }
+            AssistantMessageEvent::TextEnd { content_index, .. } => {
+                ends.push(("text", content_index));
+            }
+            AssistantMessageEvent::Done { message: done, .. } => message = Some(done),
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected Mistral error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        starts,
+        vec![("thinking", 0), ("text", 1), ("thinking", 2), ("text", 3)]
+    );
+    assert_eq!(
+        deltas,
+        vec![
+            ("thinking", 0, "plan ".into()),
+            ("text", 1, "answer ".into()),
+            ("thinking", 2, "reconsider".into()),
+            ("text", 3, "done".into()),
+            ("text", 3, "tail".into()),
+        ]
+    );
+    assert_eq!(
+        ends,
+        vec![("thinking", 0), ("text", 1), ("thinking", 2), ("text", 3)]
+    );
+    let message = message.expect("Mistral Done event");
+    assert!(matches!(
+        message.content.as_slice(),
+        [
+            ContentBlock::Thinking(first),
+            ContentBlock::Text(first_text),
+            ContentBlock::Thinking(second),
+            ContentBlock::Text(second_text),
+        ] if first.thinking == "plan "
+            && first_text.text == "answer "
+            && second.thinking == "reconsider"
+            && second_text.text == "donetail"
+    ));
+
+    let request = captured.await.expect("captured Mistral request").request;
+    let body: serde_json::Value = serde_json::from_str(
+        request
+            .split_once("\r\n\r\n")
+            .expect("Mistral request body")
+            .1,
+    )
+    .unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
 }
 
 #[cfg(feature = "mistral")]
@@ -286,6 +490,109 @@ async fn google_eof_before_finish_reason_is_error() {
     assert_eof_is_error(KnownApi::GoogleGenerativeAi, "google", base_url, true).await;
 }
 
+#[cfg(feature = "google")]
+fn google_terminal_sse(reason: &str, with_tool_call: bool) -> &'static [u8] {
+    let parts = if with_tool_call {
+        serde_json::json!([{
+            "functionCall": { "name": "lookup", "args": {} },
+            "thoughtSignature": "dG9vbA=="
+        }])
+    } else {
+        serde_json::json!([{ "text": "answer" }])
+    };
+    let payload = serde_json::json!({
+        "candidates": [{
+            "content": { "parts": parts },
+            "finishReason": reason
+        }]
+    });
+    Box::leak(
+        format!("data: {payload}\n\n")
+            .into_bytes()
+            .into_boxed_slice(),
+    )
+}
+
+#[cfg(feature = "google")]
+#[tokio::test]
+async fn google_finish_reasons_keep_success_mappings_and_fail_closed() {
+    for (provider_reason, with_tool_call, expected_reason, expected_stop) in [
+        ("STOP", false, ai::DoneReason::Stop, StopReason::Stop),
+        (
+            "MAX_TOKENS",
+            false,
+            ai::DoneReason::Length,
+            StopReason::Length,
+        ),
+        (
+            "MAX_TOKENS",
+            true,
+            ai::DoneReason::Length,
+            StopReason::Length,
+        ),
+        ("STOP", true, ai::DoneReason::ToolUse, StopReason::ToolUse),
+    ] {
+        let base_url = support::serve_once(
+            google_terminal_sse(provider_reason, with_tool_call),
+            "text/event-stream",
+        )
+        .await;
+        match terminal_event(
+            KnownApi::GoogleGenerativeAi,
+            "google",
+            "gemini-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Done { reason, message } => {
+                assert_eq!(reason, expected_reason, "provider reason {provider_reason}");
+                assert_eq!(
+                    message.stop_reason, expected_stop,
+                    "provider reason {provider_reason}"
+                );
+            }
+            event => panic!("expected Done for {provider_reason}, got {event:?}"),
+        }
+    }
+
+    for provider_reason in [
+        "MALFORMED_FUNCTION_CALL",
+        "MISSING_THOUGHT_SIGNATURE",
+        "FUTURE_GEMINI_FAILURE",
+    ] {
+        let base_url = support::serve_once(
+            google_terminal_sse(
+                provider_reason,
+                provider_reason == "MALFORMED_FUNCTION_CALL",
+            ),
+            "text/event-stream",
+        )
+        .await;
+        match terminal_event(
+            KnownApi::GoogleGenerativeAi,
+            "google",
+            "gemini-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Error { error, .. } => {
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert!(
+                    error
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains(provider_reason)),
+                    "raw finish reason was not retained: {:?}",
+                    error.error_message
+                );
+            }
+            event => panic!("expected Error for {provider_reason}, got {event:?}"),
+        }
+    }
+}
+
 #[cfg(feature = "google-vertex")]
 #[tokio::test]
 async fn vertex_wrapper_done_usage_has_nonzero_cost() {
@@ -353,6 +660,85 @@ async fn bedrock_eof_before_message_stop_is_error() {
         true,
     )
     .await;
+}
+
+#[cfg(feature = "amazon-bedrock")]
+fn bedrock_terminal_body(reason: &str) -> &'static [u8] {
+    let payload = serde_json::to_vec(&serde_json::json!({ "stopReason": reason })).unwrap();
+    Box::leak(support::aws_eventstream_frame("messageStop", &payload).into_boxed_slice())
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_stop_reasons_keep_success_mappings_and_fail_closed() {
+    for (provider_reason, expected_reason, expected_stop) in [
+        ("end_turn", ai::DoneReason::Stop, StopReason::Stop),
+        ("stop_sequence", ai::DoneReason::Stop, StopReason::Stop),
+        ("max_tokens", ai::DoneReason::Length, StopReason::Length),
+        (
+            "model_context_window_exceeded",
+            ai::DoneReason::Length,
+            StopReason::Length,
+        ),
+        ("tool_use", ai::DoneReason::ToolUse, StopReason::ToolUse),
+    ] {
+        let base_url = support::serve_once(
+            bedrock_terminal_body(provider_reason),
+            "application/vnd.amazon.eventstream",
+        )
+        .await;
+        match terminal_event(
+            KnownApi::BedrockConverseStream,
+            "amazon-bedrock",
+            "bedrock-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Done { reason, message } => {
+                assert_eq!(reason, expected_reason, "provider reason {provider_reason}");
+                assert_eq!(
+                    message.stop_reason, expected_stop,
+                    "provider reason {provider_reason}"
+                );
+            }
+            event => panic!("expected Done for {provider_reason}, got {event:?}"),
+        }
+    }
+
+    for provider_reason in [
+        "content_filtered",
+        "guardrail_intervened",
+        "malformed_tool_use",
+        "future_bedrock_failure",
+    ] {
+        let base_url = support::serve_once(
+            bedrock_terminal_body(provider_reason),
+            "application/vnd.amazon.eventstream",
+        )
+        .await;
+        match terminal_event(
+            KnownApi::BedrockConverseStream,
+            "amazon-bedrock",
+            "bedrock-test",
+            base_url,
+        )
+        .await
+        {
+            AssistantMessageEvent::Error { error, .. } => {
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert!(
+                    error
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains(provider_reason)),
+                    "raw stop reason was not retained: {:?}",
+                    error.error_message
+                );
+            }
+            event => panic!("expected Error for {provider_reason}, got {event:?}"),
+        }
+    }
 }
 
 #[cfg(feature = "openai-responses")]

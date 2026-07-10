@@ -192,7 +192,7 @@ async fn run(
         partial: partial.clone(),
     });
 
-    let mut text_index: Option<usize> = None;
+    let mut open_content_index: Option<usize> = None;
     let mut tool_call_positions: HashMap<u64, usize> = HashMap::new();
     let mut tool_arg_buffers: HashMap<u64, String> = HashMap::new();
     let mut finish_reason: Option<String> = None;
@@ -246,34 +246,59 @@ async fn run(
         let Some(delta) = choice.get("delta") else {
             continue;
         };
-        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                let idx = *text_index.get_or_insert_with(|| {
-                    let i = partial.content.len();
-                    partial.content.push(ContentBlock::text(""));
-                    i
-                });
-                let is_first = matches!(
-                    partial.content.get(idx),
-                    Some(ContentBlock::Text(tc)) if tc.text.is_empty()
-                );
-                if is_first {
-                    sender.push(AssistantMessageEvent::TextStart {
-                        content_index: idx,
-                        partial: partial.clone(),
-                    });
+        if let Some(content) = delta.get("content").filter(|value| !value.is_null()) {
+            match content {
+                Value::String(text) => append_mistral_content_delta(
+                    &mut partial,
+                    &mut sender,
+                    &mut open_content_index,
+                    false,
+                    text,
+                ),
+                Value::Array(items) => {
+                    for item in items {
+                        match item.get("type").and_then(Value::as_str) {
+                            Some("thinking") => {
+                                let thinking = item
+                                    .get("thinking")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|part| {
+                                        part.get("type").and_then(Value::as_str) == Some("text")
+                                    })
+                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                    .collect::<String>();
+                                append_mistral_content_delta(
+                                    &mut partial,
+                                    &mut sender,
+                                    &mut open_content_index,
+                                    true,
+                                    &thinking,
+                                );
+                            }
+                            Some("text") => {
+                                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                    append_mistral_content_delta(
+                                        &mut partial,
+                                        &mut sender,
+                                        &mut open_content_index,
+                                        false,
+                                        text,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                if let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) {
-                    tc.text.push_str(content);
-                }
-                sender.push(AssistantMessageEvent::TextDelta {
-                    content_index: idx,
-                    delta: content.to_string(),
-                    partial: partial.clone(),
-                });
+                _ => {}
             }
         }
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            if !tcs.is_empty() {
+                finish_mistral_content_block(&mut partial, &mut sender, &mut open_content_index);
+            }
             for tc in tcs {
                 let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let position = *tool_call_positions.entry(index).or_insert_with(|| {
@@ -309,15 +334,7 @@ async fn run(
         }
     }
 
-    if let Some(idx) = text_index {
-        if let Some(ContentBlock::Text(tc)) = partial.content.get(idx).cloned() {
-            sender.push(AssistantMessageEvent::TextEnd {
-                content_index: idx,
-                content: tc.text,
-                partial: partial.clone(),
-            });
-        }
-    }
+    finish_mistral_content_block(&mut partial, &mut sender, &mut open_content_index);
     for (index, raw) in &tool_arg_buffers {
         let Some(position) = tool_call_positions.get(index).copied() else {
             continue;
@@ -356,9 +373,21 @@ async fn run(
         Some("stop") => StopReason::Stop,
         Some("length" | "model_length") => StopReason::Length,
         Some("tool_calls") => StopReason::ToolUse,
-        _ => StopReason::Stop,
+        None if saw_done => StopReason::Stop,
+        _ => StopReason::Error,
     };
     partial.stop_reason = stop;
+    if stop == StopReason::Error {
+        partial.error_message = Some(format!(
+            "mistral finish reason: {}",
+            finish_reason.as_deref().unwrap_or("missing")
+        ));
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+        return;
+    }
     let reason = match stop {
         StopReason::ToolUse => DoneReason::ToolUse,
         StopReason::Length => DoneReason::Length,
@@ -368,6 +397,90 @@ async fn run(
         reason,
         message: partial,
     });
+}
+
+fn finish_mistral_content_block(
+    partial: &mut AssistantMessage,
+    sender: &mut AssistantMessageEventSender,
+    open_content_index: &mut Option<usize>,
+) {
+    let Some(index) = open_content_index.take() else {
+        return;
+    };
+    match partial.content.get(index).cloned() {
+        Some(ContentBlock::Text(text)) => sender.push(AssistantMessageEvent::TextEnd {
+            content_index: index,
+            content: text.text,
+            partial: partial.clone(),
+        }),
+        Some(ContentBlock::Thinking(thinking)) => {
+            sender.push(AssistantMessageEvent::ThinkingEnd {
+                content_index: index,
+                content: thinking.thinking,
+                partial: partial.clone(),
+            });
+        }
+        _ => {}
+    }
+}
+
+fn append_mistral_content_delta(
+    partial: &mut AssistantMessage,
+    sender: &mut AssistantMessageEventSender,
+    open_content_index: &mut Option<usize>,
+    is_thinking: bool,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    let same_kind = open_content_index.is_some_and(|index| {
+        matches!(
+            (is_thinking, partial.content.get(index)),
+            (true, Some(ContentBlock::Thinking(_))) | (false, Some(ContentBlock::Text(_)))
+        )
+    });
+    if !same_kind {
+        finish_mistral_content_block(partial, sender, open_content_index);
+        let index = partial.content.len();
+        if is_thinking {
+            partial
+                .content
+                .push(ContentBlock::Thinking(ThinkingContent::default()));
+            sender.push(AssistantMessageEvent::ThinkingStart {
+                content_index: index,
+                partial: partial.clone(),
+            });
+        } else {
+            partial.content.push(ContentBlock::text(""));
+            sender.push(AssistantMessageEvent::TextStart {
+                content_index: index,
+                partial: partial.clone(),
+            });
+        }
+        *open_content_index = Some(index);
+    }
+
+    let index = open_content_index.expect("content block was opened");
+    if is_thinking {
+        if let Some(ContentBlock::Thinking(thinking)) = partial.content.get_mut(index) {
+            thinking.thinking.push_str(delta);
+        }
+        sender.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: index,
+            delta: delta.to_string(),
+            partial: partial.clone(),
+        });
+    } else {
+        if let Some(ContentBlock::Text(text)) = partial.content.get_mut(index) {
+            text.text.push_str(delta);
+        }
+        sender.push(AssistantMessageEvent::TextDelta {
+            content_index: index,
+            delta: delta.to_string(),
+            partial: partial.clone(),
+        });
+    }
 }
 
 fn update_usage(usage: &mut Usage, u: &Value) {

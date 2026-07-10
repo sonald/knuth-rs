@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::api_registry::ApiProvider;
 use crate::models::calculate_usage_cost;
 use crate::providers::google_shared::{
-    convert_messages, convert_tools, is_thinking_part, map_stop_reason,
+    convert_messages, convert_tools, is_thinking_part, map_stop_reason, retain_thought_signature,
 };
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
@@ -231,11 +231,25 @@ pub(crate) async fn consume_gemini_sse(
             .pointer("/candidates/0/content/parts")
             .and_then(|v| v.as_array())
         {
-            for part in parts {
+            for (part_index, part) in parts.iter().enumerate() {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                     let is_thinking = is_thinking_part(part);
                     let want = if is_thinking { 2 } else { 1 };
-                    if open != want {
+                    let incoming_signature = part.get("thoughtSignature").and_then(|v| v.as_str());
+                    let starts_signed_part = incoming_signature.is_some_and(|incoming| {
+                        let existing = match partial.content.last() {
+                            Some(ContentBlock::Text(text)) if open == 1 => {
+                                text.text_signature.as_deref()
+                            }
+                            Some(ContentBlock::Thinking(thinking)) if open == 2 => {
+                                thinking.thinking_signature.as_deref()
+                            }
+                            _ => None,
+                        };
+                        existing != Some(incoming)
+                    });
+                    let starts_new_part = part_index > 0 && open != 0;
+                    if open != want || starts_signed_part || starts_new_part {
                         close_open_block(open, &mut partial, &mut sender);
                         if is_thinking {
                             partial
@@ -258,6 +272,10 @@ pub(crate) async fn consume_gemini_sse(
                     if is_thinking {
                         if let Some(ContentBlock::Thinking(tc)) = partial.content.get_mut(idx) {
                             tc.thinking.push_str(text);
+                            tc.thinking_signature = retain_thought_signature(
+                                tc.thinking_signature.take(),
+                                incoming_signature,
+                            );
                         }
                         sender.push(AssistantMessageEvent::ThinkingDelta {
                             content_index: idx,
@@ -267,6 +285,10 @@ pub(crate) async fn consume_gemini_sse(
                     } else {
                         if let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) {
                             tc.text.push_str(text);
+                            tc.text_signature = retain_thought_signature(
+                                tc.text_signature.take(),
+                                incoming_signature,
+                            );
                         }
                         sender.push(AssistantMessageEvent::TextDelta {
                             content_index: idx,
@@ -336,12 +358,16 @@ pub(crate) async fn consume_gemini_sse(
         {
             saw_terminal = true;
             partial.stop_reason = map_stop_reason(reason);
-            if partial
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolCall(_)))
+            if partial.stop_reason == StopReason::Stop
+                && partial
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolCall(_)))
             {
                 partial.stop_reason = StopReason::ToolUse;
+            }
+            if partial.stop_reason == StopReason::Error {
+                partial.error_message = Some(format!("google finish reason: {reason}"));
             }
         }
 
