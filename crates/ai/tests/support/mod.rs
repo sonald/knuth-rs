@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 
 use ai::{Api, KnownApi, Model, ModelCost, Provider};
