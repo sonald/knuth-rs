@@ -719,22 +719,28 @@ fn update_usage(usage: &mut Usage, val: &Value) {
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if let Some(n) = val.get("input_tokens").and_then(|v| v.as_u64()) {
-        usage.input += n.saturating_sub(cached);
-    }
-    if let Some(n) = val.get("output_tokens").and_then(|v| v.as_u64()) {
-        usage.output += n;
-    }
-    usage.cache_read += cached;
     // Non-standard but reported by local inference servers (ds4): tokens newly
     // written into the prompt cache this request.
-    if let Some(n) = val
+    let cache_write = val
         .pointer("/input_tokens_details/cache_write_tokens")
         .and_then(|v| v.as_u64())
-    {
-        usage.cache_write += n;
-    }
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+        .unwrap_or(0);
+    usage.input = val
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(cached.saturating_add(cache_write));
+    usage.output = val
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    usage.cache_read = cached;
+    usage.cache_write = cache_write;
+    usage.total_tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────
@@ -1274,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_reads_cached_and_cache_write_tokens() {
+    fn responses_usage_subtracts_cache_write_tokens() {
         // ds4 reports both cached_tokens (KV prefix hits) and cache_write_tokens
         // (new suffix written into the live KV) under input_tokens_details.
         let mut usage = Usage::default();
@@ -1289,8 +1295,11 @@ mod tests {
                 },
             }),
         );
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 10);
         assert_eq!(usage.cache_read, 80);
         assert_eq!(usage.cache_write, 20);
+        assert_eq!(usage.total_tokens, 110);
     }
 
     #[test]
@@ -1310,10 +1319,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(usage.input, 25);
+        assert_eq!(usage.input, 20);
         assert_eq!(usage.output, 10);
-        assert_eq!(usage.cache_read, 82);
-        assert_eq!(usage.total_tokens, 117);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.total_tokens, 110);
 
         let mut underflow = Usage::default();
         update_usage(
@@ -1324,6 +1333,36 @@ mod tests {
             }),
         );
         assert_eq!(underflow.input, 0);
+    }
+
+    #[test]
+    fn responses_repeated_usage_snapshot_does_not_accumulate() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 80 },
+            }),
+        );
+        update_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 50,
+                "output_tokens": 5,
+                "input_tokens_details": {
+                    "cached_tokens": 20,
+                    "cache_write_tokens": 10,
+                },
+            }),
+        );
+
+        assert_eq!(usage.input, 20);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_read, 20);
+        assert_eq!(usage.cache_write, 10);
+        assert_eq!(usage.total_tokens, 55);
     }
 
     #[test]

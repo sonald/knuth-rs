@@ -429,10 +429,18 @@ fn update_usage(usage: &mut Usage, u: &Value) {
         .get("thoughtsTokenCount")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    usage.input = prompt.saturating_sub(cached);
-    usage.output = candidates + thoughts;
+    let tool_use = u
+        .get("toolUsePromptTokenCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    usage.input = prompt.saturating_sub(cached).saturating_add(tool_use);
+    usage.output = candidates.saturating_add(thoughts);
     usage.cache_read = cached;
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    usage.total_tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
 }
 
 pub(crate) fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
@@ -497,6 +505,37 @@ pub(crate) fn push_error(sender: &mut AssistantMessageEventSender, model: &Model
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_usage_includes_tool_use_prompt_tokens() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 80,
+                "toolUsePromptTokenCount": 30,
+                "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 5,
+            }),
+        );
+
+        assert_eq!(usage.input, 50);
+        assert_eq!(usage.output, 15);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.total_tokens, 145);
+
+        update_usage(
+            &mut usage,
+            &json!({
+                "promptTokenCount": u64::MAX,
+                "cachedContentTokenCount": 1,
+                "toolUsePromptTokenCount": 2,
+            }),
+        );
+        assert_eq!(usage.input, u64::MAX);
+        assert_eq!(usage.total_tokens, u64::MAX);
+    }
 
     #[test]
     fn usage_total_tokens_uses_normalized_components() {

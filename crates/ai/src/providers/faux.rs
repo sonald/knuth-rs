@@ -324,12 +324,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replayed_usage_cost_uses_stream_model_prices() {
+    async fn replayed_usage_normalizes_total_tokens_and_cost() {
         let _guard = test_lock();
         clear_faux_responses();
         let mut response = faux_assistant_message(vec![faux_text("priced")]);
         response.usage.input = 1_000_000;
-        response.usage.total_tokens = 1_000_000;
+        response.usage.total_tokens = 0;
         set_faux_responses(vec![response]);
         let mut model = faux_model();
         model.cost.input = 2.0;
@@ -340,6 +340,7 @@ mod tests {
             .await
             .expect("expected terminal message");
 
+        assert_eq!(message.usage.total_tokens, 1_000_000);
         assert_eq!(message.usage.cost.input, 2.0);
         assert_eq!(message.usage.cost.total, 2.0);
     }

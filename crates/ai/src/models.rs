@@ -58,6 +58,11 @@ pub fn list_apis() -> Vec<Api> {
 }
 
 pub fn calculate_usage_cost(model: &Model, usage: &mut Usage) {
+    usage.total_tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
     usage.cost.input = usage.input as f64 * model.cost.input / 1_000_000.0;
     usage.cost.output = usage.output as f64 * model.cost.output / 1_000_000.0;
     usage.cost.cache_read = usage.cache_read as f64 * model.cost.cache_read / 1_000_000.0;

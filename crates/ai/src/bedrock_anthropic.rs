@@ -12,34 +12,31 @@ use base64::Engine;
 use serde::Deserialize;
 
 use crate::event_stream::EventMessage;
+use crate::models::calculate_usage_cost;
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, AssistantRole, ContentBlock, DoneReason, ErrorReason,
-    StopReason, TextContent, ThinkingContent, ToolCall, Usage,
+    Model, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
 };
 
 /// Stateful converter. Keeps the running `AssistantMessage` so each yielded event carries the
 /// partial-as-of-this-moment snapshot pie-ai consumers expect.
 pub struct Converter {
+    model: Model,
     msg: AssistantMessage,
     current_index: usize,
     started: bool,
 }
 
-impl Default for Converter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Converter {
-    pub fn new() -> Self {
+    pub fn new(model: &Model) -> Self {
         Self {
+            model: model.clone(),
             msg: AssistantMessage {
                 role: AssistantRole::Assistant,
                 content: Vec::new(),
-                api: crate::types::Api::from("bedrock-anthropic"),
-                provider: crate::types::Provider::from("amazon-bedrock"),
-                model: String::new(),
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
@@ -76,7 +73,7 @@ impl Converter {
         let mut out = Vec::new();
         match evt {
             AnthropicStreamEvent::MessageStart { message } => {
-                self.msg.model = message.model.unwrap_or_default();
+                self.msg.model = message.model.unwrap_or_else(|| self.model.id.clone());
                 self.msg.response_id = message.id;
                 if let Some(role) = message.role {
                     self.msg.role = match role.as_str() {
@@ -211,14 +208,29 @@ impl Converter {
                     };
                 }
                 if let Some(u) = usage {
-                    self.msg.usage.input = u.input_tokens.unwrap_or(0);
-                    self.msg.usage.output = u.output_tokens.unwrap_or(0);
-                    self.msg.usage.cache_read = u.cache_read_input_tokens.unwrap_or(0);
-                    self.msg.usage.cache_write = u.cache_creation_input_tokens.unwrap_or(0);
-                    self.msg.usage.total_tokens = self.msg.usage.input + self.msg.usage.output;
+                    if let Some(input) = u.input_tokens {
+                        self.msg.usage.input = input;
+                    }
+                    if let Some(output) = u.output_tokens {
+                        self.msg.usage.output = output;
+                    }
+                    if let Some(cache_read) = u.cache_read_input_tokens {
+                        self.msg.usage.cache_read = cache_read;
+                    }
+                    if let Some(cache_write) = u.cache_creation_input_tokens {
+                        self.msg.usage.cache_write = cache_write;
+                    }
+                    self.msg.usage.total_tokens = self
+                        .msg
+                        .usage
+                        .input
+                        .saturating_add(self.msg.usage.output)
+                        .saturating_add(self.msg.usage.cache_read)
+                        .saturating_add(self.msg.usage.cache_write);
                 }
             }
             AnthropicStreamEvent::MessageStop {} => {
+                calculate_usage_cost(&self.model, &mut self.msg.usage);
                 let reason = match self.msg.stop_reason {
                     StopReason::ToolUse => DoneReason::ToolUse,
                     StopReason::Length => DoneReason::Length,
@@ -232,6 +244,7 @@ impl Converter {
             AnthropicStreamEvent::Error { error } => {
                 self.msg.error_message = Some(error.message.clone());
                 self.msg.stop_reason = StopReason::Error;
+                calculate_usage_cost(&self.model, &mut self.msg.usage);
                 out.push(AssistantMessageEvent::Error {
                     reason: ErrorReason::Error,
                     error: self.msg.clone(),
@@ -332,7 +345,31 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Api, KnownApi, Model, ModelCost, Provider};
     use std::collections::HashMap;
+
+    fn model() -> Model {
+        Model {
+            id: "claude-test".into(),
+            name: "Claude Test".into(),
+            api: Api::known(KnownApi::BedrockConverseStream),
+            provider: Provider::from("amazon-bedrock"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: ModelCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.25,
+                cache_write: 1.25,
+            },
+            context_window: 200_000,
+            max_tokens: 4096,
+            headers: None,
+            compat: None,
+        }
+    }
 
     fn frame(payload_json: &str) -> EventMessage {
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload_json);
@@ -345,7 +382,7 @@ mod tests {
 
     #[test]
     fn full_text_turn_round_trip() {
-        let mut c = Converter::new();
+        let mut c = Converter::new(&model());
         // message_start
         let events = c
             .ingest(&frame(
@@ -404,7 +441,7 @@ mod tests {
 
     #[test]
     fn error_event_emits_error_variant() {
-        let mut c = Converter::new();
+        let mut c = Converter::new(&model());
         let events = c
             .ingest(&frame(
                 r#"{"type":"error","error":{"message":"too many tokens"}}"#,
@@ -420,8 +457,50 @@ mod tests {
 
     #[test]
     fn ping_emits_nothing() {
-        let mut c = Converter::new();
+        let mut c = Converter::new(&model());
         let events = c.ingest(&frame(r#"{"type":"ping"}"#)).unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn message_delta_usage_preserves_missing_fields_and_prices_done() {
+        let mut c = Converter::new(&model());
+        c.ingest(&frame(
+            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}"#,
+        ))
+        .unwrap();
+        c.ingest(&frame(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}"#,
+        ))
+        .unwrap();
+
+        let events = c.ingest(&frame(r#"{"type":"message_stop"}"#)).unwrap();
+        let Some(AssistantMessageEvent::Done { message, .. }) = events.first() else {
+            panic!("expected Done event");
+        };
+        assert_eq!(message.usage.input, 100);
+        assert_eq!(message.usage.output, 10);
+        assert_eq!(message.usage.cache_read, 80);
+        assert_eq!(message.usage.cache_write, 20);
+        assert_eq!(message.usage.total_tokens, 210);
+        assert!((message.usage.cost.total - 0.000165).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bedrock_anthropic_error_terminal_calculates_usage_cost() {
+        let mut c = Converter::new(&model());
+        c.ingest(&frame(
+            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":100}}"#,
+        ))
+        .unwrap();
+
+        let events = c
+            .ingest(&frame(r#"{"type":"error","error":{"message":"failed"}}"#))
+            .unwrap();
+        let Some(AssistantMessageEvent::Error { error, .. }) = events.first() else {
+            panic!("expected Error event");
+        };
+        assert_eq!(error.usage.total_tokens, 100);
+        assert!((error.usage.cost.total - 0.0001).abs() < f64::EPSILON);
     }
 }

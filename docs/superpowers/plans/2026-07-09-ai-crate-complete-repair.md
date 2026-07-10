@@ -568,6 +568,10 @@ cargo test -p ai --features all-providers
 - `Usage.cost` 按 `Model.cost` 计算。
 - cache read/write 不再重复计入 normal input token。
 - `total_tokens` 语义统一：`input + output + cache_read + cache_write`，其中 `input` 是非缓存输入。
+- `bedrock_anthropic::Converter` 必须显式接收 `Model` 价格上下文；不得保留无价格的 `Default/new()` 构造路径。
+- Mistral 的 `prompt_tokens` 减去 `prompt_tokens_details.cached_tokens`；Google 的非缓存 input 额外包含 `toolUsePromptTokenCount`。
+- OpenAI Responses 的 terminal `response.usage` 是整次 snapshot；cache read/write 都从 `input_tokens` 中扣除，重复 snapshot 不累加。
+- Bedrock-Anthropic `message_delta.usage` 只替换实际出现的字段，Done/Error 均按显式 Model 结算 cost。
 
 - [ ] **Step 1：新增 unit tests**
 
@@ -1061,10 +1065,17 @@ git status --short
 | `Usage.cost` 总是 0 | `calculate_usage_cost_uses_per_million_prices`，provider terminal 测试断言 usage 有价格时 cost 非 0 |
 | OpenAI cached tokens 重复计入 input | `usage_subtracts_cached_tokens_from_openai_prompt_tokens` |
 | Responses cached tokens 重复计入 input | `responses_usage_subtracts_cached_tokens_from_input_tokens` |
+| Mistral cached prompt tokens 重复计入 input | `mistral_usage_subtracts_cached_prompt_tokens` |
+| Google tool-use prompt tokens 未计入 input | `google_usage_includes_tool_use_prompt_tokens` |
+| Responses cache-write tokens 重复计入 input | `responses_usage_subtracts_cache_write_tokens` |
+| Responses terminal usage snapshot 被重复累加 | `responses_repeated_usage_snapshot_does_not_accumulate` |
 | Google `total_tokens` 信任 provider 原值而偏离统一语义 | `usage_total_tokens_uses_normalized_components` |
 | provider 终态未结算 usage cost | `openai_completions_done_usage_has_nonzero_cost` |
 | Responses 共享 consumer 终态未结算 usage cost | `openai_responses_done_usage_has_nonzero_cost` |
-| Faux replay 未按调用模型价格重算 usage cost | `replayed_usage_cost_uses_stream_model_prices` |
+| Azure Responses wrapper 真实入口未覆盖 terminal usage/cost | `azure_openai_responses_wrapper_done_usage_has_nonzero_cost` |
+| Faux replay 未规范化 total 或未按调用模型价格重算 cost | `replayed_usage_normalizes_total_tokens_and_cost` |
+| Bedrock-Anthropic usage delta 缺失字段覆盖已有累计值 | `message_delta_usage_preserves_missing_fields_and_prices_done` |
+| Bedrock-Anthropic terminal Error 未结算 cost | `bedrock_anthropic_error_terminal_calculates_usage_cost` |
 | Codex `max_tokens` 被忽略 | `codex_request_includes_max_output_tokens` |
 | Codex encrypted reasoning 没 replay | `codex_replays_encrypted_reasoning_items` |
 | Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block` |

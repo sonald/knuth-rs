@@ -371,13 +371,22 @@ async fn run(
 }
 
 fn update_usage(usage: &mut Usage, u: &Value) {
+    let cached = u
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     if let Some(n) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
-        usage.input = n;
+        usage.input = n.saturating_sub(cached);
+        usage.cache_read = cached;
     }
     if let Some(n) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
         usage.output = n;
     }
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    usage.total_tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
 }
 
 fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
@@ -531,6 +540,24 @@ fn push_error(sender: &mut AssistantMessageEventSender, model: &Model, msg: Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mistral_usage_subtracts_cached_prompt_tokens() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 80 },
+            }),
+        );
+
+        assert_eq!(usage.input, 20);
+        assert_eq!(usage.output, 10);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.total_tokens, 110);
+    }
 
     #[test]
     fn assistant_only_tool_call_omits_empty_content() {
