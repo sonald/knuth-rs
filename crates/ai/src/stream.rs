@@ -64,6 +64,9 @@ mod tests {
     use crate::types::{Api, Model, ModelCost, Provider};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
     use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    const RACE_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct RestoreBuiltins;
 
@@ -155,27 +158,32 @@ mod tests {
         let resolve_task = tokio::task::spawn_blocking(move || resolve(&model));
 
         entered_rx
-            .recv()
+            .recv_timeout(RACE_TIMEOUT)
             .expect("resolve did not reach internal hook");
         let lifecycle_was_held = provider_lifecycle_is_locked_for_test();
         let (clear_ready_rx, clear_done_rx) = race.start_clear();
 
         clear_ready_rx
-            .recv()
+            .recv_timeout(RACE_TIMEOUT)
             .expect("clear thread did not begin clear attempt");
         let done_before_release = clear_done_rx.try_recv();
         race.release();
-        let resolve_result = resolve_task.await;
-        let clear_join_result = race.join_clear();
+        let resolve_result = tokio::time::timeout(RACE_TIMEOUT, resolve_task).await;
         let done_after_release = if matches!(done_before_release, Err(TryRecvError::Empty)) {
-            clear_done_rx.recv()
+            clear_done_rx.recv_timeout(RACE_TIMEOUT)
         } else {
             Ok(())
         };
+        let clear_join_result = race.join_clear();
 
         assert!(lifecycle_was_held);
         assert!(matches!(done_before_release, Err(TryRecvError::Empty)));
-        assert!(resolve_result.expect("resolve task panicked").is_ok());
+        assert!(
+            resolve_result
+                .expect("resolve task timed out")
+                .expect("resolve task panicked")
+                .is_ok()
+        );
         assert!(clear_join_result.is_ok());
         assert!(done_after_release.is_ok());
     }

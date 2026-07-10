@@ -795,6 +795,20 @@ line_and_data_split_across_chunks_are_reassembled
 eof_without_blank_line_flushes_current_event
 ```
 
+**必须覆盖的回归矩阵：**
+
+| Boundary | Test |
+| --- | --- |
+| clear 后 built-in stream | `stream_re_registers_builtins_after_clear` |
+| request builder error | `retryable_reqwest_errors_exclude_request_builder_errors` |
+| 单个 data 前导空格 | `data_field_removes_only_one_leading_space` |
+| custom registry 中恢复 built-ins | `ensure_restores_missing_builtins_when_registry_contains_custom_provider` |
+| custom 覆盖 built-in API | `ensure_preserves_custom_override_for_builtin_api` |
+| clear 与 stream lookup | `clear_racing_with_stream_lookup_does_not_return_missing_provider_error` |
+| 多 event FIFO | `multiple_events_are_emitted_fifo` |
+| line/data 跨 chunk | `line_and_data_split_across_chunks_are_reassembled` |
+| EOF flush 当前 event | `eof_without_blank_line_flushes_current_event` |
+
 全局 registry mutation 测试共用 test-only lock，且以 drop guard 恢复 built-ins。并发测试在
 `ensure_and_get` 的 lifecycle lock 内、`register_enabled()` 后且 lookup 前暂停；clear 线程只
 能在释放 hook 后完成。不得使用 sleep 或概率轮询。
