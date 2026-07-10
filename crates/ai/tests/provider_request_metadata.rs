@@ -315,7 +315,7 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
         "test-model",
-        base_url,
+        base_url.clone(),
     );
     model.headers = Some(HashMap::from([
         (
@@ -345,23 +345,18 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
     stream_to_done(&model, &context, &options).await;
     let request = captured.await.unwrap().request;
     assert!(request.starts_with("POST /model/test-model/converse-stream HTTP/1.1\r\n"));
-    assert_eq!(
-        header_values(&request, "content-type"),
-        ["application/json; charset=utf-8"]
-    );
+    let content_type = header_values(&request, "content-type");
+    assert_eq!(content_type, ["application/json; charset=utf-8"]);
     assert_eq!(
         header_values(&request, "accept"),
         ["application/vnd.amazon.eventstream"]
     );
-    assert_eq!(
-        header_values(&request, "x-amz-security-token"),
-        ["session-token"]
-    );
-    assert_eq!(header_values(&request, "x-amz-custom-test"), ["aws-value"]);
-    assert_eq!(
-        header_values(&request, "x-bedrock-custom"),
-        ["option-value"]
-    );
+    let session_token = header_values(&request, "x-amz-security-token");
+    assert_eq!(session_token, ["session-token"]);
+    let custom_amz_header = header_values(&request, "x-amz-custom-test");
+    assert_eq!(custom_amz_header, ["aws-value"]);
+    let custom_bedrock_header = header_values(&request, "x-bedrock-custom");
+    assert_eq!(custom_bedrock_header, ["option-value"]);
     let amz_date = header_values(&request, "x-amz-date");
     assert_eq!(amz_date.len(), 1);
     let body_text = request
@@ -380,6 +375,35 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
         "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-custom-test;x-amz-date;x-amz-security-token;x-bedrock-custom"
     ));
     assert!(!authorization[0].contains("SignedHeaders=accept;"));
+
+    // The fixed botocore vector in sigv4.rs proves canonicalization. This integration check
+    // intentionally reuses that signer only to prove the provider gave it the final wire URL,
+    // credentials, date, signable headers, and payload captured by the local server.
+    let request_target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("captured request target");
+    let signed_url = url::Url::parse(&format!("{base_url}{request_target}"))
+        .expect("wire URL for signature comparison");
+    assert_eq!(signed_url.path(), request_target);
+    let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
+        method: "POST",
+        url: &signed_url,
+        headers: &[
+            ("content-type", content_type[0]),
+            ("x-amz-custom-test", custom_amz_header[0]),
+            ("x-bedrock-custom", custom_bedrock_header[0]),
+        ],
+        payload: body_text.as_bytes(),
+        region: "us-west-2",
+        service: "bedrock",
+        access_key: "AKIDEXAMPLE",
+        secret_key: "secret",
+        session_token: Some(session_token[0]),
+        amz_date: amz_date[0],
+    });
+    assert_eq!(authorization, [expected_signature.authorization]);
 
     let _bearer = EnvVarGuard::set("AWS_BEARER_TOKEN_BEDROCK", "bearer-wins");
     let (base_url, captured) =
@@ -439,7 +463,7 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
         model_id,
-        base_url,
+        base_url.clone(),
     );
 
     stream_to_done(&model, &Context::default(), &StreamOptions::default()).await;
@@ -451,6 +475,38 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
         authorization[0].contains("/us-west-2/bedrock/aws4_request"),
         "ARN region must override the eu-central-1 environment fallback: {}",
         authorization[0]
+    );
+
+    let captured_target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("captured request target");
+    assert_eq!(captured_target, request_target);
+    let signed_url = url::Url::parse(&format!("{base_url}{captured_target}"))
+        .expect("wire URL for signature comparison");
+    assert_eq!(signed_url.path(), captured_target);
+    let content_type = header_values(&request, "content-type");
+    assert_eq!(content_type, ["application/json"]);
+    let amz_date = header_values(&request, "x-amz-date");
+    assert_eq!(amz_date.len(), 1);
+    let body = request.split_once("\r\n\r\n").expect("request body").1;
+    let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
+        method: "POST",
+        url: &signed_url,
+        headers: &[("content-type", content_type[0])],
+        payload: body.as_bytes(),
+        region: "us-west-2",
+        service: "bedrock",
+        access_key: "AKIDEXAMPLE",
+        secret_key: "secret",
+        session_token: None,
+        amz_date: amz_date[0],
+    });
+    assert_eq!(
+        authorization,
+        [expected_signature.authorization],
+        "provider-to-signer wiring must sign the encoded ARN wire path with the current canonical double-encode semantics"
     );
 }
 
