@@ -81,6 +81,9 @@ impl Converter {
                         _ => AssistantRole::Assistant,
                     };
                 }
+                if let Some(usage) = message.usage {
+                    update_usage(&mut self.msg.usage, usage);
+                }
                 self.started = true;
                 out.push(AssistantMessageEvent::Start {
                     partial: self.msg.clone(),
@@ -208,25 +211,7 @@ impl Converter {
                     };
                 }
                 if let Some(u) = usage {
-                    if let Some(input) = u.input_tokens {
-                        self.msg.usage.input = input;
-                    }
-                    if let Some(output) = u.output_tokens {
-                        self.msg.usage.output = output;
-                    }
-                    if let Some(cache_read) = u.cache_read_input_tokens {
-                        self.msg.usage.cache_read = cache_read;
-                    }
-                    if let Some(cache_write) = u.cache_creation_input_tokens {
-                        self.msg.usage.cache_write = cache_write;
-                    }
-                    self.msg.usage.total_tokens = self
-                        .msg
-                        .usage
-                        .input
-                        .saturating_add(self.msg.usage.output)
-                        .saturating_add(self.msg.usage.cache_read)
-                        .saturating_add(self.msg.usage.cache_write);
+                    update_usage(&mut self.msg.usage, u);
                 }
             }
             AnthropicStreamEvent::MessageStop {} => {
@@ -254,6 +239,26 @@ impl Converter {
         }
         Ok(out)
     }
+}
+
+fn update_usage(usage: &mut Usage, update: AnthropicUsage) {
+    if let Some(input) = update.input_tokens {
+        usage.input = input;
+    }
+    if let Some(output) = update.output_tokens {
+        usage.output = output;
+    }
+    if let Some(cache_read) = update.cache_read_input_tokens {
+        usage.cache_read = cache_read;
+    }
+    if let Some(cache_write) = update.cache_creation_input_tokens {
+        usage.cache_write = cache_write;
+    }
+    usage.total_tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +297,8 @@ struct AnthropicMessageHead {
     model: Option<String>,
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,10 +470,10 @@ mod tests {
     }
 
     #[test]
-    fn message_delta_usage_preserves_missing_fields_and_prices_done() {
+    fn bedrock_anthropic_message_start_usage_combines_with_delta_output_and_prices_done() {
         let mut c = Converter::new(&model());
         c.ingest(&frame(
-            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}"#,
+            r#"{"type":"message_start","message":{"id":"m1","model":"claude","role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}}"#,
         ))
         .unwrap();
         c.ingest(&frame(
