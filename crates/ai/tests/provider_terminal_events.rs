@@ -7,6 +7,8 @@ use ai::{
     UserMessage, UserRole, stream,
 };
 use futures::StreamExt;
+#[cfg(feature = "google-vertex")]
+use support::EnvVarGuard;
 
 fn context() -> Context {
     Context {
@@ -282,6 +284,53 @@ async fn google_eof_before_finish_reason_is_error() {
     .await;
 
     assert_eof_is_error(KnownApi::GoogleGenerativeAi, "google", base_url, true).await;
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_wrapper_done_usage_has_nonzero_cost() {
+    let _lock = support::env_lock().lock().await;
+    let _project = EnvVarGuard::set("GOOGLE_VERTEX_PROJECT", "usage-project");
+    let _location = EnvVarGuard::set("GOOGLE_VERTEX_LOCATION", "us-central1");
+    let base_url = support::serve_once(
+        br#"data: {"responseId":"vertex-usage","candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":20,"toolUsePromptTokenCount":5,"candidatesTokenCount":10,"thoughtsTokenCount":5}}
+
+"#,
+        "text/event-stream",
+    )
+    .await;
+    let model = support::model(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        "gemini-test",
+        base_url,
+    );
+    let options = StreamOptions {
+        api_key: Some("vertex-test-token".into()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &context(), Some(&options));
+    let mut message = None;
+    while let Some(event) = events.next().await {
+        match event {
+            AssistantMessageEvent::Done { message: done, .. } => message = Some(done),
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected Vertex error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+
+    let message = message.expect("expected Done event from Vertex wrapper");
+    assert_eq!(message.usage.input, 85);
+    assert_eq!(message.usage.output, 15);
+    assert_eq!(message.usage.cache_read, 20);
+    assert_eq!(message.usage.cache_write, 0);
+    assert_eq!(message.usage.total_tokens, 120);
+    assert!((message.usage.cost.input - 0.000_085).abs() < 1e-12);
+    assert!((message.usage.cost.output - 0.000_030).abs() < 1e-12);
+    assert!((message.usage.cost.cache_read - 0.000_005).abs() < 1e-12);
+    assert!((message.usage.cost.total - 0.000_120).abs() < 1e-12);
 }
 
 #[cfg(feature = "amazon-bedrock")]

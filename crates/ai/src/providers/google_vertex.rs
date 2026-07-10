@@ -6,11 +6,11 @@
 //! - endpoint: `{base}/v1/projects/{project}/locations/{loc}/publishers/google/models/{id}:streamGenerateContent`
 //! - auth: OAuth Bearer access token (service account / ADC) instead of `x-goog-api-key`
 //!
+//! Authentication prefers `options.api_key`, then `GOOGLE_VERTEX_ACCESS_TOKEN`, then the
+//! service-account ADC JWT exchange in `vertex_adc`. Project selection prefers
+//! `GOOGLE_VERTEX_PROJECT`, then the service account's `project_id`.
+//!
 //! TODO:
-//! - Full Application Default Credentials: service-account JSON → signed JWT → token exchange.
-//!   For now the access token must be supplied via `options.api_key` or the
-//!   `GOOGLE_VERTEX_ACCESS_TOKEN` env var. Project/location come from
-//!   `GOOGLE_VERTEX_PROJECT` / `GOOGLE_VERTEX_LOCATION` (default `us-central1`).
 //! - global endpoint vs regional endpoint host selection
 
 use async_trait::async_trait;
@@ -76,32 +76,81 @@ async fn run(
     options: StreamOptions,
     mut sender: AssistantMessageEventSender,
 ) {
-    // Access token: explicit option, then GOOGLE_VERTEX_ACCESS_TOKEN. Full ADC is a TODO.
-    let token = match options
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("GOOGLE_VERTEX_ACCESS_TOKEN").ok())
-    {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            push_error(
-                &mut sender,
-                &model,
-                "Vertex access token missing: set GOOGLE_VERTEX_ACCESS_TOKEN or pass options.api_key (ADC/JWT flow not yet implemented)".into(),
-            );
-            return;
-        }
+    let explicit_project = std::env::var("GOOGLE_VERTEX_PROJECT")
+        .ok()
+        .filter(|project| !project.is_empty());
+    let option_token = options.api_key.clone().filter(|token| !token.is_empty());
+    let env_token = std::env::var("GOOGLE_VERTEX_ACCESS_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+
+    let (token, adc_project) = if let Some(token) = option_token {
+        (token, None)
+    } else if let Some(token) = env_token {
+        (token, None)
+    } else {
+        let service_account = match crate::vertex_adc::load_service_account(None) {
+            Ok(service_account) => service_account,
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!("Vertex ADC auth failed while loading credentials: {error}"),
+                );
+                return;
+            }
+        };
+        let project = service_account
+            .project_id
+            .clone()
+            .filter(|project| !project.is_empty());
+        let access_token =
+            match crate::vertex_adc::fetch_access_token_for_service_account(&service_account, None)
+                .await
+            {
+                Ok(access_token) => access_token.token,
+                Err(error) => {
+                    push_error(
+                        &mut sender,
+                        &model,
+                        format!("Vertex ADC auth failed during token exchange: {error}"),
+                    );
+                    return;
+                }
+            };
+        (access_token, project)
     };
 
-    let project = match std::env::var("GOOGLE_VERTEX_PROJECT") {
-        Ok(p) if !p.is_empty() => p,
-        _ => {
-            push_error(
-                &mut sender,
-                &model,
-                "GOOGLE_VERTEX_PROJECT is not set".into(),
-            );
-            return;
+    let project = if let Some(project) = explicit_project {
+        project
+    } else if let Some(project) = adc_project {
+        project
+    } else {
+        match crate::vertex_adc::load_service_account(None) {
+            Ok(service_account) => match service_account
+                .project_id
+                .filter(|project| !project.is_empty())
+            {
+                Some(project) => project,
+                None => {
+                    push_error(
+                        &mut sender,
+                        &model,
+                        "Vertex project missing: set GOOGLE_VERTEX_PROJECT or include project_id in the service-account credentials".into(),
+                    );
+                    return;
+                }
+            },
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!(
+                        "Vertex project resolution failed while loading service-account credentials: {error}"
+                    ),
+                );
+                return;
+            }
         }
     };
     let location = vertex_location();

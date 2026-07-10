@@ -3,6 +3,7 @@
 //!
 //! Implemented:
 //! - Bearer-token auth (AWS Bedrock API keys — `AWS_BEARER_TOKEN_BEDROCK` or `options.api_key`)
+//!   with AWS environment-credential SigV4 fallback
 //! - Converse Stream request body (messages / system / inferenceConfig / toolConfig)
 //! - AWS binary eventstream frame decoding → AssistantMessageEvent
 //!   (messageStart / contentBlockStart / contentBlockDelta / contentBlockStop / messageStop /
@@ -10,12 +11,12 @@
 //! - text / reasoningContent / toolUse content blocks
 //!
 //! TODO:
-//! - SigV4 request signing (the standard AWS credential path); only Bearer is wired today
 //! - prompt caching (`cachePoint` blocks)
 //! - thinking budget / display modes
 //! - image content blocks in tool results
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
@@ -56,9 +57,40 @@ impl ApiProvider for AmazonBedrockProvider {
         context: &Context,
         options: Option<&SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        let base = options.map(|o| o.base.clone());
-        self.stream(model, context, base.as_ref())
+        self.stream(model, context, Some(&translate_simple_options(options)))
     }
+}
+
+fn translate_simple_options(options: Option<&SimpleStreamOptions>) -> StreamOptions {
+    let Some(options) = options else {
+        return StreamOptions::default();
+    };
+    let mut translated = options.base.clone();
+    if let Some(level) = options.reasoning {
+        let configured_budget = options
+            .thinking_budgets
+            .as_ref()
+            .and_then(|budgets| match level {
+                ThinkingLevel::Minimal => budgets.minimal,
+                ThinkingLevel::Low => budgets.low,
+                ThinkingLevel::Medium => budgets.medium,
+                ThinkingLevel::High | ThinkingLevel::Xhigh => budgets.high,
+            });
+        let default_budget = match level {
+            ThinkingLevel::Minimal => 1024,
+            ThinkingLevel::Low => 2048,
+            ThinkingLevel::Medium => 8192,
+            ThinkingLevel::High | ThinkingLevel::Xhigh => 16384,
+        };
+        translated.provider_extras.insert(
+            "bedrock_reasoning".into(),
+            json!({
+                "type": "enabled",
+                "budget_tokens": configured_budget.unwrap_or(default_budget),
+            }),
+        );
+    }
+    translated
 }
 
 async fn run(
@@ -67,23 +99,43 @@ async fn run(
     options: StreamOptions,
     mut sender: AssistantMessageEventSender,
 ) {
-    let token = match options
+    let bearer_token = options
         .api_key
         .clone()
-        .or_else(|| std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok())
-    {
-        Some(t) if !t.is_empty() => t,
-        _ => {
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+                .ok()
+                .filter(|token| !token.is_empty())
+        });
+    let sigv4_creds = if bearer_token.is_none() {
+        match crate::bedrock_provider::BedrockCreds::from_env() {
+            Some(creds) => Some(creds),
+            None => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    "Bedrock auth missing: set AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY".into(),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let body = build_request_body(&context, &options);
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
             push_error(
                 &mut sender,
                 &model,
-                "Bedrock auth missing: set AWS_BEARER_TOKEN_BEDROCK or pass options.api_key (SigV4 signing not yet implemented)".into(),
+                format!("Bedrock request body serialization failed: {error}"),
             );
             return;
         }
     };
-
-    let body = build_request_body(&context, &options);
     let client = match crate::utils::node_http_proxy::build_client(options.timeout_ms) {
         Ok(c) => c,
         Err(e) => {
@@ -93,11 +145,6 @@ async fn run(
     };
     let base = model.base_url.trim_end_matches('/');
     let url = format!("{base}/model/{}/converse-stream", model.id);
-    let mut req = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("content-type", "application/json")
-        .header("accept", "application/vnd.amazon.eventstream");
     let custom_headers = match crate::utils::headers::merged_model_and_option_headers(
         model.headers.as_ref(),
         options.headers.as_ref(),
@@ -112,9 +159,45 @@ async fn run(
             return;
         }
     };
-    req = req.headers(custom_headers);
+    let mut req = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/vnd.amazon.eventstream")
+        .headers(custom_headers);
+    if let Some(token) = bearer_token {
+        req = req.bearer_auth(token);
+    } else if let Some(creds) = sigv4_creds {
+        let parsed_url = match url::Url::parse(&url) {
+            Ok(parsed_url) => parsed_url,
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!("Bedrock request URL is invalid: {error}"),
+                );
+                return;
+            }
+        };
+        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let signed = crate::sigv4::sign(&crate::sigv4::SigningRequest {
+            method: "POST",
+            url: &parsed_url,
+            headers: &[],
+            payload: &payload,
+            region: &creds.region,
+            service: "bedrock",
+            access_key: &creds.access_key,
+            secret_key: &creds.secret_key,
+            session_token: creds.session_token.as_deref(),
+            amz_date: &amz_date,
+        });
+        req = req.header("authorization", signed.authorization);
+        for (name, value) in signed.headers {
+            req = req.header(name, value);
+        }
+    }
 
-    let req = req.json(&body);
+    let req = req.body(payload);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
@@ -398,6 +481,9 @@ fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
             body["toolConfig"] = json!({ "tools": serialize_tools(tools) });
         }
     }
+    if let Some(reasoning) = options.provider_extras.get("bedrock_reasoning") {
+        body["additionalModelRequestFields"] = json!({ "reasoning": reasoning });
+    }
     body
 }
 
@@ -568,5 +654,65 @@ mod tests {
         assert_eq!(map_stop_reason("end_turn"), StopReason::Stop);
         assert_eq!(map_stop_reason("max_tokens"), StopReason::Length);
         assert_eq!(map_stop_reason("tool_use"), StopReason::ToolUse);
+    }
+
+    #[test]
+    fn bedrock_stream_simple_reasoning_sets_additional_model_fields() {
+        let opts = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let translated = translate_simple_options(Some(&opts));
+        let body = build_request_body(&Context::default(), &translated);
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning"]["type"],
+            "enabled"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoning"]["budget_tokens"],
+            8192
+        );
+    }
+
+    #[test]
+    fn bedrock_stream_simple_preserves_base_options_and_omits_absent_reasoning() {
+        let abort = tokio_util::sync::CancellationToken::new();
+        let options = SimpleStreamOptions {
+            base: StreamOptions {
+                max_tokens: Some(321),
+                headers: Some(std::collections::HashMap::from([(
+                    "x-test-header".into(),
+                    "kept".into(),
+                )])),
+                abort: Some(abort.clone()),
+                ..Default::default()
+            },
+            reasoning: None,
+            ..Default::default()
+        };
+        let translated = translate_simple_options(Some(&options));
+        let context = Context {
+            tools: Some(vec![Tool {
+                name: "lookup".into(),
+                description: "look up a value".into(),
+                parameters: json!({ "type": "object" }),
+            }]),
+            ..Default::default()
+        };
+        let body = build_request_body(&context, &translated);
+
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 321);
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+        assert!(body.get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            translated
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("x-test-header"))
+                .map(String::as_str),
+            Some("kept")
+        );
+        abort.cancel();
+        assert!(translated.abort.as_ref().unwrap().is_cancelled());
     }
 }

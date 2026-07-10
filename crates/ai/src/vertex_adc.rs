@@ -116,6 +116,13 @@ pub fn build_jwt(sa: &ServiceAccount, scope: Option<&str>) -> Result<String, Adc
 /// One-shot: load creds → build JWT → POST → return access_token. The caller caches.
 pub async fn fetch_access_token(scope: Option<&str>) -> Result<AccessToken, AdcError> {
     let sa = load_service_account(None)?;
+    fetch_access_token_for_service_account(&sa, scope).await
+}
+
+pub(crate) async fn fetch_access_token_for_service_account(
+    sa: &ServiceAccount,
+    scope: Option<&str>,
+) -> Result<AccessToken, AdcError> {
     let jwt = build_jwt(&sa, scope)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -137,13 +144,15 @@ pub async fn fetch_access_token(scope: Option<&str>) -> Result<AccessToken, AdcE
         .await
         .map_err(|e| AdcError::Exchange(e.to_string()))?;
     if !status.is_success() {
-        return Err(AdcError::Exchange(format!(
-            "{status}: {}",
-            text.chars().take(500).collect::<String>()
-        )));
+        return Err(AdcError::Exchange(format!("HTTP {status}")));
     }
-    let parsed: TokenResponse =
-        serde_json::from_str(&text).map_err(|e| AdcError::Exchange(format!("parse: {e}")))?;
+    let parsed: TokenResponse = serde_json::from_str(&text)
+        .map_err(|e| AdcError::Exchange(format!("parse token response: {e}")))?;
+    if parsed.access_token.is_empty() {
+        return Err(AdcError::Exchange(
+            "token response contained an empty access_token".into(),
+        ));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

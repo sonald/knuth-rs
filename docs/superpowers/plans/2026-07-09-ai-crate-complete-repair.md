@@ -21,12 +21,12 @@
 ## 文件清单
 
 - 新增：`crates/ai/tests/support/mod.rs`
-  - 本地 HTTP/SSE mock server、请求捕获、provider model 构造器。
+  - 本地 HTTP/SSE mock server、可指定响应状态的请求捕获、panic-safe env guard、provider model 构造器。
   - Bedrock AWS eventstream frame builder。
 - 新增：`crates/ai/tests/provider_terminal_events.rs`
-  - Anthropic、OpenAI completions、Mistral、Google、Bedrock、OpenAI Responses 的 EOF/终止事件测试。
+  - Anthropic、OpenAI completions、Mistral、Google、Vertex、Bedrock、OpenAI Responses 的 EOF/终止事件与 usage 测试。
 - 新增：`crates/ai/tests/provider_request_metadata.rs`
-  - `model.headers`、`options.headers`、Cloudflare URL、Codex `max_tokens`、Vertex ADC seam 的请求捕获测试。
+  - `model.headers`、`options.headers`、Cloudflare URL、Codex `max_tokens`、Bedrock SigV4、Vertex ADC/错误脱敏的请求捕获测试。
 - 修改：`crates/ai/src/utils/headers.rs`
   - 保留 `merge_headers`，增加内部 helper：先合并 `model.headers`，再让 `options.headers` 覆盖。
 - 修改：`crates/ai/src/models.rs`
@@ -887,136 +887,85 @@ cargo test -p ai --features all-providers
 - 修改：`crates/ai/src/providers/google_vertex.rs`
 - 修改：`crates/ai/src/bedrock_provider.rs`
 - 修改：`crates/ai/src/vertex_adc.rs`
+- 修改：`crates/ai/tests/support/mod.rs`
+- 修改：`crates/ai/tests/provider_request_metadata.rs`
+- 修改：`crates/ai/tests/provider_terminal_events.rs`
 
-**行为：**
-- Bedrock 支持 bearer token 或 AWS SigV4 env credentials。
-- Vertex 支持 `GOOGLE_VERTEX_ACCESS_TOKEN` 或 service-account ADC exchange。
-- 不新增 AWS/Google 依赖。
+**真实 seam：**
+- Bedrock 继续使用 `amazon_bedrock::run()` 构造的 `/model/{id}/converse-stream` 请求；只对该 URL 与最终发送的 JSON bytes 调用现有 `sigv4::sign`。不调用固定为 `/invoke-with-response-stream` 的 `bedrock_provider::invoke_stream`。
+- Vertex 继续使用 `model.base_url`/区域 host 构造最终模型 URL，并复用 Google provider 的原生 Gemini SSE consumer。ADC 复用 `vertex_adc` 已有 service-account JSON、RS256 JWT 和 token exchange，只增加一个 `pub(crate)` 的“已加载 service account”入口以避免重复读取并保留 `project_id`。
+- 没有新增公开认证类型、认证服务、生产 test hook 或依赖。
 
-- [ ] **Step 1：新增 Bedrock SigV4 seam 测试**
+**认证与请求矩阵：**
 
-```rust
-fn env_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
+| 路径 | 优先级/行为 | 真实请求测试 |
+|---|---|---|
+| Bedrock bearer | `options.api_key > AWS_BEARER_TOKEN_BEDROCK > SigV4 env credentials`，bearer 分支不附加 SigV4 headers | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock SigV4 | 对当前 converse-stream path 与同一 JSON body 签名，附加 `authorization`、`content-type`、eventstream `accept`、`x-amz-date`、payload hash、可选 session token；测试用捕获值重新签名并精确比较 authorization | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock 缺认证 | 发具名 Error，连接本地 listener 前返回 | `bedrock_missing_auth_emits_named_error_without_network_request` |
+| Vertex token | `options.api_key > GOOGLE_VERTEX_ACCESS_TOKEN > ADC` | `vertex_auth_priority_is_options_then_env_then_adc`、`vertex_can_select_adc_when_access_token_absent` |
+| Vertex project | `GOOGLE_VERTEX_PROJECT > service-account project_id` | `vertex_explicit_project_overrides_service_account_project`、`vertex_can_select_adc_when_access_token_absent` |
+| Vertex ADC | 本地 token URI 捕获 `grant_type`/JWT assertion，再以返回 token 请求本地 Vertex URL，并断言最终 Gemini JSON body | `vertex_can_select_adc_when_access_token_absent` |
+| Vertex terminal usage | 复用 Gemini terminal event，规范化 input/output/cache/total 并精确结算各 cost 分量 | `vertex_wrapper_done_usage_has_nonzero_cost` |
 
-#[test]
-fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
-    let _guard = env_test_lock().lock().unwrap();
-    unsafe {
-        std::env::remove_var("AWS_BEARER_TOKEN_BEDROCK");
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-        std::env::set_var("AWS_REGION", "us-east-1");
-    }
-    let creds = crate::bedrock_provider::BedrockCreds::from_env();
-    assert!(creds.is_some());
-    unsafe {
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        std::env::remove_var("AWS_REGION");
-    }
-}
-```
+- [x] **Step 1：三条必需测试先 RED**
 
-- [ ] **Step 2：新增 Bedrock simple reasoning 测试**
+分别运行三条具名测试；确认失败原因是缺少 SigV4 provider 接线、缺少 `translate_simple_options`、缺少 ADC provider 接线，而不是测试编译或 fixture 假失败。
 
-```rust
-#[test]
-fn bedrock_stream_simple_reasoning_sets_additional_model_fields() {
-    let opts = SimpleStreamOptions {
-        reasoning: Some(ThinkingLevel::Medium),
-        ..Default::default()
-    };
-    let translated = translate_simple_options(Some(&opts));
-    let body = build_request_body(&ctx(), &translated);
-    assert_eq!(
-        body["additionalModelRequestFields"]["reasoning"]["type"],
-        "enabled"
-    );
-}
-```
+- `bedrock_prefers_bearer_token_but_accepts_sigv4_creds`：RED 为 provider 返回 “SigV4 signing not yet implemented”。
+- `bedrock_stream_simple_reasoning_sets_additional_model_fields`：RED 为 `translate_simple_options` 不存在。
+- `vertex_can_select_adc_when_access_token_absent`：RED 为 provider 返回 “ADC/JWT flow not yet implemented”。
 
-从 `stream_simple` 中抽出私有 `translate_simple_options()`；返回 `StreamOptions`，并把 simple reasoning 映射到 `build_request_body()` 会序列化的 Bedrock request-body 路径。
+- [x] **Step 2：Bedrock SigV4 与 simple reasoning GREEN**
 
-- [ ] **Step 3：新增 Vertex ADC fallback 测试**
+- bearer 存在时不读取/使用 AWS key；无 bearer 时从 `BedrockCreds::from_env()` 取 access/secret/session/region。
+- 先把 `build_request_body()` 序列化为 bytes，再用相同 bytes 签名并发送；测试对捕获 body 重算 SHA-256，并用捕获的 URL/date/body/session token 重新签名后精确比较 authorization。
+- `translate_simple_options()` 只克隆 `base` 并写入私有 `bedrock_reasoning` extra；`build_request_body()` 把它序列化到 `additionalModelRequestFields.reasoning`。
+- `None` 不发送 reasoning；tools、headers、abort 仍保留。
 
-```rust
-#[test]
-fn vertex_can_select_adc_when_access_token_absent() {
-    let _guard = env_test_lock().lock().unwrap();
-    unsafe {
-        std::env::remove_var("GOOGLE_VERTEX_ACCESS_TOKEN");
-        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/service-account.json");
-    }
-    assert!(vertex_auth_source_for_tests().is_adc());
-    unsafe {
-        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
-    }
-}
-```
+- [x] **Step 3：Vertex ADC、认证优先级与 project fallback GREEN**
 
-`vertex_auth_source_for_tests()` 只放在 test module 内，不新增公开 API。
+- ADC 分支只加载一次 service account，并用现有 JWT exchange 获取 token。
+- 显式 env project 优先；缺失时使用同一 service account 的 `project_id`。
+- ADC token server 与最终 Vertex model server 都使用本地捕获，不访问真实 Google endpoint。
+- 最终请求断言 bearer、project/location/model URL、model/options headers、Gemini JSON body 与原生 Gemini Done。
 
-- [ ] **Step 4：确认失败**
+- [x] **Step 4：公开错误与脱敏 GREEN**
+
+以下错误全部通过 public `AssistantMessageEvent::Error` 验证，并断言消息不包含 private key、JWT assertion、access token 或 token endpoint response body：
+
+- `vertex_adc_file_error_is_public_and_redacted`
+- `vertex_adc_json_error_is_public_and_redacted`
+- `vertex_adc_jwt_error_is_public_and_redacted`
+- `vertex_adc_token_http_error_is_public_and_redacted`
+- `vertex_adc_token_response_error_is_public_and_redacted`
+
+- [x] **Step 5：环境测试隔离与 Task 5 usage 遗留 GREEN**
+
+- integration tests 共用 `support::env_lock()`。
+- 所有环境变量修改通过 panic-safe `EnvVarGuard` 恢复；移除旧的手工恢复 env 单测。
+- `vertex_wrapper_done_usage_has_nonzero_cost` 断言 normalized usage、`total_tokens` 及 input/output/cache/total 的精确 cost。
+
+- [x] **Step 6：最终验证**
 
 运行：
 
 ```bash
-cargo test -p ai --features amazon-bedrock,google-vertex bedrock_prefers_bearer_token_but_accepts_sigv4_creds bedrock_stream_simple_reasoning_sets_additional_model_fields vertex_can_select_adc_when_access_token_absent
-```
-
-预期：Bedrock low-level creds seam 可能已通过，但 provider integration 仍会报 “SigV4 not yet implemented”；Vertex 只认 access token，因此失败。
-
-- [ ] **Step 5：Bedrock SigV4 fallback**
-
-保留 bearer token 路径。缺 bearer token 时：
-
-```rust
-let creds = match crate::bedrock_provider::BedrockCreds::from_env() {
-    Some(creds) => creds,
-    None => {
-        push_error(&mut sender, &model, "Bedrock auth missing: set AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY".into());
-        return;
-    }
-};
-```
-
-使用现有 `crate::sigv4::sign` 签名 Converse Stream URL 和 JSON body。不要改走 `bedrock_provider::invoke_stream`，因为它针对 `/invoke-with-response-stream`，而当前 provider 使用 `/converse-stream`。
-
-- [ ] **Step 6：Vertex ADC fallback**
-
-token 解析顺序：
-
-```rust
-let token = if let Some(t) = options.api_key.clone().filter(|t| !t.is_empty()) {
-    t
-} else if let Some(t) = std::env::var("GOOGLE_VERTEX_ACCESS_TOKEN").ok().filter(|t| !t.is_empty()) {
-    t
-} else {
-    match crate::vertex_adc::fetch_access_token(None).await {
-        Ok(t) => t.token,
-        Err(e) => {
-            push_error(&mut sender, &model, format!("Vertex ADC auth failed: {e}"));
-            return;
-        }
-    }
-};
-```
-
-如果 service account 带 `project_id` 且 `GOOGLE_VERTEX_PROJECT` 未设置，使用该 project id。
-
-- [ ] **Step 7：测试通过**
-
-运行：
-
-```bash
-cargo test -p ai --features amazon-bedrock,google-vertex bedrock_prefers_bearer_token_but_accepts_sigv4_creds bedrock_stream_simple_reasoning_sets_additional_model_fields vertex_can_select_adc_when_access_token_absent
+cargo test -p ai --features amazon-bedrock,google-vertex --test provider_request_metadata
+cargo test -p ai --features amazon-bedrock,google-vertex --lib providers::amazon_bedrock::tests
+cargo test -p ai --features amazon-bedrock,google-vertex --test provider_terminal_events
+cargo test -p ai --features amazon-bedrock,google-vertex --lib sigv4
+cargo test -p ai --features amazon-bedrock,google-vertex --lib vertex_adc
+cargo test -p ai --no-default-features --features amazon-bedrock --lib --test provider_request_metadata --test provider_terminal_events
+cargo test -p ai --no-default-features --features google-vertex --lib --test provider_request_metadata --test provider_terminal_events
+cargo test -p ai --features amazon-bedrock,google-vertex
 cargo test -p ai --features all-providers
+cargo fmt -p ai -- --check
+rustfmt --edition 2024 --check crates/ai/src/bedrock_provider.rs crates/ai/src/providers/amazon_bedrock.rs crates/ai/src/providers/google_vertex.rs crates/ai/src/vertex_adc.rs crates/ai/tests/provider_request_metadata.rs crates/ai/tests/provider_terminal_events.rs crates/ai/tests/support/mod.rs
+git diff --check
 ```
 
-预期：PASS。
+结果：全部 PASS。独立 feature 使用 `--lib` 加 Task 9 两个 integration test targets，既覆盖该 feature 的生产编译与相关回归，也避免运行未按 provider feature 门控的无关 `anthropic_sse_e2e`。最小 feature 仍显示其他模块已有的 cfg/unused warning；Task 9 改动没有新增 warning，`all-providers` 无 warning。
 
 ---
 
@@ -1130,9 +1079,15 @@ git status --short
 | SSE multiple event FIFO | `multiple_events_are_emitted_fifo` |
 | SSE line/data chunk reassembly | `line_and_data_split_across_chunks_are_reassembled` |
 | SSE EOF flush | `eof_without_blank_line_flushes_current_event` |
-| Bedrock simple stream 丢 reasoning | `bedrock_stream_simple_reasoning_sets_additional_model_fields` |
-| Bedrock SigV4 有基础设施但未接入 | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds`，本地 mock 可验证 `authorization: AWS4-HMAC-SHA256` 时增加 integration 断言 |
-| Vertex ADC 有基础设施但未接入 | `vertex_can_select_adc_when_access_token_absent` |
+| Bedrock simple stream 丢 reasoning 或 base options | `bedrock_stream_simple_reasoning_sets_additional_model_fields`、`bedrock_stream_simple_preserves_base_options_and_omits_absent_reasoning` |
+| Bedrock bearer/SigV4 优先级错误，或 converse-stream authorization 未绑定实际 path/body/date/session token | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock 缺认证仍发网络请求 | `bedrock_missing_auth_emits_named_error_without_network_request` |
+| Vertex token/ADC 优先级及本地 ADC exchange 未接入最终 Vertex bearer 请求 | `vertex_auth_priority_is_options_then_env_then_adc`、`vertex_can_select_adc_when_access_token_absent` |
+| Vertex project 未回退或显式 env 未优先 | `vertex_can_select_adc_when_access_token_absent`、`vertex_explicit_project_overrides_service_account_project` |
+| Vertex 最终 URL、headers 或 Gemini JSON body 错误 | `vertex_can_select_adc_when_access_token_absent` |
+| Vertex ADC 错误缺 public Error 上下文或泄露凭据 | `vertex_adc_file_error_is_public_and_redacted`、`vertex_adc_json_error_is_public_and_redacted`、`vertex_adc_jwt_error_is_public_and_redacted`、`vertex_adc_token_http_error_is_public_and_redacted`、`vertex_adc_token_response_error_is_public_and_redacted` |
+| Vertex wrapper terminal usage 或 input/output/cache/total cost 错误 | `vertex_wrapper_done_usage_has_nonzero_cost` |
+| Task 9 环境变量测试并发污染或 panic 后不恢复 | `provider_request_metadata` 与 `vertex_wrapper_done_usage_has_nonzero_cost` 共用 `support::env_lock()` + `EnvVarGuard` |
 | README provider 状态过期 | README diff 加最终验证命令 |
 
 ## 自检

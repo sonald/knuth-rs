@@ -25,12 +25,24 @@ impl BedrockCreds {
     /// Resolve creds from the standard AWS env vars. Returns `None` when the required pair
     /// (access key + secret) isn't set.
     pub fn from_env() -> Option<Self> {
-        let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
-        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
         let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_DEFAULT_REGION")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| "us-east-1".to_string());
         Some(Self {
             access_key,
             secret_key,
@@ -197,28 +209,3 @@ pub async fn invoke_stream(
 /// Entry-point placeholder kept for backwards compat with prior register() callers; the
 /// streaming/non-streaming invokers above are the actual provider API.
 pub fn register() {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn creds_from_env_returns_none_without_keys() {
-        // Save+restore to avoid leaking state to other tests.
-        let prior_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
-        let prior_sec = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
-        assert!(BedrockCreds::from_env().is_none());
-        unsafe {
-            if let Some(v) = prior_key {
-                std::env::set_var("AWS_ACCESS_KEY_ID", v);
-            }
-            if let Some(v) = prior_sec {
-                std::env::set_var("AWS_SECRET_ACCESS_KEY", v);
-            }
-        }
-    }
-}
