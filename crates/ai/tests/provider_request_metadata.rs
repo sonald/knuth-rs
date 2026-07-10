@@ -1,12 +1,16 @@
 mod support;
 
-#[cfg(any(feature = "openai-completions", feature = "google-vertex"))]
+#[cfg(any(
+    feature = "openai-completions",
+    feature = "amazon-bedrock",
+    feature = "google-vertex"
+))]
 use std::collections::HashMap;
 
+#[cfg(any(feature = "openai-codex-responses", feature = "amazon-bedrock"))]
+use ai::Provider;
 #[cfg(feature = "openai-codex-responses")]
-use ai::{
-    Api, AssistantMessage, ContentBlock, Message, Provider, StopReason, ThinkingContent, Usage,
-};
+use ai::{Api, AssistantMessage, ContentBlock, Message, StopReason, ThinkingContent, Usage};
 #[cfg(any(
     feature = "openai-completions",
     feature = "openai-codex-responses",
@@ -18,6 +22,8 @@ use ai::{
     )
 ))]
 use ai::{AssistantMessageEvent, Context, KnownApi, StreamOptions, stream};
+#[cfg(feature = "amazon-bedrock")]
+use ai::{SimpleStreamOptions, ThinkingLevel, stream_simple};
 #[cfg(any(
     feature = "openai-completions",
     feature = "openai-codex-responses",
@@ -307,12 +313,20 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
             .await;
     let signed_url =
         url::Url::parse(&format!("{base_url}/model/test-model/converse-stream")).unwrap();
-    let model = support::model(
+    let mut model = support::model(
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
         "test-model",
         base_url,
     );
+    model.headers = Some(HashMap::from([
+        (
+            "content-type".into(),
+            "application/json; charset=utf-8".into(),
+        ),
+        ("x-amz-custom-test".into(), "aws-value".into()),
+        ("x-bedrock-custom".into(), "model-value".into()),
+    ]));
     let context = Context {
         system_prompt: None,
         messages: vec![ai::Message::User(ai::UserMessage {
@@ -322,14 +336,20 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
         })],
         tools: None,
     };
-    let options = StreamOptions::default();
+    let options = StreamOptions {
+        headers: Some(HashMap::from([(
+            "x-bedrock-custom".into(),
+            "option-value".into(),
+        )])),
+        ..Default::default()
+    };
 
     stream_to_done(&model, &context, &options).await;
     let request = captured.await.unwrap().request;
     assert!(request.starts_with("POST /model/test-model/converse-stream HTTP/1.1\r\n"));
     assert_eq!(
         header_values(&request, "content-type"),
-        ["application/json"]
+        ["application/json; charset=utf-8"]
     );
     assert_eq!(
         header_values(&request, "accept"),
@@ -338,6 +358,11 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
     assert_eq!(
         header_values(&request, "x-amz-security-token"),
         ["session-token"]
+    );
+    assert_eq!(header_values(&request, "x-amz-custom-test"), ["aws-value"]);
+    assert_eq!(
+        header_values(&request, "x-bedrock-custom"),
+        ["option-value"]
     );
     let amz_date = header_values(&request, "x-amz-date");
     assert_eq!(amz_date.len(), 1);
@@ -351,10 +376,20 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
     );
     let body: serde_json::Value = serde_json::from_str(body_text).unwrap();
     assert_eq!(body["messages"][0]["content"][0]["text"], "signed body");
+    let authorization = header_values(&request, "authorization");
+    assert_eq!(authorization.len(), 1);
+    assert!(authorization[0].contains(
+        "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-custom-test;x-amz-date;x-amz-security-token;x-bedrock-custom"
+    ));
+    assert!(!authorization[0].contains("SignedHeaders=accept;"));
     let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
         method: "POST",
         url: &signed_url,
-        headers: &[],
+        headers: &[
+            ("content-type", "application/json; charset=utf-8"),
+            ("x-amz-custom-test", "aws-value"),
+            ("x-bedrock-custom", "option-value"),
+        ],
         payload: body_text.as_bytes(),
         region: "us-west-2",
         service: "bedrock",
@@ -363,10 +398,7 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
         session_token: Some("session-token"),
         amz_date: amz_date[0],
     });
-    assert_eq!(
-        header_values(&request, "authorization"),
-        [expected_signature.authorization]
-    );
+    assert_eq!(authorization, [expected_signature.authorization]);
 
     let _bearer = EnvVarGuard::set("AWS_BEARER_TOKEN_BEDROCK", "bearer-wins");
     let (base_url, captured) =
@@ -408,6 +440,37 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
 
 #[cfg(feature = "amazon-bedrock")]
 #[tokio::test]
+async fn bedrock_sigv4_uses_inference_profile_arn_region() {
+    let _lock = support::env_lock().lock().await;
+    let _bearer_absent = EnvVarGuard::remove("AWS_BEARER_TOKEN_BEDROCK");
+    let _access_key = EnvVarGuard::set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    let _secret_key = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", "secret");
+    let _session_token = EnvVarGuard::remove("AWS_SESSION_TOKEN");
+    let _region = EnvVarGuard::set("AWS_REGION", "eu-central-1");
+
+    let (base_url, captured) =
+        support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
+            .await;
+    let model = support::model(
+        KnownApi::BedrockConverseStream,
+        "amazon-bedrock",
+        "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/test-profile",
+        base_url,
+    );
+
+    stream_to_done(&model, &Context::default(), &StreamOptions::default()).await;
+    let request = captured.await.unwrap().request;
+    let authorization = header_values(&request, "authorization");
+    assert_eq!(authorization.len(), 1);
+    assert!(
+        authorization[0].contains("/us-west-2/bedrock/aws4_request"),
+        "ARN region must override the eu-central-1 environment fallback: {}",
+        authorization[0]
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
 async fn bedrock_missing_auth_emits_named_error_without_network_request() {
     let _lock = support::env_lock().lock().await;
     let _bearer = EnvVarGuard::remove("AWS_BEARER_TOKEN_BEDROCK");
@@ -436,6 +499,214 @@ async fn bedrock_missing_auth_emits_named_error_without_network_request() {
             .await
             .is_err(),
         "missing credentials must stop before opening the HTTP connection"
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+async fn capture_bedrock_simple_body(
+    model_id: &str,
+    mut options: SimpleStreamOptions,
+) -> serde_json::Value {
+    let (base_url, captured) =
+        support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
+            .await;
+    let mut model = ai::get_model(&Provider::from("amazon-bedrock"), model_id)
+        .unwrap_or_else(|| panic!("missing built-in Bedrock model {model_id}"));
+    model.base_url = base_url;
+    options.base.api_key = Some("simple-bearer".into());
+
+    let mut events = stream_simple(&model, &Context::default(), Some(&options));
+    let mut saw_done = false;
+    while let Some(event) = events.next().await {
+        match event {
+            AssistantMessageEvent::Done { .. } => saw_done = true,
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected stream error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_done, "expected normally terminated stream");
+    let request = captured.await.unwrap().request;
+    serde_json::from_str(
+        request
+            .split_once("\r\n\r\n")
+            .expect("Bedrock request body")
+            .1,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_uses_claude_adaptive_fields() {
+    let body = capture_bedrock_simple_body(
+        "global.anthropic.claude-opus-4-6-v1",
+        SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"],
+        serde_json::json!({ "type": "adaptive" })
+    );
+    assert_eq!(
+        body["additionalModelRequestFields"]["output_config"],
+        serde_json::json!({ "effort": "medium" })
+    );
+    assert!(
+        body["additionalModelRequestFields"]
+            .get("reasoning")
+            .is_none()
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_keeps_claude_budget_below_max_tokens() {
+    let model = ai::get_model(
+        &Provider::from("amazon-bedrock"),
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    )
+    .expect("built-in Claude 4.5 model");
+    let body = capture_bedrock_simple_body(
+        &model.id,
+        SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"]["type"],
+        "enabled"
+    );
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+        8192
+    );
+    let max_tokens = body["inferenceConfig"]["maxTokens"]
+        .as_u64()
+        .expect("Claude maxTokens");
+    assert_eq!(max_tokens, u64::from(model.max_tokens));
+    assert!(8192 < max_tokens);
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_respects_explicit_max_tokens() {
+    let body = capture_bedrock_simple_body(
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        SimpleStreamOptions {
+            base: StreamOptions {
+                max_tokens: Some(4096),
+                ..Default::default()
+            },
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let max_tokens = body["inferenceConfig"]["maxTokens"]
+        .as_u64()
+        .expect("Claude maxTokens");
+    let budget = body["additionalModelRequestFields"]["thinking"]["budget_tokens"]
+        .as_u64()
+        .expect("Claude thinking budget");
+    assert_eq!(max_tokens, 4096);
+    assert!(budget < max_tokens);
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_uses_nova_reasoning_config() {
+    let body = capture_bedrock_simple_body(
+        "amazon.nova-2-lite-v1:0",
+        SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        body["additionalModelRequestFields"]["reasoningConfig"],
+        serde_json::json!({
+            "type": "enabled",
+            "maxReasoningEffort": "medium"
+        })
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_nova_high_omits_inference_limits() {
+    let body = capture_bedrock_simple_body(
+        "amazon.nova-2-lite-v1:0",
+        SimpleStreamOptions {
+            base: StreamOptions {
+                max_tokens: Some(2048),
+                temperature: Some(0.5),
+                ..Default::default()
+            },
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        body["additionalModelRequestFields"]["reasoningConfig"]["maxReasoningEffort"],
+        "high"
+    );
+    assert!(body.get("inferenceConfig").is_none());
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_simple_reasoning_fails_closed_for_unmapped_builtin_model() {
+    let (base_url, captured) =
+        support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
+            .await;
+    let mut model = ai::get_model(&Provider::from("amazon-bedrock"), "deepseek.r1-v1:0")
+        .expect("built-in DeepSeek model");
+    model.base_url = base_url;
+    let options = SimpleStreamOptions {
+        base: StreamOptions {
+            api_key: Some("simple-bearer".into()),
+            ..Default::default()
+        },
+        reasoning: Some(ThinkingLevel::Medium),
+        ..Default::default()
+    };
+
+    let mut events = stream_simple(&model, &Context::default(), Some(&options));
+    let mut terminal = None;
+    while let Some(event) = events.next().await {
+        if event.is_terminal() {
+            terminal = Some(event);
+        }
+    }
+    let AssistantMessageEvent::Error { reason, error } = terminal.expect("terminal event") else {
+        panic!("unmapped reasoning model must fail closed");
+    };
+    assert_eq!(reason, ai::ErrorReason::Error);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some(
+            "Bedrock simple reasoning has no documented configurable protocol for model deepseek.r1-v1:0"
+        )
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), captured)
+            .await
+            .is_err(),
+        "unsupported reasoning must fail before opening the HTTP connection"
     );
 }
 
@@ -769,6 +1040,105 @@ async fn vertex_adc_token_response_error_is_public_and_redacted() {
     assert!(!error.contains("token-response-sentinel"));
     assert!(!error.contains(&assertion));
     assert!(!error.contains("BEGIN PRIVATE KEY"));
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_adc_token_exchange_honors_abort() {
+    let _lock = support::env_lock().lock().await;
+    let (token_uri, token_request) = support::serve_capture_hanging_once().await;
+    let credentials =
+        write_service_account(&token_uri, "abort-project", support::TEST_RSA_PRIVATE_KEY);
+    let _access_token = EnvVarGuard::remove("GOOGLE_VERTEX_ACCESS_TOKEN");
+    let _project = EnvVarGuard::remove("GOOGLE_VERTEX_PROJECT");
+    let _credentials = EnvVarGuard::set(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        credentials.path().to_str().unwrap(),
+    );
+    let model = support::model(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        "gemini-test",
+        "http://127.0.0.1:9".into(),
+    );
+    let abort = tokio_util::sync::CancellationToken::new();
+    let options = StreamOptions {
+        abort: Some(abort.clone()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &Context::default(), Some(&options));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), token_request)
+        .await
+        .expect("ADC token request must start")
+        .expect("captured ADC token request");
+    abort.cancel();
+    let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while let Some(event) = events.next().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("Vertex stream ended without a terminal event");
+    })
+    .await
+    .expect("abort must stop a hanging ADC exchange");
+
+    let AssistantMessageEvent::Error { reason, error } = terminal else {
+        panic!("abort must emit Error");
+    };
+    assert_eq!(reason, ai::ErrorReason::Aborted);
+    assert_eq!(error.stop_reason, ai::StopReason::Aborted);
+    assert_eq!(error.error_message.as_deref(), Some("aborted"));
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_adc_token_exchange_honors_timeout_ms() {
+    let _lock = support::env_lock().lock().await;
+    let (token_uri, token_request) = support::serve_capture_hanging_once().await;
+    let credentials =
+        write_service_account(&token_uri, "timeout-project", support::TEST_RSA_PRIVATE_KEY);
+    let _access_token = EnvVarGuard::remove("GOOGLE_VERTEX_ACCESS_TOKEN");
+    let _project = EnvVarGuard::remove("GOOGLE_VERTEX_PROJECT");
+    let _credentials = EnvVarGuard::set(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        credentials.path().to_str().unwrap(),
+    );
+    let model = support::model(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        "gemini-test",
+        "http://127.0.0.1:9".into(),
+    );
+    let options = StreamOptions {
+        timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &Context::default(), Some(&options));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), token_request)
+        .await
+        .expect("ADC token request must start")
+        .expect("captured ADC token request");
+    let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while let Some(event) = events.next().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("Vertex stream ended without a terminal event");
+    })
+    .await
+    .expect("timeout_ms must stop a hanging ADC exchange");
+
+    let AssistantMessageEvent::Error { reason, error } = terminal else {
+        panic!("timeout must emit Error");
+    };
+    assert_eq!(reason, ai::ErrorReason::Error);
+    assert_eq!(error.stop_reason, ai::StopReason::Error);
+    let message = error.error_message.expect("named ADC timeout error");
+    assert!(message.starts_with("Vertex ADC auth failed during token exchange: token exchange:"));
 }
 
 #[cfg(feature = "openai-completions")]

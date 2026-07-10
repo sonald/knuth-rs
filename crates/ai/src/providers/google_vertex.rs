@@ -70,6 +70,19 @@ fn vertex_host(location: &str) -> String {
     }
 }
 
+fn vertex_request_url(model: &Model, project: &str, location: &str) -> String {
+    let base = model.base_url.trim_end_matches('/');
+    let host = if base.is_empty() || base == "https://{location}-aiplatform.googleapis.com" {
+        vertex_host(location)
+    } else {
+        base.replace("{location}", location)
+    };
+    format!(
+        "{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:streamGenerateContent?alt=sse",
+        model.id
+    )
+}
+
 async fn run(
     model: Model,
     context: Context,
@@ -104,20 +117,27 @@ async fn run(
             .project_id
             .clone()
             .filter(|project| !project.is_empty());
-        let access_token =
-            match crate::vertex_adc::fetch_access_token_for_service_account(&service_account, None)
-                .await
-            {
-                Ok(access_token) => access_token.token,
-                Err(error) => {
-                    push_error(
-                        &mut sender,
-                        &model,
-                        format!("Vertex ADC auth failed during token exchange: {error}"),
-                    );
-                    return;
-                }
-            };
+        let access_token = match crate::vertex_adc::fetch_access_token_for_service_account(
+            &service_account,
+            None,
+            &options,
+        )
+        .await
+        {
+            Ok(access_token) => access_token.token,
+            Err(crate::vertex_adc::AdcError::Aborted) => {
+                abort_utils::push_aborted(&mut sender, &model);
+                return;
+            }
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!("Vertex ADC auth failed during token exchange: {error}"),
+                );
+                return;
+            }
+        };
         (access_token, project)
     };
 
@@ -164,15 +184,7 @@ async fn run(
         }
     };
 
-    let host = if model.base_url.is_empty() {
-        vertex_host(&location)
-    } else {
-        model.base_url.trim_end_matches('/').to_string()
-    };
-    let url = format!(
-        "{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:streamGenerateContent?alt=sse",
-        model.id
-    );
+    let url = vertex_request_url(&model, &project, &location);
     let mut req = client
         .post(&url)
         .bearer_auth(token)
@@ -232,11 +244,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_is_regional_or_global() {
+    fn builtin_model_url_resolves_regional_and_global_location() {
+        let model = crate::get_model(&Provider::from("google-vertex"), "gemini-2.5-pro")
+            .expect("built-in Vertex model");
         assert_eq!(
-            vertex_host("us-central1"),
-            "https://us-central1-aiplatform.googleapis.com"
+            model.base_url,
+            "https://{location}-aiplatform.googleapis.com"
         );
-        assert_eq!(vertex_host("global"), "https://aiplatform.googleapis.com");
+        assert_eq!(
+            vertex_request_url(&model, "test-project", "europe-west4"),
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/test-project/locations/europe-west4/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            vertex_request_url(&model, "test-project", "global"),
+            "https://aiplatform.googleapis.com/v1/projects/test-project/locations/global/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
     }
 }

@@ -41,6 +41,8 @@
   - EOF 终止检查、`model.headers`、cost 计算。
 - 修改：`crates/ai/src/providers/amazon_bedrock.rs`
   - EOF 终止检查、`stream_simple` reasoning 透传、`model.headers`、cost 计算、SigV4 fallback。
+- 修改：`crates/ai/src/sigv4.rs`
+  - 固定 canonical request/signature 向量，并确保 signer 生成值覆盖调用方同名 headers。
 - 修改：`crates/ai/src/providers/openai_responses.rs`
   - cost 计算、cache-aware usage total、done event 按 `output_index`/`item_id` 路由、复用 EOF helper。
 - 修改：`crates/ai/src/providers/openai_codex_responses.rs`
@@ -893,7 +895,9 @@ cargo test -p ai --features all-providers
 
 **真实 seam：**
 - Bedrock 继续使用 `amazon_bedrock::run()` 构造的 `/model/{id}/converse-stream` 请求；只对该 URL 与最终发送的 JSON bytes 调用现有 `sigv4::sign`。不调用固定为 `/invoke-with-response-stream` 的 `bedrock_provider::invoke_stream`。
-- Vertex 继续使用 `model.base_url`/区域 host 构造最终模型 URL，并复用 Google provider 的原生 Gemini SSE consumer。ADC 复用 `vertex_adc` 已有 service-account JSON、RS256 JWT 和 token exchange，只增加一个 `pub(crate)` 的“已加载 service account”入口以避免重复读取并保留 `project_id`。
+- SigV4 从最终 `HeaderMap` 选择稳定 headers：存在的 `content-type`、`host` 与全部 `x-amz-*` 必签，`accept` 可不签；调用方不能覆盖 signer 生成的 host/date/payload hash/session token。
+- Bedrock simple reasoning 只识别当前内置且有文档协议的 Claude 与 Nova 2 Lite 模型族；未知模型在发起网络请求前 fail closed。
+- Vertex 继续使用 `model.base_url`/区域 host 构造最终模型 URL，并复用 Google provider 的原生 Gemini SSE consumer。内置 `{location}` endpoint 对 regional/global 分别解析；ADC 复用 `vertex_adc` 已有 service-account JSON、RS256 JWT 和 token exchange，并继承 stream abort/timeout。
 - 没有新增公开认证类型、认证服务、生产 test hook 或依赖。
 
 **认证与请求矩阵：**
@@ -901,11 +905,15 @@ cargo test -p ai --features all-providers
 | 路径 | 优先级/行为 | 真实请求测试 |
 |---|---|---|
 | Bedrock bearer | `options.api_key > AWS_BEARER_TOKEN_BEDROCK > SigV4 env credentials`，bearer 分支不附加 SigV4 headers | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
-| Bedrock SigV4 | 对当前 converse-stream path 与同一 JSON body 签名，附加 `authorization`、`content-type`、eventstream `accept`、`x-amz-date`、payload hash、可选 session token；测试用捕获值重新签名并精确比较 authorization | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock SigV4 | 对最终 path/body/headers 签名；固定向量覆盖 canonical request hash、SignedHeaders 与 signature，捕获测试覆盖最终发送 headers | `sigv4::tests::signs_post_with_payload_and_session_token`、`bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock reasoning | Claude 4.6/4.7 使用 adaptive `thinking`/`output_config`，旧 Claude 使用严格小于 `maxTokens` 的 fixed budget，Nova 2 Lite 使用 `reasoningConfig`；未知模型 fail closed | `bedrock_simple_reasoning_*`、`bedrock_stream_simple_rejects_unknown_claude_protocol` |
+| Bedrock signing region | ARN 与标准 runtime endpoint 优先于 env/default；二者冲突时本地报错 | `bedrock_sigv4_uses_inference_profile_arn_region`、`bedrock_signing_region_*` |
 | Bedrock 缺认证 | 发具名 Error，连接本地 listener 前返回 | `bedrock_missing_auth_emits_named_error_without_network_request` |
 | Vertex token | `options.api_key > GOOGLE_VERTEX_ACCESS_TOKEN > ADC` | `vertex_auth_priority_is_options_then_env_then_adc`、`vertex_can_select_adc_when_access_token_absent` |
 | Vertex project | `GOOGLE_VERTEX_PROJECT > service-account project_id` | `vertex_explicit_project_overrides_service_account_project`、`vertex_can_select_adc_when_access_token_absent` |
 | Vertex ADC | 本地 token URI 捕获 `grant_type`/JWT assertion，再以返回 token 请求本地 Vertex URL，并断言最终 Gemini JSON body | `vertex_can_select_adc_when_access_token_absent` |
+| Vertex endpoint | 内置 `{location}` endpoint 同时覆盖 regional 与 global URL | `builtin_model_url_resolves_regional_and_global_location` |
+| Vertex ADC control | token exchange 的 send/body 阶段继承 `abort` 与 `timeout_ms` | `vertex_adc_token_exchange_honors_abort`、`vertex_adc_token_exchange_honors_timeout_ms` |
 | Vertex terminal usage | 复用 Gemini terminal event，规范化 input/output/cache/total 并精确结算各 cost 分量 | `vertex_wrapper_done_usage_has_nonzero_cost` |
 
 - [x] **Step 1：三条必需测试先 RED**
@@ -920,7 +928,8 @@ cargo test -p ai --features all-providers
 
 - bearer 存在时不读取/使用 AWS key；无 bearer 时从 `BedrockCreds::from_env()` 取 access/secret/session/region。
 - 先把 `build_request_body()` 序列化为 bytes，再用相同 bytes 签名并发送；测试对捕获 body 重算 SHA-256，并用捕获的 URL/date/body/session token 重新签名后精确比较 authorization。
-- `translate_simple_options()` 只克隆 `base` 并写入私有 `bedrock_reasoning` extra；`build_request_body()` 把它序列化到 `additionalModelRequestFields.reasoning`。
+- `translate_simple_options()` 保留 base options，并按真实模型 ID 写入私有 `bedrock_additional_model_request_fields`：adaptive Claude 使用 `thinking`/`output_config`，旧 Claude 使用 fixed-budget `thinking`，Nova 2 Lite 使用 `reasoningConfig`。
+- fixed-budget Claude 保留显式 `maxTokens`，budget 最低 1024 且严格小于 `maxTokens`；无法形成合法组合时本地报错。
 - `None` 不发送 reasoning；tools、headers、abort 仍保留。
 
 - [x] **Step 3：Vertex ADC、认证优先级与 project fallback GREEN**
@@ -929,6 +938,8 @@ cargo test -p ai --features all-providers
 - 显式 env project 优先；缺失时使用同一 service account 的 `project_id`。
 - ADC token server 与最终 Vertex model server 都使用本地捕获，不访问真实 Google endpoint。
 - 最终请求断言 bearer、project/location/model URL、model/options headers、Gemini JSON body 与原生 Gemini Done。
+- 内置 `{location}` base URL 对 regional location 替换区域，对 `global` 使用无区域 host；自定义 base URL 仍保留。
+- ADC token exchange 使用与最终请求相同的 `abort`，并用 `timeout_ms` 覆盖原 15 秒默认超时。
 
 - [x] **Step 4：公开错误与脱敏 GREEN**
 
@@ -946,7 +957,14 @@ cargo test -p ai --features all-providers
 - 所有环境变量修改通过 panic-safe `EnvVarGuard` 恢复；移除旧的手工恢复 env 单测。
 - `vertex_wrapper_done_usage_has_nonzero_cost` 断言 normalized usage、`total_tokens` 及 input/output/cache/total 的精确 cost。
 
-- [x] **Step 6：最终验证**
+- [x] **Step 6：五项独立审查修复 RED/GREEN**
+
+- tests-only detached `2cc9bda` 上，最终 SignedHeaders 断言 RED；当前实现固定向量与捕获请求均 GREEN。
+- `maxTokens=4096` 时旧草稿错误放大为 12288，ARN `us-west-2` 仍使用 env `eu-central-1`；修复后 reasoning budget/上限和 ARN/endpoint/env 决策均 GREEN。
+- tests-only detached `2cc9bda` 上，Vertex 内置 URL helper 不存在，ADC abort/timeout 都超过 500ms 门限；修复后 regional/global URL 与两个控制流测试均 GREEN。
+- 删除重复 unit assertions、单次调用的 Nova-high helper，以及 hanging capture server 中重复的请求读取代码；没有新增依赖、文件、公开 auth 类型或生产 test hook。
+
+- [x] **Step 7：最终验证**
 
 运行：
 
@@ -965,7 +983,7 @@ rustfmt --edition 2024 --check crates/ai/src/bedrock_provider.rs crates/ai/src/p
 git diff --check
 ```
 
-结果：全部 PASS。独立 feature 使用 `--lib` 加 Task 9 两个 integration test targets，既覆盖该 feature 的生产编译与相关回归，也避免运行未按 provider feature 门控的无关 `anthropic_sse_e2e`。最小 feature 仍显示其他模块已有的 cfg/unused warning；Task 9 改动没有新增 warning，`all-providers` 无 warning。
+结果：全部 PASS。独立 Bedrock 为 76 个 lib、9 个 request metadata、1 个 terminal test；独立 Vertex 为 75+10+1。组合 feature 共 132 tests，`all-providers` 共 197 tests，全部 0 failed；最小 feature 仅显示其他模块已有的 cfg/unused warning，`all-providers` 无 warning。
 
 ---
 

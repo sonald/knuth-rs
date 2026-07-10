@@ -42,18 +42,18 @@ pub fn sign(req: &SigningRequest<'_>) -> SignedRequest {
     let date = req.amz_date.get(..8).unwrap_or(req.amz_date); // YYYYMMDD when valid.
     let payload_hash = hex::encode(Sha256::digest(req.payload));
 
-    // Compose all headers we'll sign. Caller headers + host + x-amz-date + content-hash +
-    // optional security-token, lower-cased, sorted, trimmed.
+    // Compose all headers we'll sign. Required SigV4 values win over caller-provided aliases so
+    // the returned synthesized headers are exactly the values covered by the signature.
     let mut header_map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in req.headers {
+        header_map.insert(k.to_ascii_lowercase(), trim_collapse(v));
+    }
     let host = host_with_port(req.url);
     header_map.insert("host".into(), host);
     header_map.insert("x-amz-date".into(), req.amz_date.to_string());
     header_map.insert("x-amz-content-sha256".into(), payload_hash.clone());
     if let Some(tok) = req.session_token {
         header_map.insert("x-amz-security-token".into(), tok.to_string());
-    }
-    for (k, v) in req.headers {
-        header_map.insert(k.to_ascii_lowercase(), trim_collapse(v));
     }
 
     let canonical_headers: String = header_map
@@ -244,12 +244,27 @@ mod tests {
             amz_date: "20250101T000000Z",
         };
         let signed = sign(&req);
-        assert!(signed.authorization.starts_with(
-            "AWS4-HMAC-SHA256 Credential=AKIATEST/20250101/us-east-1/bedrock/aws4_request"
-        ));
-        assert!(signed.authorization.contains(
-            "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
-        ));
+        let canonical_request = concat!(
+            "POST\n",
+            "/model/anthropic.claude/invoke\n",
+            "\n",
+            "content-type:application/json\n",
+            "host:bedrock-runtime.us-east-1.amazonaws.com\n",
+            "x-amz-content-sha256:5e4ce7b36ba37b78a5d5f9fd08e6b7b54ba6879d651aa46ec9e1d6fa24ebe30a\n",
+            "x-amz-date:20250101T000000Z\n",
+            "x-amz-security-token:token123\n",
+            "\n",
+            "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n",
+            "5e4ce7b36ba37b78a5d5f9fd08e6b7b54ba6879d651aa46ec9e1d6fa24ebe30a",
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(canonical_request.as_bytes())),
+            "711819f1d9f60c749c9a75d265a9de4ae4ac1609db0ee9fcacd3d8a2abb0fca7"
+        );
+        assert_eq!(
+            signed.authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIATEST/20250101/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=6c750cebf0103280f0fdaa4fd9ec2f02235dca9feb9b206a63710193aa27c1f9"
+        );
         // Generated headers are returned verbatim.
         assert!(
             signed

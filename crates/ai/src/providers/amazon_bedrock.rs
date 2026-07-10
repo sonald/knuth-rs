@@ -12,11 +12,12 @@
 //!
 //! TODO:
 //! - prompt caching (`cachePoint` blocks)
-//! - thinking budget / display modes
+//! - thinking display modes
 //! - image content blocks in tool results
 
 use async_trait::async_trait;
 use chrono::Utc;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
@@ -57,16 +58,36 @@ impl ApiProvider for AmazonBedrockProvider {
         context: &Context,
         options: Option<&SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        self.stream(model, context, Some(&translate_simple_options(options)))
+        match translate_simple_options(model, options) {
+            Ok(options) => self.stream(model, context, Some(&options)),
+            Err(error) => {
+                let (stream, mut sender) = AssistantMessageEventStream::new();
+                push_error(&mut sender, model, error);
+                stream
+            }
+        }
     }
 }
 
-fn translate_simple_options(options: Option<&SimpleStreamOptions>) -> StreamOptions {
+fn translate_simple_options(
+    model: &Model,
+    options: Option<&SimpleStreamOptions>,
+) -> Result<StreamOptions, String> {
     let Some(options) = options else {
-        return StreamOptions::default();
+        return Ok(StreamOptions::default());
     };
     let mut translated = options.base.clone();
-    if let Some(level) = options.reasoning {
+    let Some(level) = options.reasoning else {
+        return Ok(translated);
+    };
+
+    let additional_fields = if supports_adaptive_thinking(model) {
+        json!({
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": reasoning_effort(model, level) },
+        })
+    } else if supports_fixed_budget_thinking(model) {
+        const MIN_THINKING_BUDGET: u32 = 1024;
         let configured_budget = options
             .thinking_budgets
             .as_ref()
@@ -82,15 +103,107 @@ fn translate_simple_options(options: Option<&SimpleStreamOptions>) -> StreamOpti
             ThinkingLevel::Medium => 8192,
             ThinkingLevel::High | ThinkingLevel::Xhigh => 16384,
         };
-        translated.provider_extras.insert(
-            "bedrock_reasoning".into(),
-            json!({
+        let max_tokens = translated.max_tokens.unwrap_or(model.max_tokens);
+        if max_tokens <= MIN_THINKING_BUDGET {
+            return Err(format!(
+                "Bedrock model {} requires maxTokens greater than the minimum Claude thinking budget",
+                model.id
+            ));
+        }
+        let budget = configured_budget
+            .unwrap_or(default_budget)
+            .max(MIN_THINKING_BUDGET)
+            .min(max_tokens - 1);
+        translated.max_tokens = Some(max_tokens);
+        json!({
+            "thinking": {
                 "type": "enabled",
-                "budget_tokens": configured_budget.unwrap_or(default_budget),
-            }),
-        );
+                "budget_tokens": budget,
+            }
+        })
+    } else if is_nova_2_lite(model) {
+        let effort = match level {
+            ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+        };
+        if effort == "high" {
+            translated.max_tokens = None;
+            translated.temperature = None;
+        }
+        json!({
+            "reasoningConfig": {
+                "type": "enabled",
+                "maxReasoningEffort": effort,
+            }
+        })
+    } else {
+        return Err(format!(
+            "Bedrock simple reasoning has no documented configurable protocol for model {}",
+            model.id
+        ));
+    };
+    translated.provider_extras.insert(
+        "bedrock_additional_model_request_fields".into(),
+        additional_fields,
+    );
+    Ok(translated)
+}
+
+fn model_id_matches(id: &str, canonical_id: &str) -> bool {
+    id == canonical_id
+        || ["au.", "eu.", "global.", "jp.", "us."]
+            .iter()
+            .any(|prefix| id.strip_prefix(prefix) == Some(canonical_id))
+}
+
+fn supports_adaptive_thinking(model: &Model) -> bool {
+    [
+        "anthropic.claude-opus-4-6-v1",
+        "anthropic.claude-opus-4-7",
+        "anthropic.claude-sonnet-4-6",
+    ]
+    .iter()
+    .any(|id| model_id_matches(&model.id, id))
+}
+
+fn supports_fixed_budget_thinking(model: &Model) -> bool {
+    [
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "anthropic.claude-opus-4-1-20250805-v1:0",
+        "anthropic.claude-opus-4-5-20251101-v1:0",
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ]
+    .iter()
+    .any(|id| model_id_matches(&model.id, id))
+}
+
+fn reasoning_effort(model: &Model, level: ThinkingLevel) -> String {
+    let mapped_level = match level {
+        ThinkingLevel::Minimal => ModelThinkingLevel::Minimal,
+        ThinkingLevel::Low => ModelThinkingLevel::Low,
+        ThinkingLevel::Medium => ModelThinkingLevel::Medium,
+        ThinkingLevel::High => ModelThinkingLevel::High,
+        ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+    };
+    if let Some(mapped) = model
+        .thinking_level_map
+        .as_ref()
+        .and_then(|levels| levels.get(&mapped_level))
+        .and_then(|level| level.as_ref())
+    {
+        return mapped.clone();
     }
-    translated
+    match level {
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+    }
+    .into()
+}
+
+fn is_nova_2_lite(model: &Model) -> bool {
+    model_id_matches(&model.id, "amazon.nova-2-lite-v1:0")
 }
 
 async fn run(
@@ -159,13 +272,29 @@ async fn run(
             return;
         }
     };
-    let mut req = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "application/vnd.amazon.eventstream")
-        .headers(custom_headers);
+    let mut request_headers = custom_headers;
+    if !request_headers.contains_key(CONTENT_TYPE) {
+        request_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    if !request_headers.contains_key(ACCEPT) {
+        request_headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.amazon.eventstream"),
+        );
+    }
     if let Some(token) = bearer_token {
-        req = req.bearer_auth(token);
+        let authorization = match HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!("Bedrock bearer token is not a valid header value: {error}"),
+                );
+                return;
+            }
+        };
+        request_headers.insert(AUTHORIZATION, authorization);
     } else if let Some(creds) = sigv4_creds {
         let parsed_url = match url::Url::parse(&url) {
             Ok(parsed_url) => parsed_url,
@@ -178,26 +307,86 @@ async fn run(
                 return;
             }
         };
+        let signing_region = match resolve_signing_region(&model.id, &parsed_url, &creds.region) {
+            Ok(region) => region,
+            Err(error) => {
+                push_error(&mut sender, &model, format!("Bedrock SigV4: {error}"));
+                return;
+            }
+        };
+        request_headers.remove(HOST);
+        request_headers.remove(AUTHORIZATION);
+        let signing_headers = match request_headers
+            .iter()
+            .filter(|(name, _)| sigv4_signs_header(name))
+            .map(|(name, value)| {
+                value
+                    .to_str()
+                    .map(|value| (name.as_str(), value))
+                    .map_err(|error| format!("header {name:?} cannot be signed: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(headers) => headers,
+            Err(error) => {
+                push_error(&mut sender, &model, format!("Bedrock SigV4: {error}"));
+                return;
+            }
+        };
         let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let signed = crate::sigv4::sign(&crate::sigv4::SigningRequest {
             method: "POST",
             url: &parsed_url,
-            headers: &[],
+            headers: &signing_headers,
             payload: &payload,
-            region: &creds.region,
+            region: &signing_region,
             service: "bedrock",
             access_key: &creds.access_key,
             secret_key: &creds.secret_key,
             session_token: creds.session_token.as_deref(),
             amz_date: &amz_date,
         });
-        req = req.header("authorization", signed.authorization);
+        drop(signing_headers);
+        let authorization = match HeaderValue::from_str(&signed.authorization) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                push_error(
+                    &mut sender,
+                    &model,
+                    format!("Bedrock SigV4 authorization header is invalid: {error}"),
+                );
+                return;
+            }
+        };
+        request_headers.insert(AUTHORIZATION, authorization);
         for (name, value) in signed.headers {
-            req = req.header(name, value);
+            let name = match HeaderName::from_bytes(name.as_bytes()) {
+                Ok(name) => name,
+                Err(error) => {
+                    push_error(
+                        &mut sender,
+                        &model,
+                        format!("Bedrock SigV4 generated an invalid header name: {error}"),
+                    );
+                    return;
+                }
+            };
+            let value = match HeaderValue::from_str(&value) {
+                Ok(value) => value,
+                Err(error) => {
+                    push_error(
+                        &mut sender,
+                        &model,
+                        format!("Bedrock SigV4 generated an invalid header value: {error}"),
+                    );
+                    return;
+                }
+            };
+            request_headers.insert(name, value);
         }
     }
 
-    let req = req.body(payload);
+    let req = client.post(&url).headers(request_headers).body(payload);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
@@ -228,6 +417,70 @@ async fn run(
     }
 
     consume(resp, &model, sender, options.abort.as_ref()).await;
+}
+
+fn sigv4_signs_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "accept"
+            | "authorization"
+            | "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "user-agent"
+            | "x-amzn-trace-id"
+    )
+}
+
+fn resolve_signing_region(
+    model_id: &str,
+    url: &url::Url,
+    fallback: &str,
+) -> Result<String, String> {
+    let arn_region = bedrock_arn_region(model_id);
+    let endpoint_region = standard_bedrock_endpoint_region(url);
+    match (arn_region, endpoint_region) {
+        (Some(arn), Some(endpoint)) if arn != endpoint => Err(format!(
+            "Bedrock model ARN region {arn} conflicts with endpoint region {endpoint}"
+        )),
+        (Some(region), _) | (None, Some(region)) => Ok(region.to_string()),
+        (None, None) => Ok(fallback.to_string()),
+    }
+}
+
+fn bedrock_arn_region(model_id: &str) -> Option<&str> {
+    let mut parts = model_id.split(':');
+    if parts.next()? != "arn" {
+        return None;
+    }
+    let partition = parts.next()?;
+    if !partition.starts_with("aws") || parts.next()? != "bedrock" {
+        return None;
+    }
+    let region = parts.next()?;
+    (!region.is_empty()).then_some(region)
+}
+
+fn standard_bedrock_endpoint_region(url: &url::Url) -> Option<&str> {
+    let host = url.host_str()?;
+    let regional_host = host
+        .strip_suffix(".amazonaws.com.cn")
+        .or_else(|| host.strip_suffix(".amazonaws.com"))?;
+    let region = regional_host
+        .strip_prefix("bedrock-runtime.")
+        .or_else(|| regional_host.strip_prefix("bedrock-runtime-fips."))?;
+    (!region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+    .then_some(region)
 }
 
 async fn consume(
@@ -469,10 +722,16 @@ fn update_usage(usage: &mut Usage, u: &Value) {
 }
 
 fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
-    let mut body = json!({
-        "messages": convert_messages(&context.messages),
-        "inferenceConfig": inference_config(options),
-    });
+    let mut body = json!({ "messages": convert_messages(&context.messages) });
+    let nova_high = options
+        .provider_extras
+        .get("bedrock_additional_model_request_fields")
+        .and_then(|fields| fields.pointer("/reasoningConfig/maxReasoningEffort"))
+        .and_then(Value::as_str)
+        == Some("high");
+    if !nova_high {
+        body["inferenceConfig"] = inference_config(options);
+    }
     if let Some(sys) = &context.system_prompt {
         body["system"] = json!([{ "text": sys }]);
     }
@@ -481,8 +740,11 @@ fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
             body["toolConfig"] = json!({ "tools": serialize_tools(tools) });
         }
     }
-    if let Some(reasoning) = options.provider_extras.get("bedrock_reasoning") {
-        body["additionalModelRequestFields"] = json!({ "reasoning": reasoning });
+    if let Some(fields) = options
+        .provider_extras
+        .get("bedrock_additional_model_request_fields")
+    {
+        body["additionalModelRequestFields"] = fields.clone();
     }
     body
 }
@@ -657,25 +919,59 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_stream_simple_reasoning_sets_additional_model_fields() {
-        let opts = SimpleStreamOptions {
+    fn bedrock_stream_simple_rejects_unknown_claude_protocol() {
+        let mut model = crate::get_model(
+            &Provider::from("amazon-bedrock"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        )
+        .expect("built-in Claude model");
+        model.id = "anthropic.claude-future-v1:0".into();
+        let options = SimpleStreamOptions {
             reasoning: Some(ThinkingLevel::Medium),
             ..Default::default()
         };
-        let translated = translate_simple_options(Some(&opts));
-        let body = build_request_body(&Context::default(), &translated);
+
         assert_eq!(
-            body["additionalModelRequestFields"]["reasoning"]["type"],
-            "enabled"
+            translate_simple_options(&model, Some(&options)).unwrap_err(),
+            "Bedrock simple reasoning has no documented configurable protocol for model anthropic.claude-future-v1:0"
         );
+    }
+
+    #[test]
+    fn bedrock_signing_region_prefers_standard_endpoint_over_env_fallback() {
+        let url = url::Url::parse(
+            "https://bedrock-runtime.eu-central-1.amazonaws.com/model/test/converse-stream",
+        )
+        .unwrap();
+
         assert_eq!(
-            body["additionalModelRequestFields"]["reasoning"]["budget_tokens"],
-            8192
+            resolve_signing_region("test-model", &url, "us-east-1").unwrap(),
+            "eu-central-1"
+        );
+    }
+
+    #[test]
+    fn bedrock_signing_region_rejects_arn_endpoint_conflict() {
+        let url = url::Url::parse(
+            "https://bedrock-runtime.eu-central-1.amazonaws.com/model/test/converse-stream",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_signing_region(
+                "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/test",
+                &url,
+                "us-east-1",
+            )
+            .unwrap_err(),
+            "Bedrock model ARN region us-west-2 conflicts with endpoint region eu-central-1"
         );
     }
 
     #[test]
     fn bedrock_stream_simple_preserves_base_options_and_omits_absent_reasoning() {
+        let model = crate::get_model(&Provider::from("amazon-bedrock"), "amazon.nova-lite-v1:0")
+            .expect("built-in Nova model");
         let abort = tokio_util::sync::CancellationToken::new();
         let options = SimpleStreamOptions {
             base: StreamOptions {
@@ -690,7 +986,7 @@ mod tests {
             reasoning: None,
             ..Default::default()
         };
-        let translated = translate_simple_options(Some(&options));
+        let translated = translate_simple_options(&model, Some(&options)).unwrap();
         let context = Context {
             tools: Some(vec![Tool {
                 name: "lookup".into(),

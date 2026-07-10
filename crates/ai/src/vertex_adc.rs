@@ -17,10 +17,13 @@
 #![allow(dead_code)]
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
+
+use crate::types::StreamOptions;
+use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest};
 
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
@@ -34,6 +37,8 @@ pub enum AdcError {
     Sign(String),
     #[error("token exchange: {0}")]
     Exchange(String),
+    #[error("aborted")]
+    Aborted,
 }
 
 /// Loaded service-account JSON.
@@ -116,33 +121,32 @@ pub fn build_jwt(sa: &ServiceAccount, scope: Option<&str>) -> Result<String, Adc
 /// One-shot: load creds → build JWT → POST → return access_token. The caller caches.
 pub async fn fetch_access_token(scope: Option<&str>) -> Result<AccessToken, AdcError> {
     let sa = load_service_account(None)?;
-    fetch_access_token_for_service_account(&sa, scope).await
+    fetch_access_token_for_service_account(&sa, scope, &StreamOptions::default()).await
 }
 
 pub(crate) async fn fetch_access_token_for_service_account(
     sa: &ServiceAccount,
     scope: Option<&str>,
+    options: &StreamOptions,
 ) -> Result<AccessToken, AdcError> {
     let jwt = build_jwt(&sa, scope)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| AdcError::Exchange(e.to_string()))?;
+    let client =
+        crate::utils::node_http_proxy::build_client(Some(options.timeout_ms.unwrap_or(15_000)))
+            .map_err(|e| AdcError::Exchange(e.to_string()))?;
     let form = [
         ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
         ("assertion", &jwt),
     ];
-    let resp = client
-        .post(&sa.token_uri)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| AdcError::Exchange(e.to_string()))?;
+    let resp = abort_utils::send_or_abort(
+        client.post(&sa.token_uri).form(&form),
+        options.abort.as_ref(),
+    )
+    .await
+    .map_err(adc_http_error)?;
     let status = resp.status();
-    let text = resp
-        .text()
+    let text = abort_utils::response_text_or_abort(resp, options.abort.as_ref())
         .await
-        .map_err(|e| AdcError::Exchange(e.to_string()))?;
+        .map_err(adc_http_error)?;
     if !status.is_success() {
         return Err(AdcError::Exchange(format!("HTTP {status}")));
     }
@@ -162,6 +166,13 @@ pub(crate) async fn fetch_access_token_for_service_account(
         expires_at: now + parsed.expires_in.unwrap_or(3600),
         scope: parsed.scope,
     })
+}
+
+fn adc_http_error(error: AbortErrorOrReqwest) -> AdcError {
+    match error {
+        AbortErrorOrReqwest::Aborted => AdcError::Aborted,
+        AbortErrorOrReqwest::Reqwest(error) => AdcError::Exchange(error.to_string()),
+    }
 }
 
 #[cfg(test)]
