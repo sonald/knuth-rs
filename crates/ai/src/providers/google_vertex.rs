@@ -129,10 +129,11 @@ async fn run(
         .bearer_auth(token)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
-    if let Some(extra) = &options.headers {
-        for (k, v) in extra {
-            req = req.header(k.as_str(), v.as_str());
-        }
+    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+        model.headers.as_ref(),
+        options.headers.as_ref(),
+    ) {
+        req = req.header(k, v);
     }
 
     let req = req.json(&body);

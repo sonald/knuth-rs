@@ -185,10 +185,11 @@ async fn run(
         req = req.header("x-client-request-id", sid.as_str());
     }
 
-    if let Some(extra) = &options.headers {
-        for (k, v) in extra {
-            req = req.header(k.as_str(), v.as_str());
-        }
+    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+        model.headers.as_ref(),
+        options.headers.as_ref(),
+    ) {
+        req = req.header(k, v);
     }
 
     let req = req.json(&body);

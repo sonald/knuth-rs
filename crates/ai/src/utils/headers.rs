@@ -19,3 +19,56 @@ pub fn merge_headers(
     }
     out
 }
+
+pub fn merged_model_and_option_headers(
+    model_headers: Option<&HashMap<String, String>>,
+    option_headers: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    match model_headers {
+        Some(base) => merge_headers(base, option_headers),
+        None => option_headers.cloned().unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_headers_are_used_without_option_headers() {
+        let model = HashMap::from([("x-model".to_string(), "model".to_string())]);
+
+        assert_eq!(merged_model_and_option_headers(Some(&model), None), model);
+    }
+
+    #[test]
+    fn option_headers_override_model_headers() {
+        let model = HashMap::from([
+            ("x-model".to_string(), "model".to_string()),
+            ("x-shared".to_string(), "model".to_string()),
+        ]);
+        let options = HashMap::from([
+            ("x-options".to_string(), "options".to_string()),
+            ("x-shared".to_string(), "options".to_string()),
+        ]);
+
+        assert_eq!(
+            merged_model_and_option_headers(Some(&model), Some(&options)),
+            HashMap::from([
+                ("x-model".to_string(), "model".to_string()),
+                ("x-options".to_string(), "options".to_string()),
+                ("x-shared".to_string(), "options".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn option_headers_are_used_without_model_headers() {
+        let options = HashMap::from([("x-options".to_string(), "options".to_string())]);
+
+        assert_eq!(
+            merged_model_and_option_headers(None, Some(&options)),
+            options
+        );
+    }
+}

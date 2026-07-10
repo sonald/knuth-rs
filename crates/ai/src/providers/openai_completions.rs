@@ -16,7 +16,7 @@
 //! TODO:
 //! - cacheControlFormat: "anthropic" markers + thinkingFormat negotiation (deepseek/qwen/zai)
 //! - baseUrl auto-detection of compat flags (store/developer-role/max_tokens field)
-//! - GitHub Copilot dynamic headers, Cloudflare base URL rewriting
+//! - GitHub Copilot dynamic headers
 //! - tool-result `name` field for providers that require it
 //! - requiresAssistantAfterToolResult message massaging
 
@@ -139,20 +139,39 @@ async fn run(
     };
 
     let base = if model.base_url.is_empty() {
-        OPENAI_BASE_URL
+        Ok(OPENAI_BASE_URL.to_string())
     } else {
-        model.base_url.as_str()
+        #[cfg(feature = "cloudflare")]
+        {
+            if crate::providers::cloudflare::is_cloudflare_provider(&model.provider.0) {
+                crate::providers::cloudflare::resolve_cloudflare_base_url(&model)
+            } else {
+                Ok(model.base_url.clone())
+            }
+        }
+        #[cfg(not(feature = "cloudflare"))]
+        {
+            Ok::<_, String>(model.base_url.clone())
+        }
     };
-    let url = crate::utils::openai_compat_url::build_chat_completions_url(base);
+    let base = match base {
+        Ok(base) => base,
+        Err(error) => {
+            push_error(&mut sender, &model, error);
+            return;
+        }
+    };
+    let url = crate::utils::openai_compat_url::build_chat_completions_url(&base);
     let mut req = client
         .post(&url)
         .bearer_auth(api_key)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
-    if let Some(extra) = &options.headers {
-        for (k, v) in extra {
-            req = req.header(k.as_str(), v.as_str());
-        }
+    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+        model.headers.as_ref(),
+        options.headers.as_ref(),
+    ) {
+        req = req.header(k, v);
     }
 
     let req = req.json(&body);
