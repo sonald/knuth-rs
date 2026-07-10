@@ -304,88 +304,73 @@ mod tests {
     #[tokio::test]
     async fn start_step_emits_started_and_ended_with_length_reason() {
         clear_faux_responses();
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(16);
         let mut agent_loop = mk_loop(tx);
         let expected_step_id = agent_loop.step_id();
         let message = mk_message(StopReason::Length, vec![ContentBlock::text("partial")]);
         set_faux_responses(vec![message]);
 
-        agent_loop.start_step().await.unwrap();
+        let result = timeout(Duration::from_secs(1), agent_loop.start_step()).await;
         clear_faux_responses();
+        result.expect("start_step should not block").unwrap();
 
-        let mut saw_started = false;
-        let wait_for_end = timeout(Duration::from_secs(1), async {
-            loop {
-                let Some(message) = rx.recv().await else {
-                    panic!(
-                        "actor message channel closed before ModelStepEnded; saw_started={saw_started}"
-                    );
-                };
-
-                match message {
-                    AgentActorMessage::Turn(actor_step_id, TurnMessage::Event(event)) => {
-                        assert_eq!(
-                            actor_step_id, expected_step_id,
-                            "turn event carried an unexpected step_id: {event:?}"
-                        );
-
-                        match event {
-                            AgentEvent::ModelStepStarted { step_id } => {
-                                assert_eq!(step_id, expected_step_id);
-                                assert!(!saw_started, "received duplicate ModelStepStarted");
-                                saw_started = true;
-                            }
-                            AgentEvent::ModelStepEnded {
-                                step_id,
-                                reason,
-                                assistant_message,
-                            } => {
-                                assert!(
-                                    saw_started,
-                                    "received ModelStepEnded before ModelStepStarted"
-                                );
-                                assert_eq!(step_id, expected_step_id);
-                                assert_eq!(reason, ModelStepEndReason::Length);
-                                assert_eq!(
-                                    assistant_message
-                                        .expect("ModelStepEnded should include assistant_message")
-                                        .stop_reason,
-                                    StopReason::Length
-                                );
-                                break;
-                            }
-                            other => {
-                                assert!(
-                                    saw_started,
-                                    "unexpected event before ModelStepStarted: {other:?}"
-                                );
-                            }
+        let messages = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        for message in &messages {
+            match message {
+                AgentActorMessage::Turn(step_id, TurnMessage::Event(event)) => {
+                    assert_eq!(*step_id, expected_step_id);
+                    match event {
+                        AgentEvent::ModelStepStarted { step_id }
+                        | AgentEvent::ModelStepEnded { step_id, .. } => {
+                            assert_eq!(*step_id, expected_step_id);
                         }
-                    }
-                    AgentActorMessage::Turn(
-                        step_id,
-                        TurnMessage::Finished {
-                            reason,
-                            assistant_message,
-                        },
-                    ) => {
-                        panic!(
-                            "unexpected TurnMessage::Finished for step_id {step_id}: reason={reason:?}, assistant_message_present={}",
-                            assistant_message.is_some()
-                        );
-                    }
-                    AgentActorMessage::Command(command) => {
-                        panic!(
-                            "unexpected actor command while waiting for ModelStepEnded: {command}"
-                        );
+                        _ => {}
                     }
                 }
+                AgentActorMessage::Turn(_, TurnMessage::Finished { .. }) => {
+                    panic!("unexpected TurnMessage::Finished");
+                }
+                AgentActorMessage::Command(_) => panic!("unexpected actor command"),
             }
-        })
-        .await;
+        }
 
-        if wait_for_end.is_err() {
-            panic!("timed out waiting for ModelStepEnded; saw_started={saw_started}");
+        let lifecycle = messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentActorMessage::Turn(
+                    _,
+                    TurnMessage::Event(AgentEvent::ModelStepStarted { .. }),
+                ) => Some("started"),
+                AgentActorMessage::Turn(
+                    _,
+                    TurnMessage::Event(AgentEvent::ModelStepEnded { .. }),
+                ) => Some("ended"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["started", "ended"]);
+
+        match messages.last().expect("expected actor messages") {
+            AgentActorMessage::Turn(
+                step_id,
+                TurnMessage::Event(AgentEvent::ModelStepEnded {
+                    step_id: event_step_id,
+                    reason,
+                    assistant_message,
+                }),
+            ) => {
+                assert_eq!(*step_id, expected_step_id);
+                assert_eq!(*event_step_id, expected_step_id);
+                assert_eq!(*reason, ModelStepEndReason::Length);
+                assert_eq!(
+                    assistant_message
+                        .as_ref()
+                        .expect("ModelStepEnded should include assistant_message")
+                        .stop_reason,
+                    StopReason::Length
+                );
+            }
+            _ => unreachable!(),
         }
     }
 }

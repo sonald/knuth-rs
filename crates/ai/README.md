@@ -25,7 +25,7 @@ behavior and the explicit remaining limitations.
 | Google Vertex | working — access token or service-account ADC via `GOOGLE_APPLICATION_CREDENTIALS`; reuses Gemini consumer |
 | Amazon Bedrock | working — Converse Stream with Bearer token or SigV4 environment credentials |
 | Mistral | working — chat-completions-shaped; x-affinity, alphanumeric tool ids |
-| Cloudflare | working through OpenAI/Anthropic-compatible providers; base-url placeholders resolve from `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_GATEWAY_ID` |
+| Cloudflare | catalog + base-url placeholder support; the `cloudflare` feature alone does not wire a provider. Enable the model's corresponding `anthropic`, `openai-responses`, or `openai-completions` feature to make requests. |
 | Faux | scriptable — queue `AssistantMessage`s, replayed as event sequences |
 | Models registry | generated catalog loaded from `models.generated.json` |
 | Cost accounting | working for streamed usage across built-in providers; `Usage.cost` is populated from `Model.cost` |
