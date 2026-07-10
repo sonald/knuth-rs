@@ -315,6 +315,7 @@ cargo test -p ai --features all-providers
 **行为：**
 - 同一个 chunk 里多个 `tool_calls` 必须按 index/id 分开累积参数。
 - 不允许把两个 tool call 的 JSON 参数拼到同一个 buffer。
+- 入站 tool-call id 继续遵守 Mistral 的 9 位字母数字 normalization 契约。
 
 - [ ] **Step 1：新增失败测试**
 
@@ -330,12 +331,12 @@ mock SSE 内容包含两个并行 tool call：
 [
   {
     "index": 0,
-    "id": "call_a",
+    "id": "alpha1234",
     "function": { "name": "a", "arguments": "{\"x\":1}" }
   },
   {
     "index": 1,
-    "id": "call_b",
+    "id": "bravo5678",
     "function": { "name": "b", "arguments": "{\"y\":2}" }
   }
 ]
@@ -343,8 +344,9 @@ mock SSE 内容包含两个并行 tool call：
 
 断言：
 - 最终 message 有两个 `ContentBlock::ToolCall`。
-- 第一个 id/name/arguments 为 `call_a`/`a`/`{"x":1}`。
-- 第二个 id/name/arguments 为 `call_b`/`b`/`{"y":2}`。
+- 第一个 id/name/arguments 为 `alpha1234`/`a`/`{"x":1}`。
+- 第二个 id/name/arguments 为 `bravo5678`/`b`/`{"y":2}`。
+- 另以跨 chunk 事件测试覆盖非法或超长 id 被规范化为 9 位字母数字，且每个 call 的 Start/Delta/End 始终使用自己的 content index。
 
 - [ ] **Step 2：确认失败**
 
@@ -369,7 +371,7 @@ for tc in tool_calls {
     let pos = *tool_call_positions.entry(index).or_insert_with(|| {
         let p = partial.content.len();
         partial.content.push(ContentBlock::ToolCall(ToolCall {
-            id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            id: normalize_tool_call_id(tc.get("id").and_then(|v| v.as_str()).unwrap_or("")),
             name: tc.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             arguments: Map::new(),
             thought_signature: None,
@@ -1021,6 +1023,7 @@ git status --short
 | Bedrock 截断流被当作 Done | `bedrock_eof_before_message_stop_is_error` |
 | OpenAI Responses 保持 EOF error | `openai_responses_eof_before_terminal_event_is_error` |
 | Mistral 并行 tool calls 被合并 | `mistral_parallel_tool_calls_do_not_merge_arguments` |
+| Mistral 并行 tool-call 事件错用 content index 或丢失 id normalization | `mistral_parallel_tool_call_events_preserve_content_indices` |
 | `model.headers` 被忽略 | `openai_completions_merges_model_headers_then_options_headers`，以及 header helper unit coverage |
 | Cloudflare placeholders 未解析 | `cloudflare_placeholders_are_resolved_before_request` |
 | `Usage.cost` 总是 0 | `calculate_usage_cost_uses_per_million_prices`，provider terminal 测试断言 usage 有价格时 cost 非 0 |

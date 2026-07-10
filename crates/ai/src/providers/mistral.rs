@@ -273,7 +273,7 @@ async fn run(
                         .unwrap_or("");
                     let i = partial.content.len();
                     partial.content.push(ContentBlock::ToolCall(ToolCall {
-                        id: id.to_string(),
+                        id: normalize_tool_call_id(id),
                         name: name.to_string(),
                         arguments: Map::new(),
                         thought_signature: None,
