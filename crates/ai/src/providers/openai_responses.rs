@@ -308,6 +308,7 @@ pub(crate) async fn consume_responses_sse(
 struct StreamState {
     item_to_content: HashMap<String, usize>,
     output_to_content: HashMap<usize, usize>,
+    output_content_to_content: HashMap<(usize, usize), usize>,
     tool_arg_buffers: HashMap<usize, String>,
 }
 
@@ -334,10 +335,12 @@ fn handle_event(
         }
         "response.output_item.added" => on_output_item_added(&payload, partial, state, sender),
         "response.output_item.done" => on_output_item_done(&payload, partial, state, sender),
-        "response.output_text.delta" => on_text_delta(&payload, partial, sender),
-        "response.output_text.done" => on_text_done(&payload, partial, sender),
-        "response.reasoning_summary_text.delta" => on_thinking_delta(&payload, partial, sender),
-        "response.reasoning_summary_text.done" => on_thinking_done(&payload, partial),
+        "response.output_text.delta" => on_text_delta(&payload, partial, state, sender),
+        "response.output_text.done" => on_text_done(&payload, partial, state, sender),
+        "response.reasoning_summary_text.delta" => {
+            on_thinking_delta(&payload, partial, state, sender)
+        }
+        "response.reasoning_summary_text.done" => on_thinking_done(&payload, partial, state),
         "response.function_call_arguments.delta" => {
             on_tool_args_delta(&payload, partial, state, sender)
         }
@@ -446,9 +449,7 @@ fn on_output_item_done(
     let item = &payload["item"];
     match item["type"].as_str().unwrap_or("") {
         "reasoning" => {
-            let Some(idx) = content_index_for_event(payload, state)
-                .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::Thinking(_))))
-            else {
+            let Some(idx) = content_index_for_event(payload, state) else {
                 return;
             };
             let summary = item["summary"]
@@ -488,9 +489,7 @@ fn on_output_item_done(
             }
         }
         "function_call" => {
-            let Some(idx) = content_index_for_event(payload, state)
-                .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
-            else {
+            let Some(idx) = content_index_for_event(payload, state) else {
                 return;
             };
             let raw = item["arguments"]
@@ -546,11 +545,25 @@ fn content_index_for_event(payload: &Value, state: &StreamState) -> Option<usize
         })
 }
 
-fn find_last_block(
-    partial: &AssistantMessage,
-    pred: impl Fn(&ContentBlock) -> bool,
-) -> Option<usize> {
-    partial.content.iter().rposition(pred)
+fn content_index_for_content_event(payload: &Value, state: &StreamState) -> Option<usize> {
+    let output_index = payload["output_index"].as_u64()? as usize;
+    let content_index = payload["content_index"].as_u64()? as usize;
+    state
+        .output_content_to_content
+        .get(&(output_index, content_index))
+        .copied()
+}
+
+fn remember_content_event_index(payload: &Value, content_index: usize, state: &mut StreamState) {
+    let Some(output_index) = payload["output_index"].as_u64() else {
+        return;
+    };
+    let Some(part_index) = payload["content_index"].as_u64() else {
+        return;
+    };
+    state
+        .output_content_to_content
+        .insert((output_index as usize, part_index as usize), content_index);
 }
 
 fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
@@ -563,14 +576,16 @@ fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
 fn on_text_delta(
     payload: &Value,
     partial: &mut AssistantMessage,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    let idx = match partial.content.last() {
-        Some(ContentBlock::Text(_)) => partial.content.len() - 1,
-        _ => {
+    let idx = match content_index_for_content_event(payload, state) {
+        Some(idx) => idx,
+        None => {
             let i = partial.content.len();
             partial.content.push(ContentBlock::text(""));
+            remember_content_event_index(payload, i, state);
             sender.push(AssistantMessageEvent::TextStart {
                 content_index: i,
                 partial: partial.clone(),
@@ -580,6 +595,8 @@ fn on_text_delta(
     };
     if let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) {
         tc.text.push_str(&delta);
+    } else {
+        return;
     }
     sender.push(AssistantMessageEvent::TextDelta {
         content_index: idx,
@@ -591,10 +608,12 @@ fn on_text_delta(
 fn on_text_done(
     payload: &Value,
     partial: &mut AssistantMessage,
+    state: &StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
-    if let Some(ContentBlock::Text(tc)) = partial.content.last().cloned() {
-        let idx = partial.content.len() - 1;
+    if let Some(idx) = content_index_for_content_event(payload, state)
+        && let Some(ContentBlock::Text(tc)) = partial.content.get(idx).cloned()
+    {
         let text = payload["text"]
             .as_str()
             .map(|s| s.to_string())
@@ -610,20 +629,23 @@ fn on_text_done(
 fn on_thinking_delta(
     payload: &Value,
     partial: &mut AssistantMessage,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    let idx = match partial
-        .content
-        .iter()
-        .rposition(|b| matches!(b, ContentBlock::Thinking(_)))
-    {
+    let idx = match content_index_for_event(payload, state) {
         Some(i) => i,
         None => {
             let i = partial.content.len();
             partial
                 .content
                 .push(ContentBlock::Thinking(ThinkingContent::default()));
+            if let Some(item_id) = payload["item_id"].as_str().filter(|id| !id.is_empty()) {
+                state.item_to_content.insert(item_id.to_string(), i);
+            }
+            if let Some(output_index) = payload["output_index"].as_u64() {
+                state.output_to_content.insert(output_index as usize, i);
+            }
             sender.push(AssistantMessageEvent::ThinkingStart {
                 content_index: i,
                 partial: partial.clone(),
@@ -641,12 +663,8 @@ fn on_thinking_delta(
     });
 }
 
-fn on_thinking_done(payload: &Value, partial: &mut AssistantMessage) {
-    if let Some(idx) = partial
-        .content
-        .iter()
-        .rposition(|b| matches!(b, ContentBlock::Thinking(_)))
-    {
+fn on_thinking_done(payload: &Value, partial: &mut AssistantMessage, state: &StreamState) {
+    if let Some(idx) = content_index_for_event(payload, state) {
         let content = payload["text"]
             .as_str()
             .map(|s| s.to_string())
@@ -664,9 +682,7 @@ fn on_tool_args_delta(
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    if let Some(idx) = content_index_for_event(payload, state)
-        .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
-    {
+    if let Some(idx) = content_index_for_event(payload, state) {
         state
             .tool_arg_buffers
             .entry(idx)
@@ -681,9 +697,7 @@ fn on_tool_args_delta(
 }
 
 fn on_tool_args_done(payload: &Value, partial: &mut AssistantMessage, state: &mut StreamState) {
-    let Some(idx) = content_index_for_event(payload, state)
-        .or_else(|| find_last_block(partial, |b| matches!(b, ContentBlock::ToolCall(_))))
-    else {
+    let Some(idx) = content_index_for_event(payload, state) else {
         return;
     };
     let raw = payload["arguments"].as_str().unwrap_or("");
@@ -1241,6 +1255,130 @@ mod tests {
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["id"], "rs_1");
         assert_eq!(input[0]["encrypted_content"], "enc");
+    }
+
+    #[tokio::test]
+    async fn text_done_routes_by_output_index_not_last_block() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "answer",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] },
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        handle_event(
+            &sse_event(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "answer",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        drop(sender);
+
+        let mut ended_text_blocks = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::TextEnd {
+                content_index,
+                content,
+                ..
+            } = event
+            {
+                ended_text_blocks.push((content_index, content));
+            }
+        }
+        assert_eq!(ended_text_blocks, vec![(0, "answer".into())]);
+    }
+
+    #[test]
+    fn reasoning_done_routes_by_output_index_not_last_same_type_block() {
+        let m = mk_model();
+        let (_stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (output_index, item_id) in [(0, "rs_1"), (2, "rs_2")] {
+            handle_event(
+                &sse_event(
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": { "type": "reasoning", "id": item_id, "summary": [] },
+                    }),
+                ),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        if let Some(ContentBlock::Thinking(thinking)) = partial.content.get_mut(1) {
+            thinking.thinking = "second reasoning".into();
+        }
+
+        handle_event(
+            &sse_event(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": "first reasoning",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+
+        let thinking: Vec<_> = partial
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking(thinking) => Some(thinking.thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, vec!["first reasoning", "second reasoning"]);
     }
 
     #[test]

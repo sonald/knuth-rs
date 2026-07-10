@@ -1079,7 +1079,7 @@ git status --short
 | Codex `max_tokens` 被忽略或缺省时误发送 | `codex_request_includes_max_output_tokens`、`codex_request_omits_max_output_tokens_by_default` |
 | Codex encrypted reasoning 没 replay | `codex_replays_encrypted_reasoning_items` |
 | Codex Responses wrapper 真实入口未覆盖 terminal usage/cost | `codex_responses_wrapper_done_usage_has_nonzero_cost` |
-| Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block` |
+| Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block`、`reasoning_done_routes_by_output_index_not_last_same_type_block` |
 | `clear_api_providers()` 后 built-ins 失效 | `stream_re_registers_builtins_after_clear` |
 | retry 防御分支可能 panic | `retryable_reqwest_errors_exclude_request_builder_errors` |
 | SSE 吞掉过多前导空格 | `data_field_removes_only_one_leading_space` |
