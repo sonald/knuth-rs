@@ -1122,8 +1122,14 @@ git status --short
 | Responses `output_item.done` 重复发出 block End 或快照不一致 | `reasoning_output_item_done_emits_one_thinking_end_with_matching_partial`、`function_call_output_item_done_emits_one_tool_call_end_with_matching_partial` |
 | Responses 无 identity 的 reasoning delta 创建孤立 block | `identityless_reasoning_delta_does_not_create_orphan_block` |
 | `clear_api_providers()` 后 built-ins 失效 | `stream_re_registers_builtins_after_clear` |
+| Registry 非空但 built-ins 缺失 | `ensure_restores_missing_builtins_when_registry_contains_custom_provider` |
+| custom same-API override | `ensure_preserves_custom_override_for_builtin_api` |
+| clear/stream ensure+lookup race | `clear_racing_with_stream_lookup_does_not_return_missing_provider_error` |
 | retry 防御分支可能 panic | `retryable_reqwest_errors_exclude_request_builder_errors` |
 | SSE 吞掉过多前导空格 | `data_field_removes_only_one_leading_space` |
+| SSE multiple event FIFO | `multiple_events_are_emitted_fifo` |
+| SSE line/data chunk reassembly | `line_and_data_split_across_chunks_are_reassembled` |
+| SSE EOF flush | `eof_without_blank_line_flushes_current_event` |
 | Bedrock simple stream 丢 reasoning | `bedrock_stream_simple_reasoning_sets_additional_model_fields` |
 | Bedrock SigV4 有基础设施但未接入 | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds`，本地 mock 可验证 `authorization: AWS4-HMAC-SHA256` 时增加 integration 断言 |
 | Vertex ADC 有基础设施但未接入 | `vertex_can_select_adc_when_access_token_absent` |
