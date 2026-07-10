@@ -150,6 +150,7 @@ async fn consume(
     // Bedrock indexes content blocks; map contentBlockIndex → our content vec position.
     let mut tool_args: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut index_map: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut saw_terminal = false;
 
     let mut es = AwsEventStream::new(resp.bytes_stream());
     loop {
@@ -314,6 +315,7 @@ async fn consume(
                 }
             }
             Some("messageStop") => {
+                saw_terminal = true;
                 partial.stop_reason = map_stop_reason(payload["stopReason"].as_str().unwrap_or(""));
             }
             Some("metadata") => {
@@ -323,6 +325,16 @@ async fn consume(
             }
             _ => {}
         }
+    }
+
+    if !saw_terminal {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("bedrock stream ended before terminal event".into());
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+        return;
     }
 
     let reason = match partial.stop_reason {

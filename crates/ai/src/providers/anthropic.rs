@@ -270,6 +270,7 @@ async fn run(
     });
 
     let mut sse = SseStream::new(resp.bytes_stream());
+    let mut saw_terminal = false;
     loop {
         if sender.is_closed() {
             return; // consumer dropped — abort silently.
@@ -289,17 +290,21 @@ async fn run(
             }
             Ok(ev) => {
                 if !handle_sse(&ev, &mut partial, &mut tool_arg_buffers, &mut sender) {
-                    return;
+                    saw_terminal = true;
+                    break;
                 }
             }
         }
     }
 
-    partial.stop_reason = StopReason::Stop;
-    sender.push(AssistantMessageEvent::Done {
-        reason: DoneReason::Stop,
-        message: partial,
-    });
+    if !saw_terminal {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("anthropic stream ended before terminal event".into());
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────

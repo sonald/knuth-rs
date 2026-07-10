@@ -183,6 +183,7 @@ async fn run(
     let mut tool_content_index: Option<usize> = None;
     let mut tool_args = String::new();
     let mut finish_reason: Option<String> = None;
+    let mut saw_done = false;
 
     let mut sse = SseStream::new(resp.bytes_stream());
     loop {
@@ -205,6 +206,7 @@ async fn run(
             }
         };
         if ev.data.trim() == "[DONE]" {
+            saw_done = true;
             break;
         }
         let Ok(chunk): Result<Value, _> = serde_json::from_str(&ev.data) else {
@@ -315,6 +317,16 @@ async fn run(
                 partial: partial.clone(),
             });
         }
+    }
+
+    if !saw_done && finish_reason.is_none() {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("mistral stream ended before terminal event".into());
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+        return;
     }
 
     let stop = match finish_reason.as_deref() {

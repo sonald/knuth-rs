@@ -191,6 +191,7 @@ async fn run(
     let mut thinking_index: Option<usize> = None;
     let mut tools: BTreeMap<u64, ToolAccum> = BTreeMap::new();
     let mut finish_reason: Option<String> = None;
+    let mut saw_done = false;
 
     let mut sse = SseStream::new(resp.bytes_stream());
     loop {
@@ -213,6 +214,7 @@ async fn run(
             }
         };
         if ev.data.trim() == "[DONE]" {
+            saw_done = true;
             break;
         }
         let Ok(chunk): Result<Value, _> = serde_json::from_str(&ev.data) else {
@@ -397,6 +399,17 @@ async fn run(
                 partial: partial.clone(),
             });
         }
+    }
+
+    if !saw_done && finish_reason.is_none() {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message =
+            Some("openai-completions stream ended before terminal event".into());
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+        return;
     }
 
     let stop = finish_reason

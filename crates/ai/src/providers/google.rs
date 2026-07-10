@@ -186,6 +186,7 @@ pub(crate) async fn consume_gemini_sse(
     // Track open text/thinking block kind: 0 = none, 1 = text, 2 = thinking.
     let mut open: u8 = 0;
     let mut tool_counter: u64 = 0;
+    let mut saw_terminal = false;
     let mut sse = SseStream::new(resp.bytes_stream());
     loop {
         if sender.is_closed() {
@@ -322,6 +323,7 @@ pub(crate) async fn consume_gemini_sse(
             .pointer("/candidates/0/finishReason")
             .and_then(|v| v.as_str())
         {
+            saw_terminal = true;
             partial.stop_reason = map_stop_reason(reason);
             if partial
                 .content
@@ -338,6 +340,16 @@ pub(crate) async fn consume_gemini_sse(
     }
 
     close_open_block(open, &mut partial, &mut sender);
+
+    if !saw_terminal {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("google stream ended before terminal event".into());
+        sender.push(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        });
+        return;
+    }
 
     let reason = match partial.stop_reason {
         StopReason::ToolUse => DoneReason::ToolUse,
