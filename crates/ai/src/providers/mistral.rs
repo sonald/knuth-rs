@@ -569,30 +569,40 @@ fn convert_messages(msgs: &[Message]) -> Vec<Value> {
                 out.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant(a) => {
-                let mut text = String::new();
+                let mut content = Vec::new();
                 let mut tool_calls = Vec::new();
                 for b in &a.content {
                     match b {
-                        ContentBlock::Text(t) => {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(&t.text);
+                        ContentBlock::Text(t) if !t.text.trim().is_empty() => {
+                            content.push(json!({
+                                "type": "text",
+                                "text": t.text,
+                            }));
                         }
+                        ContentBlock::Thinking(t) if !t.thinking.trim().is_empty() => {
+                            content.push(json!({
+                                "type": "thinking",
+                                "thinking": [{
+                                    "type": "text",
+                                    "text": t.thinking,
+                                }],
+                            }));
+                        }
+                        ContentBlock::Text(_) | ContentBlock::Thinking(_) => {}
                         ContentBlock::ToolCall(tc) => tool_calls.push(json!({
                             "id": normalize_tool_call_id(&tc.id),
                             "type": "function",
                             "function": {
                                 "name": tc.name,
                                 "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                            },
+                            }
                         })),
-                        _ => {}
+                        ContentBlock::Image(_) => {}
                     }
                 }
                 let mut msg = json!({ "role": "assistant" });
-                if !text.is_empty() {
-                    msg["content"] = json!(text);
+                if !content.is_empty() {
+                    msg["content"] = json!(content);
                 } else if tool_calls.is_empty() {
                     msg["content"] = json!("");
                 }

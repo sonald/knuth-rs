@@ -15,6 +15,7 @@ use ai::{Api, AssistantMessage, ContentBlock, Message, StopReason, ThinkingConte
     feature = "openai-completions",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
+    feature = "mistral",
     feature = "google",
     feature = "google-vertex",
     all(
@@ -29,6 +30,7 @@ use ai::{SimpleStreamOptions, ThinkingLevel, stream_simple};
     feature = "openai-completions",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
+    feature = "mistral",
     feature = "google",
     feature = "google-vertex",
     all(
@@ -249,6 +251,7 @@ fn header_values<'a>(request: &'a str, target: &str) -> Vec<&'a str> {
 
 #[cfg(any(
     feature = "amazon-bedrock",
+    feature = "mistral",
     feature = "google",
     feature = "google-vertex"
 ))]
@@ -271,8 +274,105 @@ async fn stream_to_done(
     done.expect("expected normally terminated stream")
 }
 
+#[cfg(feature = "mistral")]
+const MISTRAL_REASONING_SSE: &[u8] = br#"data: {"id":"mistral-reasoning","choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"plan"}]},{"type":"text","text":"answer"},{"type":"thinking","thinking":[{"type":"text","text":"review"}]},{"type":"text","text":"final"}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+#[cfg(feature = "mistral")]
+const MISTRAL_DONE_SSE: &[u8] =
+    br#"data: {"id":"mistral-done","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+#[cfg(feature = "mistral")]
+#[tokio::test]
+async fn mistral_public_stream_replays_thinking_and_text_chunks_in_block_order() {
+    let first_user = ai::Message::User(ai::UserMessage {
+        role: ai::UserRole::User,
+        content: ai::UserContent::Text("first turn".into()),
+        timestamp: 0,
+    });
+    let options = StreamOptions {
+        api_key: Some("mistral-test-key".into()),
+        ..Default::default()
+    };
+    let first_context = Context {
+        messages: vec![first_user.clone()],
+        ..Default::default()
+    };
+    let (base_url, first_request) =
+        support::serve_capture_once(MISTRAL_REASONING_SSE, "text/event-stream").await;
+    let model = support::model(
+        KnownApi::MistralConversations,
+        "mistral",
+        "mistral-small-latest",
+        base_url,
+    );
+
+    let assistant = stream_to_done(&model, &first_context, &options).await;
+    let _ = first_request.await.expect("first captured request");
+    assert!(matches!(
+        assistant.content.as_slice(),
+        [
+            ai::ContentBlock::Thinking(first_thinking),
+            ai::ContentBlock::Text(first_text),
+            ai::ContentBlock::Thinking(second_thinking),
+            ai::ContentBlock::Text(second_text),
+        ] if first_thinking.thinking == "plan"
+            && first_text.text == "answer"
+            && second_thinking.thinking == "review"
+            && second_text.text == "final"
+    ));
+
+    let next_context = Context {
+        messages: vec![
+            first_user,
+            ai::Message::Assistant(assistant),
+            ai::Message::User(ai::UserMessage {
+                role: ai::UserRole::User,
+                content: ai::UserContent::Text("second turn".into()),
+                timestamp: 1,
+            }),
+        ],
+        ..Default::default()
+    };
+    let (base_url, next_request) =
+        support::serve_capture_once(MISTRAL_DONE_SSE, "text/event-stream").await;
+    let model = support::model(
+        KnownApi::MistralConversations,
+        "mistral",
+        "mistral-small-latest",
+        base_url,
+    );
+    let _ = stream_to_done(&model, &next_context, &options).await;
+
+    let request = next_request.await.expect("next captured request").request;
+    let body = captured_request_json(&request);
+    assert_eq!(
+        body["messages"][1]["content"],
+        serde_json::json!([
+            {
+                "type": "thinking",
+                "thinking": [{ "type": "text", "text": "plan" }]
+            },
+            { "type": "text", "text": "answer" },
+            {
+                "type": "thinking",
+                "thinking": [{ "type": "text", "text": "review" }]
+            },
+            { "type": "text", "text": "final" }
+        ])
+    );
+}
+
 #[cfg(any(
     feature = "amazon-bedrock",
+    feature = "mistral",
     feature = "google",
     feature = "google-vertex"
 ))]
