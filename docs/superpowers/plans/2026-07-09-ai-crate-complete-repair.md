@@ -1076,8 +1076,9 @@ git status --short
 | Faux replay 未规范化 total 或未按调用模型价格重算 cost | `replayed_usage_normalizes_total_tokens_and_cost` |
 | Bedrock-Anthropic 丢失 message_start usage 或 delta 缺失字段覆盖已有值 | `bedrock_anthropic_message_start_usage_combines_with_delta_output_and_prices_done` |
 | Bedrock-Anthropic terminal Error 未结算 cost | `bedrock_anthropic_error_terminal_calculates_usage_cost` |
-| Codex `max_tokens` 被忽略 | `codex_request_includes_max_output_tokens` |
+| Codex `max_tokens` 被忽略或缺省时误发送 | `codex_request_includes_max_output_tokens`、`codex_request_omits_max_output_tokens_by_default` |
 | Codex encrypted reasoning 没 replay | `codex_replays_encrypted_reasoning_items` |
+| Codex Responses wrapper 真实入口未覆盖 terminal usage/cost | `codex_responses_wrapper_done_usage_has_nonzero_cost` |
 | Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block` |
 | `clear_api_providers()` 后 built-ins 失效 | `stream_re_registers_builtins_after_clear` |
 | retry 防御分支可能 panic | `retryable_reqwest_errors_exclude_request_builder_errors` |

@@ -12,8 +12,13 @@ use std::collections::HashMap;
 ))]
 use std::ffi::OsString;
 
+#[cfg(feature = "openai-codex-responses")]
+use ai::{
+    Api, AssistantMessage, ContentBlock, Message, Provider, StopReason, ThinkingContent, Usage,
+};
 #[cfg(any(
     feature = "openai-completions",
+    feature = "openai-codex-responses",
     all(
         feature = "cloudflare",
         any(feature = "anthropic", feature = "openai-responses")
@@ -22,6 +27,7 @@ use std::ffi::OsString;
 use ai::{AssistantMessageEvent, Context, KnownApi, StreamOptions, stream};
 #[cfg(any(
     feature = "openai-completions",
+    feature = "openai-codex-responses",
     all(
         feature = "cloudflare",
         any(feature = "anthropic", feature = "openai-responses")
@@ -52,6 +58,15 @@ data: {"type":"response.created","response":{"id":"resp_1"}}
 
 event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{}}}
+
+"#;
+
+#[cfg(feature = "openai-codex-responses")]
+const CODEX_RESPONSES_SSE: &[u8] = br#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_codex"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_codex","status":"completed","output":[],"usage":{}}}
 
 "#;
 
@@ -146,6 +161,115 @@ async fn capture_completions_request(
     }
     assert!(saw_done, "expected normally terminated stream");
     captured.await.unwrap().request
+}
+
+#[cfg(feature = "openai-codex-responses")]
+async fn capture_codex_request(context: Context, options: StreamOptions) -> serde_json::Value {
+    let (base_url, captured) =
+        support::serve_capture_once(CODEX_RESPONSES_SSE, "text/event-stream").await;
+    let model = support::model(
+        KnownApi::OpenAICodexResponses,
+        "openai-codex",
+        "gpt-5-codex",
+        base_url,
+    );
+
+    let mut events = stream(&model, &context, Some(&options));
+    let mut saw_done = false;
+    while let Some(event) = events.next().await {
+        match event {
+            AssistantMessageEvent::Done { .. } => saw_done = true,
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected stream error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_done, "expected normally terminated stream");
+
+    let request = captured.await.unwrap().request;
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("captured HTTP request body");
+    serde_json::from_str(body).expect("valid request JSON")
+}
+
+#[cfg(feature = "openai-codex-responses")]
+fn codex_options(max_tokens: Option<u32>) -> StreamOptions {
+    StreamOptions {
+        api_key: Some("test-key".into()),
+        max_tokens,
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_request_includes_max_output_tokens() {
+    let body = capture_codex_request(Context::default(), codex_options(Some(1234))).await;
+
+    assert_eq!(body["max_output_tokens"], 1234);
+    assert!(body.get("max_tokens").is_none());
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_request_omits_max_output_tokens_by_default() {
+    let body = capture_codex_request(Context::default(), codex_options(None)).await;
+
+    assert!(body.get("max_output_tokens").is_none());
+    assert!(body.get("max_tokens").is_none());
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_replays_encrypted_reasoning_items() {
+    let encrypted_item = serde_json::json!({
+        "type": "reasoning",
+        "id": "rs_123",
+        "encrypted_content": "encrypted-payload",
+        "summary": [{ "type": "summary_text", "text": "brief summary" }]
+    });
+    let assistant = Message::Assistant(AssistantMessage {
+        role: Default::default(),
+        content: vec![
+            ContentBlock::Thinking(ThinkingContent {
+                thinking: "brief summary".into(),
+                thinking_signature: Some(encrypted_item.to_string()),
+                redacted: false,
+            }),
+            ContentBlock::Thinking(ThinkingContent {
+                thinking: "ordinary local thinking".into(),
+                thinking_signature: None,
+                redacted: false,
+            }),
+            ContentBlock::text("answer"),
+        ],
+        api: Api::known(KnownApi::OpenAICodexResponses),
+        provider: Provider::from("openai-codex"),
+        model: "gpt-5-codex".into(),
+        response_model: None,
+        response_id: Some("resp_previous".into()),
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        timestamp: 0,
+    });
+    let context = Context {
+        system_prompt: None,
+        messages: vec![assistant],
+        tools: None,
+    };
+
+    let body = capture_codex_request(context, codex_options(None)).await;
+    let input = body["input"].as_array().expect("input array");
+    let reasoning_items: Vec<_> = input
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .collect();
+
+    assert_eq!(reasoning_items, vec![&encrypted_item]);
 }
 
 #[cfg(feature = "openai-completions")]

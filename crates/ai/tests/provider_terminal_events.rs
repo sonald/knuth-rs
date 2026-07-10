@@ -1,8 +1,10 @@
 mod support;
 
+#[cfg(feature = "mistral")]
+use ai::ContentBlock;
 use ai::{
-    AssistantMessageEvent, ContentBlock, Context, KnownApi, Message, StopReason, StreamOptions,
-    UserContent, UserMessage, UserRole, stream,
+    AssistantMessageEvent, Context, KnownApi, Message, StopReason, StreamOptions, UserContent,
+    UserMessage, UserRole, stream,
 };
 use futures::StreamExt;
 
@@ -344,6 +346,44 @@ async fn openai_responses_done_usage_has_nonzero_cost() {
     assert!(message.usage.cost.total > 0.0);
     assert_eq!(message.usage.input, 20);
     assert_eq!(message.usage.cache_read, 80);
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_responses_wrapper_done_usage_has_nonzero_cost() {
+    let base_url = support::serve_once(
+        br#"data: {"type":"response.completed","response":{"id":"resp_codex","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":20}}}}
+
+"#,
+        "text/event-stream",
+    )
+    .await;
+    let model = support::model(
+        KnownApi::OpenAICodexResponses,
+        "openai-codex",
+        "gpt-5-codex",
+        base_url,
+    );
+    let options = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &context(), Some(&options));
+    let mut message = None;
+
+    while let Some(event) = events.next().await {
+        if let AssistantMessageEvent::Done { message: done, .. } = event {
+            message = Some(done);
+        }
+    }
+
+    let message = message.expect("expected Done event from Codex wrapper");
+    assert_eq!(message.usage.input, 0);
+    assert_eq!(message.usage.output, 10);
+    assert_eq!(message.usage.cache_read, 80);
+    assert_eq!(message.usage.cache_write, 20);
+    assert_eq!(message.usage.total_tokens, 110);
+    assert!(message.usage.cost.total > 0.0);
 }
 
 #[cfg(feature = "azure-openai-responses")]

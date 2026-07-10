@@ -198,7 +198,7 @@ async fn run(
 
 fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     // Codex omits the system message and uses `instructions` instead.
-    let messages = convert_messages(&context.messages, None, false);
+    let messages = convert_codex_messages(&context.messages);
     let mut body = json!({
         "model": model.id,
         "store": false,
@@ -215,6 +215,9 @@ fn build_request_body(model: &Model, context: &Context, options: &StreamOptions)
     if let Some(t) = options.temperature {
         body["temperature"] = json!(t);
     }
+    if let Some(max_tokens) = options.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
     if let Some(tools) = &context.tools {
         if !tools.is_empty() {
             body["tools"] = json!(serialize_tools(tools));
@@ -224,6 +227,29 @@ fn build_request_body(model: &Model, context: &Context, options: &StreamOptions)
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
     body
+}
+
+fn convert_codex_messages(messages: &[Message]) -> Vec<Value> {
+    let mut replayable = messages.to_vec();
+    for message in &mut replayable {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        assistant.content.retain(|block| match block {
+            ContentBlock::Thinking(thinking) => thinking
+                .thinking_signature
+                .as_deref()
+                .and_then(|signature| serde_json::from_str::<Value>(signature).ok())
+                .is_some_and(|item| {
+                    item["type"] == "reasoning"
+                        && item
+                            .get("encrypted_content")
+                            .is_some_and(|content| content.is_string())
+                }),
+            _ => true,
+        });
+    }
+    convert_messages(&replayable, None, true)
 }
 
 #[cfg(test)]
