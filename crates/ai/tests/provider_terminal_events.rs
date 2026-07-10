@@ -1,8 +1,8 @@
 mod support;
 
 use ai::{
-    AssistantMessageEvent, Context, KnownApi, Message, StopReason, StreamOptions, UserContent,
-    UserMessage, UserRole, stream,
+    AssistantMessageEvent, ContentBlock, Context, KnownApi, Message, StopReason, StreamOptions,
+    UserContent, UserMessage, UserRole, stream,
 };
 use futures::StreamExt;
 
@@ -86,6 +86,53 @@ async fn mistral_eof_before_done_or_finish_reason_is_error() {
     .await;
 
     assert_eof_is_error(KnownApi::MistralConversations, "mistral", base_url).await;
+}
+
+#[cfg(feature = "mistral")]
+#[tokio::test]
+async fn mistral_parallel_tool_calls_do_not_merge_arguments() {
+    let base_url = support::serve_once(
+        br#"data: {"id":"mistral_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"a","arguments":"{\"x\":1}"}},{"index":1,"id":"call_b","function":{"name":"b","arguments":"{\"y\":2}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        "text/event-stream",
+    )
+    .await;
+    let model = support::model(
+        KnownApi::MistralConversations,
+        "mistral",
+        "test-model",
+        base_url,
+    );
+    let options = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &context(), Some(&options));
+    let mut message = None;
+
+    while let Some(event) = events.next().await {
+        if let AssistantMessageEvent::Done { message: done, .. } = event {
+            message = Some(done);
+        }
+    }
+
+    let message = message.expect("expected Done event");
+    assert_eq!(message.content.len(), 2);
+    assert!(matches!(
+        &message.content[0],
+        ContentBlock::ToolCall(call)
+            if call.id == "call_a" && call.name == "a"
+                && call.arguments.get("x") == Some(&serde_json::json!(1))
+    ));
+    assert!(matches!(
+        &message.content[1],
+        ContentBlock::ToolCall(call)
+            if call.id == "call_b" && call.name == "b"
+                && call.arguments.get("y") == Some(&serde_json::json!(2))
+    ));
 }
 
 #[cfg(feature = "google")]

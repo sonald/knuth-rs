@@ -12,6 +12,8 @@
 //! - structured reasoning-part assembly ([THINK]...[/THINK])
 //! - tool-call id normalization map across handoffs (we only truncate here)
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
@@ -180,8 +182,8 @@ async fn run(
     });
 
     let mut text_index: Option<usize> = None;
-    let mut tool_content_index: Option<usize> = None;
-    let mut tool_args = String::new();
+    let mut tool_call_positions: HashMap<u64, usize> = HashMap::new();
+    let mut tool_arg_buffers: HashMap<u64, String> = HashMap::new();
     let mut finish_reason: Option<String> = None;
     let mut saw_done = false;
 
@@ -262,7 +264,8 @@ async fn run(
         }
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tcs {
-                if tool_content_index.is_none() {
+                let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let position = *tool_call_positions.entry(index).or_insert_with(|| {
                     let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = tc
                         .pointer("/function/name")
@@ -270,22 +273,22 @@ async fn run(
                         .unwrap_or("");
                     let i = partial.content.len();
                     partial.content.push(ContentBlock::ToolCall(ToolCall {
-                        id: normalize_tool_call_id(id),
+                        id: id.to_string(),
                         name: name.to_string(),
                         arguments: Map::new(),
                         thought_signature: None,
                     }));
-                    tool_content_index = Some(i);
                     sender.push(AssistantMessageEvent::ToolCallStart {
                         content_index: i,
                         partial: partial.clone(),
                     });
-                }
+                    i
+                });
                 if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
                     if !args.is_empty() {
-                        tool_args.push_str(args);
+                        tool_arg_buffers.entry(index).or_default().push_str(args);
                         sender.push(AssistantMessageEvent::ToolCallDelta {
-                            content_index: tool_content_index.unwrap(),
+                            content_index: position,
                             delta: args.to_string(),
                             partial: partial.clone(),
                         });
@@ -304,15 +307,22 @@ async fn run(
             });
         }
     }
-    if let Some(idx) = tool_content_index {
-        if let Ok(Value::Object(map)) = crate::utils::json_parse::parse_partial_json(&tool_args) {
-            if let Some(ContentBlock::ToolCall(b)) = partial.content.get_mut(idx) {
-                b.arguments = map;
-            }
+    for (index, raw) in &tool_arg_buffers {
+        let Some(position) = tool_call_positions.get(index).copied() else {
+            continue;
+        };
+        if let Ok(Value::Object(map)) = crate::utils::json_parse::parse_partial_json(raw)
+            && let Some(ContentBlock::ToolCall(b)) = partial.content.get_mut(position)
+        {
+            b.arguments = map;
         }
-        if let Some(ContentBlock::ToolCall(b)) = partial.content.get(idx).cloned() {
+    }
+    let mut tool_positions: Vec<_> = tool_call_positions.values().copied().collect();
+    tool_positions.sort_unstable();
+    for position in tool_positions {
+        if let Some(ContentBlock::ToolCall(b)) = partial.content.get(position).cloned() {
             sender.push(AssistantMessageEvent::ToolCallEnd {
-                content_index: idx,
+                content_index: position,
                 tool_call: b,
                 partial: partial.clone(),
             });
