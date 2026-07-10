@@ -4,7 +4,9 @@
 //! `content_block_stop` / `message_delta` / `message_stop`). This module converts that
 //! payload stream into pie-ai's `AssistantMessageEvent` stream.
 //!
-//! Wired downstream of [`crate::bedrock_provider::invoke_stream`].
+//! This is a standalone converter utility for callers that already receive the legacy
+//! Bedrock-Anthropic envelope. It is not the built-in Bedrock provider registered by
+//! `register_builtins`; that path uses `providers::amazon_bedrock` and Converse Stream.
 
 #![allow(dead_code)]
 
@@ -21,22 +23,28 @@ use crate::types::{
 /// Stateful converter. Keeps the running `AssistantMessage` so each yielded event carries the
 /// partial-as-of-this-moment snapshot pie-ai consumers expect.
 pub struct Converter {
-    model: Model,
+    model: Option<Model>,
     msg: AssistantMessage,
     current_index: usize,
     started: bool,
 }
 
+impl Default for Converter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Converter {
-    pub fn new(model: &Model) -> Self {
+    pub fn new() -> Self {
         Self {
-            model: model.clone(),
+            model: None,
             msg: AssistantMessage {
                 role: AssistantRole::Assistant,
                 content: Vec::new(),
-                api: model.api.clone(),
-                provider: model.provider.clone(),
-                model: model.id.clone(),
+                api: crate::types::Api::from("bedrock-anthropic"),
+                provider: crate::types::Provider::from("amazon-bedrock"),
+                model: String::new(),
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
@@ -48,6 +56,15 @@ impl Converter {
             current_index: 0,
             started: false,
         }
+    }
+
+    pub fn with_model(model: Model) -> Self {
+        let mut converter = Self::new();
+        converter.msg.api = model.api.clone();
+        converter.msg.provider = model.provider.clone();
+        converter.msg.model = model.id.clone();
+        converter.model = Some(model);
+        converter
     }
 
     /// Feed one event-stream EventMessage. Returns zero or more typed events. Returning
@@ -73,7 +90,10 @@ impl Converter {
         let mut out = Vec::new();
         match evt {
             AnthropicStreamEvent::MessageStart { message } => {
-                self.msg.model = message.model.unwrap_or_else(|| self.model.id.clone());
+                self.msg.model = message
+                    .model
+                    .or_else(|| self.model.as_ref().map(|model| model.id.clone()))
+                    .unwrap_or_default();
                 self.msg.response_id = message.id;
                 if let Some(role) = message.role {
                     self.msg.role = match role.as_str() {
@@ -215,7 +235,9 @@ impl Converter {
                 }
             }
             AnthropicStreamEvent::MessageStop {} => {
-                calculate_usage_cost(&self.model, &mut self.msg.usage);
+                if let Some(model) = &self.model {
+                    calculate_usage_cost(model, &mut self.msg.usage);
+                }
                 let reason = match self.msg.stop_reason {
                     StopReason::ToolUse => DoneReason::ToolUse,
                     StopReason::Length => DoneReason::Length,
@@ -229,7 +251,9 @@ impl Converter {
             AnthropicStreamEvent::Error { error } => {
                 self.msg.error_message = Some(error.message.clone());
                 self.msg.stop_reason = StopReason::Error;
-                calculate_usage_cost(&self.model, &mut self.msg.usage);
+                if let Some(model) = &self.model {
+                    calculate_usage_cost(model, &mut self.msg.usage);
+                }
                 out.push(AssistantMessageEvent::Error {
                     reason: ErrorReason::Error,
                     error: self.msg.clone(),
@@ -388,8 +412,14 @@ mod tests {
     }
 
     #[test]
+    fn converter_preserves_default_and_no_arg_new_constructors() {
+        let _new = Converter::new();
+        let _default = Converter::default();
+    }
+
+    #[test]
     fn full_text_turn_round_trip() {
-        let mut c = Converter::new(&model());
+        let mut c = Converter::new();
         // message_start
         let events = c
             .ingest(&frame(
@@ -448,7 +478,7 @@ mod tests {
 
     #[test]
     fn error_event_emits_error_variant() {
-        let mut c = Converter::new(&model());
+        let mut c = Converter::new();
         let events = c
             .ingest(&frame(
                 r#"{"type":"error","error":{"message":"too many tokens"}}"#,
@@ -464,14 +494,14 @@ mod tests {
 
     #[test]
     fn ping_emits_nothing() {
-        let mut c = Converter::new(&model());
+        let mut c = Converter::new();
         let events = c.ingest(&frame(r#"{"type":"ping"}"#)).unwrap();
         assert!(events.is_empty());
     }
 
     #[test]
     fn bedrock_anthropic_message_start_usage_combines_with_delta_output_and_prices_done() {
-        let mut c = Converter::new(&model());
+        let mut c = Converter::with_model(model());
         c.ingest(&frame(
             r#"{"type":"message_start","message":{"id":"m1","model":"claude","role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}}"#,
         ))
@@ -495,7 +525,7 @@ mod tests {
 
     #[test]
     fn bedrock_anthropic_error_terminal_calculates_usage_cost() {
-        let mut c = Converter::new(&model());
+        let mut c = Converter::with_model(model());
         c.ingest(&frame(
             r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":100}}"#,
         ))

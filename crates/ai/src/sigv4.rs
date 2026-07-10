@@ -108,8 +108,8 @@ pub fn sign(req: &SigningRequest<'_>) -> SignedRequest {
 fn host_with_port(url: &url::Url) -> String {
     let host = url.host_str().unwrap_or("").to_string();
     match (url.port(), url.scheme()) {
-        (Some(p), "http") if p == 80 => host,
-        (Some(p), "https") if p == 443 => host,
+        (Some(80), "http") => host,
+        (Some(443), "https") => host,
         (Some(p), _) => format!("{host}:{p}"),
         (None, _) => host,
     }

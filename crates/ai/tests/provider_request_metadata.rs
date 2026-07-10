@@ -7,12 +7,15 @@ mod support;
 ))]
 use std::collections::HashMap;
 
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+use ai::Message;
 #[cfg(any(feature = "openai-codex-responses", feature = "amazon-bedrock"))]
 use ai::Provider;
 #[cfg(feature = "openai-codex-responses")]
-use ai::{Api, AssistantMessage, ContentBlock, Message, StopReason, ThinkingContent, Usage};
+use ai::{Api, AssistantMessage, ContentBlock, StopReason, ThinkingContent, ToolCall, Usage};
 #[cfg(any(
     feature = "openai-completions",
+    feature = "openai-responses",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
     feature = "mistral",
@@ -26,8 +29,11 @@ use ai::{Api, AssistantMessage, ContentBlock, Message, StopReason, ThinkingConte
 use ai::{AssistantMessageEvent, Context, KnownApi, StreamOptions, stream};
 #[cfg(feature = "amazon-bedrock")]
 use ai::{SimpleStreamOptions, ThinkingLevel, stream_simple};
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+use ai::{UserContent, UserMessage, UserRole};
 #[cfg(any(
     feature = "openai-completions",
+    feature = "openai-responses",
     feature = "openai-codex-responses",
     feature = "amazon-bedrock",
     feature = "mistral",
@@ -88,6 +94,39 @@ data: {"type":"response.created","response":{"id":"resp_codex"}}
 
 event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_codex","status":"completed","output":[],"usage":{}}}
+
+"#;
+
+#[cfg(feature = "openai-responses")]
+const RESPONSES_ROUND_TRIP_SSE: &[u8] = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"encrypted","summary":[{"type":"summary_text","text":"plan"}]}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_commentary","phase":"commentary","content":[]}}
+
+data: {"type":"response.content_part.added","item_id":"msg_commentary","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}
+
+data: {"type":"response.output_text.delta","item_id":"msg_commentary","output_index":1,"content_index":0,"delta":"checking"}
+
+data: {"type":"response.output_text.done","item_id":"msg_commentary","output_index":1,"content_index":0,"text":"checking"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_commentary","phase":"commentary","content":[{"type":"output_text","text":"checking"}]}}
+
+data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":2,"arguments":"{\"path\":\"README.md\"}"}
+
+data: {"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"README.md\"}"}}
+
+data: {"type":"response.output_item.added","output_index":3,"item":{"type":"message","id":"msg_final","phase":"final_answer","content":[]}}
+
+data: {"type":"response.content_part.added","item_id":"msg_final","output_index":3,"content_index":0,"part":{"type":"output_text","text":""}}
+
+data: {"type":"response.output_text.done","item_id":"msg_final","output_index":3,"content_index":0,"text":"finished"}
+
+data: {"type":"response.output_item.done","output_index":3,"item":{"type":"message","id":"msg_final","phase":"final_answer","content":[{"type":"output_text","text":"finished"}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_round_trip","status":"completed","output":[],"usage":{}}}
 
 "#;
 
@@ -155,6 +194,80 @@ async fn capture_codex_request(context: Context, options: StreamOptions) -> serd
         .split_once("\r\n\r\n")
         .expect("captured HTTP request body");
     serde_json::from_str(body).expect("valid request JSON")
+}
+
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn responses_store_false_round_trip_preserves_interleaved_output_items() {
+    let first_url = support::serve_once(RESPONSES_ROUND_TRIP_SSE, "text/event-stream").await;
+    let mut model = support::model(KnownApi::OpenAIResponses, "openai", "gpt-test", first_url);
+    let options = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    let mut first_stream = stream(&model, &Context::default(), Some(&options));
+    let mut first_message = None;
+    while let Some(event) = first_stream.next().await {
+        match event {
+            AssistantMessageEvent::Done { message, .. } => first_message = Some(message),
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected first-turn error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+
+    let second_response = br#"data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[],"usage":{}}}
+
+"#;
+    let (second_url, captured) =
+        support::serve_capture_once(second_response, "text/event-stream").await;
+    model.base_url = second_url;
+    let context = Context {
+        system_prompt: None,
+        messages: vec![
+            Message::Assistant(first_message.expect("first-turn Done message")),
+            Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("continue".into()),
+                timestamp: 0,
+            }),
+        ],
+        tools: None,
+    };
+    let mut second_stream = stream(&model, &context, Some(&options));
+    let mut second_done = false;
+    while let Some(event) = second_stream.next().await {
+        match event {
+            AssistantMessageEvent::Done { .. } => second_done = true,
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected second-turn error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+    assert!(second_done, "second turn must terminate with Done");
+
+    let request = captured.await.unwrap().request;
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(
+        input[..4]
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["reasoning", "message", "function_call", "message"]
+    );
+    assert_eq!(input[1]["id"], "msg_commentary");
+    assert_eq!(input[1]["phase"], "commentary");
+    assert_eq!(input[1]["content"][0]["text"], "checking");
+    assert_eq!(input[2]["id"], "fc_1");
+    assert_eq!(input[2]["call_id"], "call_1");
+    assert_eq!(input[3]["id"], "msg_final");
+    assert_eq!(input[3]["phase"], "final_answer");
+    assert_eq!(input[3]["content"][0]["text"], "finished");
+    assert_eq!(input[4]["role"], "user");
 }
 
 #[cfg(feature = "openai-codex-responses")]
@@ -233,6 +346,110 @@ async fn codex_replays_encrypted_reasoning_items() {
         .collect();
 
     assert_eq!(reasoning_items, vec![&encrypted_item]);
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_replays_only_well_formed_encrypted_reasoning_in_mixed_history() {
+    let encrypted_item = serde_json::json!({
+        "type": "reasoning",
+        "id": "rs_valid",
+        "encrypted_content": "encrypted-payload",
+        "summary": [],
+    });
+    let thinking = |signature: Option<String>| {
+        ContentBlock::Thinking(ThinkingContent {
+            thinking: "not replayable".into(),
+            thinking_signature: signature,
+            redacted: false,
+        })
+    };
+    let assistant = Message::Assistant(AssistantMessage {
+        role: Default::default(),
+        content: vec![
+            ContentBlock::text("before"),
+            thinking(Some("{".into())),
+            ContentBlock::ToolCall(ToolCall {
+                id: "call_1|fc_1".into(),
+                name: "read".into(),
+                arguments: Default::default(),
+                thought_signature: None,
+            }),
+            thinking(Some(
+                serde_json::json!({
+                    "type": "message",
+                    "encrypted_content": "wrong-type",
+                })
+                .to_string(),
+            )),
+            ContentBlock::text("middle"),
+            thinking(Some(
+                serde_json::json!({ "type": "reasoning", "id": "rs_missing" }).to_string(),
+            )),
+            thinking(Some(
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_non_string",
+                    "encrypted_content": 7,
+                })
+                .to_string(),
+            )),
+            thinking(None),
+            thinking(Some(encrypted_item.to_string())),
+            ContentBlock::text("after"),
+        ],
+        api: Api::known(KnownApi::OpenAICodexResponses),
+        provider: Provider::from("openai-codex"),
+        model: "gpt-5-codex".into(),
+        response_model: None,
+        response_id: Some("resp_previous".into()),
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        timestamp: 0,
+    });
+    let context = Context {
+        system_prompt: None,
+        messages: vec![
+            assistant,
+            Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("continue".into()),
+                timestamp: 0,
+            }),
+        ],
+        tools: None,
+    };
+
+    let body = capture_codex_request(context, codex_options(None)).await;
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(
+        input[..5]
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "message",
+            "function_call",
+            "message",
+            "reasoning",
+            "message"
+        ]
+    );
+    assert_eq!(input[0]["content"][0]["text"], "before");
+    assert_eq!(input[1]["call_id"], "call_1");
+    assert_eq!(input[2]["content"][0]["text"], "middle");
+    assert_eq!(input[3], encrypted_item);
+    assert_eq!(input[4]["content"][0]["text"], "after");
+    assert_eq!(input[5]["role"], "user");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .count(),
+        1
+    );
 }
 
 #[cfg(any(
@@ -413,7 +630,7 @@ async fn assert_google_signature_round_trip(
     };
     let (base_url, first_request) =
         support::serve_capture_once(GOOGLE_SIGNATURE_SSE, "text/event-stream").await;
-    let model = support::model(api.clone(), provider, "gemini-test", base_url);
+    let model = support::model(api, provider, "gemini-test", base_url);
 
     let assistant = stream_to_done(&model, &first_context, options).await;
     let _ = first_request.await.expect("first captured request");

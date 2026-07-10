@@ -9,14 +9,12 @@
 //! - SSE → AssistantMessageEvent mapping for the happy path
 //! - `prompt_cache_key` + `prompt_cache_retention` ("24h" when retention is long)
 //! - `reasoning.effort` + `reasoning.summary` + `include: ["reasoning.encrypted_content"]`
-//! - service_tier knob (cost multiplier TODO)
+//! - service_tier request knob; usage cost remains based on the static `Model.cost` catalog
 //!
 //! TODO:
 //! - Cross-provider transform_messages
 //! - GitHub Copilot dynamic headers
 //! - Tool-call id `call|item` normalization across provider handoffs
-//! - service_tier pricing multiplier
-//! - `output_text.done`/`function_call_arguments.done` final-state reconciliation
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -309,6 +307,7 @@ struct StreamState {
     item_to_content: HashMap<String, usize>,
     output_to_content: HashMap<usize, usize>,
     output_content_to_content: HashMap<(usize, usize), usize>,
+    output_message_signatures: HashMap<usize, String>,
     tool_arg_buffers: HashMap<usize, String>,
     ended_content: HashSet<usize>,
 }
@@ -338,7 +337,9 @@ fn handle_event(
         "response.output_item.done" => on_output_item_done(&payload, partial, state, sender),
         "response.content_part.added" => on_content_part_added(&payload, partial, state, sender),
         "response.output_text.delta" => on_text_delta(&payload, partial, state, sender),
-        "response.output_text.done" => on_text_done(&payload, partial, state, sender),
+        "response.refusal.delta" => on_text_delta(&payload, partial, state, sender),
+        "response.output_text.done" => on_text_done(&payload, "text", partial, state, sender),
+        "response.refusal.done" => on_text_done(&payload, "refusal", partial, state, sender),
         "response.reasoning_summary_text.delta" => {
             on_thinking_delta(&payload, partial, state, sender)
         }
@@ -407,6 +408,15 @@ fn on_output_item_added(
     let item = &payload["item"];
     let output_index = payload["output_index"].as_u64().map(|n| n as usize);
     match item["type"].as_str().unwrap_or("") {
+        "message" => {
+            if let (Some(output_index), Some(signature)) =
+                (output_index, text_signature_for_item(item))
+            {
+                state
+                    .output_message_signatures
+                    .insert(output_index, signature);
+            }
+        }
         "reasoning" => {
             let idx = partial.content.len();
             partial
@@ -450,6 +460,7 @@ fn on_output_item_done(
 ) {
     let item = &payload["item"];
     match item["type"].as_str().unwrap_or("") {
+        "message" => on_message_item_done(payload, partial, state, sender),
         "reasoning" => {
             let Some(idx) = content_index_for_event(payload, state) else {
                 return;
@@ -521,6 +532,71 @@ fn on_output_item_done(
     }
 }
 
+fn on_message_item_done(
+    payload: &Value,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) {
+    let Some(output_index) = payload["output_index"].as_u64().map(|n| n as usize) else {
+        return;
+    };
+    let item = &payload["item"];
+    let signature = text_signature_for_item(item);
+    if let Some(signature) = &signature {
+        state
+            .output_message_signatures
+            .insert(output_index, signature.clone());
+    }
+    let Some(parts) = item["content"].as_array() else {
+        return;
+    };
+
+    for (part_index, part) in parts.iter().enumerate() {
+        let final_text = match part["type"].as_str() {
+            Some("output_text") => part["text"].as_str(),
+            Some("refusal") => part["refusal"].as_str(),
+            _ => None,
+        };
+        let Some(final_text) = final_text else {
+            continue;
+        };
+        let identity = (output_index, part_index);
+        let idx = match state.output_content_to_content.get(&identity).copied() {
+            Some(idx) => idx,
+            None => {
+                let idx = partial.content.len();
+                partial.content.push(ContentBlock::Text(TextContent {
+                    text: String::new(),
+                    text_signature: signature.clone(),
+                }));
+                state.output_content_to_content.insert(identity, idx);
+                sender.push(AssistantMessageEvent::TextStart {
+                    content_index: idx,
+                    partial: partial.clone(),
+                });
+                idx
+            }
+        };
+
+        let Some(ContentBlock::Text(text)) = partial.content.get_mut(idx) else {
+            continue;
+        };
+        text.text = final_text.to_string();
+        if signature.is_some() {
+            text.text_signature.clone_from(&signature);
+        }
+        let content = text.text.clone();
+        if state.ended_content.insert(idx) {
+            sender.push(AssistantMessageEvent::TextEnd {
+                content_index: idx,
+                content,
+                partial: partial.clone(),
+            });
+        }
+    }
+}
+
 fn remember_item_index(
     item: &Value,
     output_index: Option<usize>,
@@ -581,15 +657,51 @@ fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
     }
 }
 
+fn text_signature_for_item(item: &Value) -> Option<String> {
+    let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+    let phase = match item["phase"].as_str() {
+        Some("commentary") => Some(TextSignaturePhase::Commentary),
+        Some("final_answer") => Some(TextSignaturePhase::FinalAnswer),
+        _ => None,
+    };
+    serde_json::to_string(&TextSignatureV1 {
+        v: 1,
+        id: id.to_string(),
+        phase,
+    })
+    .ok()
+}
+
+fn parse_text_signature(signature: Option<&str>) -> Option<(String, Option<TextSignaturePhase>)> {
+    let signature = signature.filter(|signature| !signature.is_empty())?;
+    if signature.starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(signature)
+        && value["v"].as_u64() == Some(1)
+        && let Some(id) = value["id"].as_str()
+    {
+        let phase = match value["phase"].as_str() {
+            Some("commentary") => Some(TextSignaturePhase::Commentary),
+            Some("final_answer") => Some(TextSignaturePhase::FinalAnswer),
+            _ => None,
+        };
+        return Some((id.to_string(), phase));
+    }
+    Some((signature.to_string(), None))
+}
+
 fn on_content_part_added(
     payload: &Value,
     partial: &mut AssistantMessage,
     state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
-    if payload["part"]["type"].as_str() != Some("output_text") {
+    let Some(text) = (match payload["part"]["type"].as_str() {
+        Some("output_text") => payload["part"]["text"].as_str(),
+        Some("refusal") => payload["part"]["refusal"].as_str(),
+        _ => None,
+    }) else {
         return;
-    }
+    };
     let Some(identity) = content_event_identity(payload) else {
         return;
     };
@@ -598,8 +710,27 @@ fn on_content_part_added(
     }
 
     let idx = partial.content.len();
-    let text = payload["part"]["text"].as_str().unwrap_or_default();
-    partial.content.push(ContentBlock::text(text));
+    let text_signature = state
+        .output_message_signatures
+        .get(&identity.0)
+        .cloned()
+        .or_else(|| {
+            payload["item_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .and_then(|id| {
+                    serde_json::to_string(&TextSignatureV1 {
+                        v: 1,
+                        id: id.to_string(),
+                        phase: None,
+                    })
+                    .ok()
+                })
+        });
+    partial.content.push(ContentBlock::Text(TextContent {
+        text: text.to_string(),
+        text_signature,
+    }));
     remember_content_event_index(payload, idx, state);
     sender.push(AssistantMessageEvent::TextStart {
         content_index: idx,
@@ -634,6 +765,7 @@ fn on_text_delta(
 
 fn on_text_done(
     payload: &Value,
+    final_text_field: &str,
     partial: &mut AssistantMessage,
     state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
@@ -647,7 +779,7 @@ fn on_text_done(
     let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) else {
         return;
     };
-    if let Some(text) = payload["text"].as_str() {
+    if let Some(text) = payload[final_text_field].as_str() {
         tc.text = text.to_string();
     }
     let content = tc.text.clone();
@@ -910,33 +1042,47 @@ pub(crate) fn convert_messages(
                 out.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant(a) => {
-                let mut content = Vec::new();
-                let mut function_calls = Vec::new();
                 for b in &a.content {
                     match b {
-                        ContentBlock::Text(t) => content.push(json!({
-                            "type": "output_text",
-                            "text": t.text,
-                        })),
-                        // Servers that consume reasoning items merge them into
-                        // the *following* assistant message, so this must be
-                        // emitted before the message / function_call items.
-                        ContentBlock::Thinking(th) if replay_reasoning => {
-                            if let Some(raw) = th
+                        ContentBlock::Text(t) => {
+                            let mut message = json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": t.text,
+                                    "annotations": [],
+                                }],
+                                "status": "completed",
+                            });
+                            if let Some((id, phase)) =
+                                parse_text_signature(t.text_signature.as_deref())
+                            {
+                                message["id"] = json!(id);
+                                if let Some(phase) = phase {
+                                    message["phase"] = json!(match phase {
+                                        TextSignaturePhase::Commentary => "commentary",
+                                        TextSignaturePhase::FinalAnswer => "final_answer",
+                                    });
+                                }
+                            }
+                            out.push(message);
+                        }
+                        ContentBlock::Thinking(th) => {
+                            let raw = th
                                 .thinking_signature
                                 .as_ref()
                                 .and_then(|sig| serde_json::from_str::<Value>(sig).ok())
-                                .filter(|v| v["type"] == "reasoning")
-                            {
+                                .filter(|value| value["type"] == "reasoning");
+                            if let Some(raw) = raw {
                                 out.push(raw);
-                            } else if !th.thinking.is_empty() {
+                            } else if replay_reasoning && !th.thinking.is_empty() {
                                 out.push(json!({
                                     "type": "reasoning",
                                     "summary": [{ "type": "summary_text", "text": th.thinking }],
                                 }));
                             }
                         }
-                        ContentBlock::Thinking(_) => {}
                         ContentBlock::ToolCall(tc) => {
                             let (call_id, item_id) = split_responses_tool_call_id(&tc.id);
                             let mut call = json!({
@@ -948,15 +1094,11 @@ pub(crate) fn convert_messages(
                             if let Some(item_id) = item_id {
                                 call["id"] = json!(item_id);
                             }
-                            function_calls.push(call);
+                            out.push(call);
                         }
                         ContentBlock::Image(_) => {}
                     }
                 }
-                if !content.is_empty() {
-                    out.push(json!({ "role": "assistant", "content": content }));
-                }
-                out.extend(function_calls);
             }
             Message::ToolResult(tr) => {
                 let text_parts: Vec<String> = tr
@@ -1196,6 +1338,308 @@ mod tests {
             error_message: None,
             timestamp: 0,
         })
+    }
+
+    #[tokio::test]
+    async fn refusal_lifecycle_uses_text_events_and_reconciles_output_item_done() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (kind, payload) in [
+            (
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_refusal",
+                        "phase": "final_answer",
+                        "content": [],
+                    },
+                }),
+            ),
+            (
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_refusal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "refusal", "refusal": "" },
+                }),
+            ),
+            (
+                "response.refusal.delta",
+                json!({
+                    "type": "response.refusal.delta",
+                    "item_id": "msg_refusal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "cannot",
+                }),
+            ),
+            (
+                "response.refusal.done",
+                json!({
+                    "type": "response.refusal.done",
+                    "item_id": "msg_refusal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "refusal": "cannot comply",
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_refusal",
+                        "phase": "final_answer",
+                        "content": [{ "type": "refusal", "refusal": "cannot comply" }],
+                    },
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type": "response.completed",
+                    "response": { "status": "completed", "output": [] },
+                }),
+            ),
+        ] {
+            handle_event(
+                &sse_event(kind, payload),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut starts = Vec::new();
+        let mut deltas = Vec::new();
+        let mut ends = Vec::new();
+        let mut done = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextStart {
+                    content_index,
+                    partial,
+                } => starts.push((content_index, partial)),
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                    partial,
+                } => deltas.push((content_index, delta, partial)),
+                AssistantMessageEvent::TextEnd {
+                    content_index,
+                    content,
+                    partial,
+                } => ends.push((content_index, content, partial)),
+                AssistantMessageEvent::Done { message, .. } => done = Some(message),
+                _ => {}
+            }
+        }
+
+        assert_eq!(starts.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].1, "cannot");
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].1, "cannot comply");
+        for message in [
+            &partial,
+            &starts[0].1,
+            &deltas[0].2,
+            &ends[0].2,
+            done.as_ref().unwrap(),
+        ] {
+            let Some(ContentBlock::Text(text)) = message.content.first() else {
+                panic!("expected refusal represented by a Text block");
+            };
+            let signature: Value = serde_json::from_str(text.text_signature.as_deref().unwrap())
+                .expect("TextSignatureV1 JSON");
+            assert_eq!(
+                signature,
+                json!({ "v": 1, "id": "msg_refusal", "phase": "final_answer" })
+            );
+        }
+        assert!(matches!(
+            done.unwrap().content.first(),
+            Some(ContentBlock::Text(text)) if text.text == "cannot comply"
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_output_item_done_finalizes_unfinished_refusal() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (kind, payload) in [
+            (
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "message", "id": "msg_refusal", "content": [] },
+                }),
+            ),
+            (
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_refusal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "refusal", "refusal": "" },
+                }),
+            ),
+            (
+                "response.refusal.delta",
+                json!({
+                    "type": "response.refusal.delta",
+                    "item_id": "msg_refusal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "partial",
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_refusal",
+                        "content": [{ "type": "refusal", "refusal": "final refusal" }],
+                    },
+                }),
+            ),
+        ] {
+            handle_event(
+                &sse_event(kind, payload),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut ends = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::TextEnd {
+                content, partial, ..
+            } = event
+            {
+                ends.push((content, partial));
+            }
+        }
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].0, "final refusal");
+        assert!(matches!(
+            ends[0].1.content.first(),
+            Some(ContentBlock::Text(text)) if text.text == "final refusal"
+        ));
+    }
+
+    #[test]
+    fn content_part_added_ignores_non_text_and_non_refusal_parts() {
+        let m = mk_model();
+        let (_stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "reasoning_text", "text": "private" },
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+
+        assert!(partial.content.is_empty());
+    }
+
+    #[test]
+    fn responses_replay_preserves_interleaved_output_items_and_message_identity() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "encrypted",
+            "summary": [],
+        });
+        let commentary_signature = serde_json::to_string(&TextSignatureV1 {
+            v: 1,
+            id: "msg_commentary".into(),
+            phase: Some(TextSignaturePhase::Commentary),
+        })
+        .unwrap();
+        let final_signature = serde_json::to_string(&TextSignatureV1 {
+            v: 1,
+            id: "msg_final".into(),
+            phase: Some(TextSignaturePhase::FinalAnswer),
+        })
+        .unwrap();
+        let mut arguments = Map::new();
+        arguments.insert("path".into(), json!("README.md"));
+
+        let input = convert_messages(
+            &[assistant_message(vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some(reasoning.to_string()),
+                    redacted: false,
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "checking".into(),
+                    text_signature: Some(commentary_signature),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1|fc_1".into(),
+                    name: "read".into(),
+                    arguments,
+                    thought_signature: None,
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "finished".into(),
+                    text_signature: Some(final_signature),
+                }),
+            ])],
+            None,
+            false,
+        );
+
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reasoning", "message", "function_call", "message"]
+        );
+        assert_eq!(input[1]["id"], "msg_commentary");
+        assert_eq!(input[1]["phase"], "commentary");
+        assert_eq!(input[1]["content"][0]["text"], "checking");
+        assert_eq!(input[3]["id"], "msg_final");
+        assert_eq!(input[3]["phase"], "final_answer");
+        assert_eq!(input[3]["content"][0]["text"], "finished");
     }
 
     #[test]

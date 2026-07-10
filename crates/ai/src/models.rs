@@ -57,7 +57,7 @@ pub fn list_apis() -> Vec<Api> {
     out.into_iter().collect()
 }
 
-pub fn calculate_usage_cost(model: &Model, usage: &mut Usage) {
+pub(crate) fn calculate_usage_cost(model: &Model, usage: &mut Usage) {
     usage.total_tokens = usage
         .input
         .saturating_add(usage.output)

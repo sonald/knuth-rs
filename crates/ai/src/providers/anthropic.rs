@@ -750,8 +750,10 @@ fn convert_messages(msgs: &[Message], cc: Option<&Value>, compat: &Compat) -> Ve
                         "is_error": tr.is_error,
                         "content": inner,
                     });
-                    if cc.is_some() && Some(i) == last_user_idx {
-                        result_block["cache_control"] = cc.unwrap().clone();
+                    if Some(i) == last_user_idx
+                        && let Some(cc) = cc
+                    {
+                        result_block["cache_control"] = cc.clone();
                     }
                     blocks.push(result_block);
                     i += 1;

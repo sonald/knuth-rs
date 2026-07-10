@@ -1,11 +1,26 @@
 mod support;
 
+#[cfg(any(
+    feature = "mistral",
+    feature = "openai-responses",
+    feature = "openai-codex-responses"
+))]
+use ai::ContentBlock;
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai-completions",
+    feature = "mistral",
+    feature = "google",
+    feature = "amazon-bedrock",
+    feature = "openai-responses"
+))]
+use ai::StopReason;
 use ai::{
-    AssistantMessageEvent, Context, KnownApi, Message, StopReason, StreamOptions, UserContent,
-    UserMessage, UserRole, stream,
+    AssistantMessageEvent, Context, KnownApi, Message, StreamOptions, UserContent, UserMessage,
+    UserRole, stream,
 };
 #[cfg(feature = "mistral")]
-use ai::{ContentBlock, SimpleStreamOptions, ThinkingLevel, stream_simple};
+use ai::{SimpleStreamOptions, ThinkingLevel, stream_simple};
 use futures::StreamExt;
 #[cfg(feature = "google-vertex")]
 use support::EnvVarGuard;
@@ -20,6 +35,82 @@ fn context() -> Context {
         })],
         tools: None,
     }
+}
+
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+const RESPONSES_REFUSAL_SSE: &[u8] = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_refusal","phase":"final_answer","content":[]}}
+
+data: {"type":"response.content_part.added","item_id":"msg_refusal","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":""}}
+
+data: {"type":"response.refusal.delta","item_id":"msg_refusal","output_index":0,"content_index":0,"delta":"cannot"}
+
+data: {"type":"response.refusal.done","item_id":"msg_refusal","output_index":0,"content_index":0,"refusal":"cannot comply"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_refusal","phase":"final_answer","content":[{"type":"refusal","refusal":"cannot comply"}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{}}}
+
+"#;
+
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+async fn assert_responses_refusal_lifecycle(api: KnownApi, provider: &str) {
+    let base_url = support::serve_once(RESPONSES_REFUSAL_SSE, "text/event-stream").await;
+    let model = support::model(api, provider, "test-model", base_url);
+    let options = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &context(), Some(&options));
+    let mut lifecycle = Vec::new();
+    let mut terminal = None;
+
+    while let Some(event) = events.next().await {
+        match event {
+            AssistantMessageEvent::TextStart { partial, .. } => {
+                assert!(matches!(
+                    partial.content.first(),
+                    Some(ContentBlock::Text(text)) if text.text.is_empty()
+                ));
+                lifecycle.push("start");
+            }
+            AssistantMessageEvent::TextDelta { delta, partial, .. } => {
+                assert_eq!(delta, "cannot");
+                assert!(matches!(
+                    partial.content.first(),
+                    Some(ContentBlock::Text(text)) if text.text == "cannot"
+                ));
+                lifecycle.push("delta");
+            }
+            AssistantMessageEvent::TextEnd {
+                content, partial, ..
+            } => {
+                assert_eq!(content, "cannot comply");
+                assert!(matches!(
+                    partial.content.first(),
+                    Some(ContentBlock::Text(text)) if text.text == "cannot comply"
+                ));
+                lifecycle.push("end");
+            }
+            AssistantMessageEvent::Done { message, .. } => terminal = Some(message),
+            AssistantMessageEvent::Error { error, .. } => {
+                panic!("unexpected refusal stream error: {:?}", error.error_message)
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(lifecycle, ["start", "delta", "end"]);
+    let message = terminal.expect("completed refusal response");
+    let Some(ContentBlock::Text(text)) = message.content.first() else {
+        panic!("refusal must remain a Text block");
+    };
+    assert_eq!(text.text, "cannot comply");
+    let signature: serde_json::Value =
+        serde_json::from_str(text.text_signature.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        signature,
+        serde_json::json!({ "v": 1, "id": "msg_refusal", "phase": "final_answer" })
+    );
 }
 
 #[cfg(any(feature = "google", feature = "amazon-bedrock", feature = "mistral"))]
@@ -48,6 +139,14 @@ async fn terminal_event(
     terminal.expect("provider terminal event")
 }
 
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai-completions",
+    feature = "mistral",
+    feature = "google",
+    feature = "amazon-bedrock",
+    feature = "openai-responses"
+))]
 async fn assert_eof_is_error(
     api: KnownApi,
     provider: &str,
@@ -751,6 +850,18 @@ async fn openai_responses_eof_before_terminal_event_is_error() {
     .await;
 
     assert_eof_is_error(KnownApi::OpenAIResponses, "openai", base_url, false).await;
+}
+
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn openai_responses_refusal_uses_complete_text_lifecycle() {
+    assert_responses_refusal_lifecycle(KnownApi::OpenAIResponses, "openai").await;
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_responses_wrapper_reuses_refusal_text_lifecycle() {
+    assert_responses_refusal_lifecycle(KnownApi::OpenAICodexResponses, "openai-codex").await;
 }
 
 #[cfg(feature = "openai-responses")]

@@ -17,7 +17,7 @@ behavior and the explicit remaining limitations.
 | Event stream (`utils/event_stream.rs`) | implemented + tested |
 | Registry + entry points (`api_registry.rs` / `stream.rs`) | implemented |
 | Anthropic | working — SSE, text/thinking/tool_use, cache_control, budget thinking, compat |
-| OpenAI Responses | working — text/reasoning/function_call, cache key + 24h retention |
+| OpenAI Responses | working — text/refusal/reasoning/function_call, output-item replay, cache key + 24h retention |
 | OpenAI Completions | working — catch-all; parallel tool_calls, reasoning_content, `[DONE]` |
 | OpenAI Codex | working (HTTP/SSE path) — instructions body, codex headers; WebSocket transport TODO |
 | Azure OpenAI Responses | working — reuses Responses consumer; deployment-name + api-key header |
@@ -28,12 +28,20 @@ behavior and the explicit remaining limitations.
 | Cloudflare | catalog + base-url placeholder support; the `cloudflare` feature alone does not wire a provider. Enable the model's corresponding `anthropic`, `openai-responses`, or `openai-completions` feature to make requests. |
 | Faux | scriptable — queue `AssistantMessage`s, replayed as event sequences |
 | Models registry | generated catalog loaded from `models.generated.json` |
-| Cost accounting | working for streamed usage across built-in providers; `Usage.cost` is populated from `Model.cost` |
+| Cost accounting | static catalog-price accounting for streamed usage across built-in providers; `Usage.cost` is populated from `Model.cost` |
 | Cross-provider `transform_messages` | implemented helper (image downgrade, thinking, id normalization, synthetic results); provider-local conversion remains the default and global handoff is caller-owned |
 | Context-overflow detection (`overflow.rs`) | implemented — all provider error patterns |
 | Anthropic OAuth (PKCE) | implemented — authorize URL, local listener, exchange, refresh |
 | OpenAI Codex / Copilot OAuth | not implemented |
 | Images | unsupported — `images(...)` returns an explicit error |
+
+Cost accounting always uses the static per-million-token catalog prices in `Model.cost`. A provider's
+`service_tier` option is sent as request metadata, but pie-ai does not apply service-tier-specific
+dynamic pricing or mutate the model catalog price.
+
+`bedrock_anthropic::Converter` is a standalone utility for legacy Bedrock-Anthropic event
+envelopes. It is not a provider registered by `register_builtins`; the built-in Amazon Bedrock
+path is the Converse Stream implementation in `providers::amazon_bedrock`.
 
 Mock-SSE end-to-end tests (`tests/anthropic_sse_e2e.rs`) prove the shared HTTP→SSE→event pipeline
 against a local server (no API key). `scripts/regen_models.sh` regenerates the model catalog from
