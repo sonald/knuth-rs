@@ -61,17 +61,19 @@ impl<S> SseStream<S> {
                 // Comment — ignore.
                 continue;
             }
-            let (field, value) = match line.find(':') {
-                Some(i) => (&line[..i], line[i + 1..].trim_start_matches(' ')),
+            let (field, raw) = match line.find(':') {
+                Some(i) => (&line[..i], &line[i + 1..]),
                 None => (line, ""),
             };
             match field {
-                "event" => self.current.event = Some(value.to_string()),
+                "event" => self.current.event = Some(raw.trim_start_matches(' ').to_string()),
                 "data" => {
                     if !self.current.data.is_empty() {
                         self.current.data.push('\n');
                     }
-                    self.current.data.push_str(value);
+                    self.current
+                        .data
+                        .push_str(raw.strip_prefix(' ').unwrap_or(raw));
                 }
                 _ => {} // ignore `id`, `retry`, etc.
             }
@@ -111,6 +113,46 @@ where
                     self.pending.reverse();
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{TryStreamExt, stream};
+
+    async fn parse(input: &'static [u8]) -> Vec<SseEvent> {
+        SseStream::new(stream::iter(vec![Ok::<_, reqwest::Error>(
+            Bytes::from_static(input),
+        )]))
+        .try_collect()
+        .await
+        .expect("SSE input is valid")
+    }
+
+    #[tokio::test]
+    async fn data_field_removes_only_one_leading_space() {
+        let cases = [
+            (b"data: one\ndata: two\n\n".as_slice(), vec!["one\ntwo"]),
+            (b"data:no-space\n\n".as_slice(), vec!["no-space"]),
+            (
+                b"data:  two-leading-spaces\n\n".as_slice(),
+                vec![" two-leading-spaces"],
+            ),
+            (b"data:\n\n".as_slice(), vec![]),
+            (b"data: crlf\r\n\r\n".as_slice(), vec!["crlf"]),
+        ];
+
+        for (input, expected) in cases {
+            let events = parse(input).await;
+            assert_eq!(
+                events
+                    .into_iter()
+                    .map(|event| event.data)
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 }

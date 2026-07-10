@@ -57,6 +57,12 @@ fn registry() -> &'static Mutex<Registry> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn registry_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static CELL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub fn register_api_provider(provider: Box<dyn ApiProvider>, source_id: Option<String>) {
     let mut reg = registry().lock().expect("registry poisoned");
     let api = provider.api().to_string();
@@ -91,6 +97,14 @@ pub fn unregister_api_providers(source_id: &str) {
 pub fn clear_api_providers() {
     let mut reg = registry().lock().expect("registry poisoned");
     reg.entries.clear();
+}
+
+pub(crate) fn is_empty() -> bool {
+    registry()
+        .lock()
+        .expect("registry poisoned")
+        .entries
+        .is_empty()
 }
 
 /// Snapshot of currently-registered api ids. The TS `getApiProviders()` returns the internal
@@ -177,13 +191,15 @@ mod tests {
     };
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex as TokioMutex;
 
-    fn registry_test_lock() -> &'static TokioMutex<()> {
-        static CELL: OnceLock<TokioMutex<()>> = OnceLock::new();
-        CELL.get_or_init(|| TokioMutex::new(()))
+    struct RestoreBuiltins;
+
+    impl Drop for RestoreBuiltins {
+        fn drop(&mut self) {
+            clear_api_providers();
+            crate::providers::register_builtins::ensure();
+        }
     }
-
     #[derive(Default)]
     struct CountingProvider {
         stream_calls: AtomicUsize,
@@ -271,6 +287,7 @@ mod tests {
     #[tokio::test]
     async fn handle_survives_unregister_after_lookup() {
         let _guard = registry_test_lock().lock().await;
+        let _restore = RestoreBuiltins;
         clear_api_providers();
         register_api_provider(
             Box::new(CountingProvider::default()),
@@ -294,6 +311,7 @@ mod tests {
     #[tokio::test]
     async fn handle_survives_clear_after_lookup_for_simple_stream() {
         let _guard = registry_test_lock().lock().await;
+        let _restore = RestoreBuiltins;
         clear_api_providers();
         register_api_provider(Box::new(CountingProvider::default()), None);
         let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
@@ -314,6 +332,7 @@ mod tests {
     #[tokio::test]
     async fn captured_handle_still_returns_mismatch_error_stream() {
         let _guard = registry_test_lock().lock().await;
+        let _restore = RestoreBuiltins;
         clear_api_providers();
         register_api_provider(Box::new(CountingProvider::default()), None);
         let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");

@@ -58,19 +58,10 @@ pub async fn send_with_retry(
 
     let mut attempt: u32 = 0;
     loop {
-        let attempt_req = match template.try_clone() {
-            Some(r) => r,
-            None => {
-                return Err(RetrySendError::Reqwest(
-                    // try_clone failed mid-loop — shouldn't happen since we proved it cloneable
-                    // above, but be defensive.
-                    reqwest::Client::new()
-                        .get("http://_")
-                        .build()
-                        .err()
-                        .unwrap(),
-                ));
-            }
+        let Some(attempt_req) = template.try_clone() else {
+            return abort::send_or_abort(template, options.abort.as_ref())
+                .await
+                .map_err(retry_send_error);
         };
         let result = abort::send_or_abort(attempt_req, options.abort.as_ref()).await;
         match result {
@@ -144,7 +135,8 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 fn is_retryable_reqwest_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+    !e.is_builder()
+        && (e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode())
 }
 
 fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
@@ -199,5 +191,17 @@ mod tests {
         assert!(d0 < d3);
         let capped = backoff_delay(10, 0, 5_000);
         assert!(capped.as_millis() <= 5_000);
+    }
+
+    #[test]
+    fn retryable_reqwest_errors_exclude_request_builder_errors() {
+        let error = reqwest::Client::new()
+            .get("https://example.com")
+            .header("invalid\nheader", "value")
+            .build()
+            .expect_err("invalid header must fail while building the request");
+
+        assert!(error.is_builder());
+        assert!(!is_retryable_reqwest_error(&error));
     }
 }

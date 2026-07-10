@@ -13,6 +13,10 @@ pub fn ensure() {
     ENSURED.get_or_init(|| {
         register_enabled();
     });
+
+    if crate::api_registry::is_empty() {
+        register_enabled();
+    }
 }
 
 fn register_enabled() {
@@ -77,4 +81,54 @@ fn register_enabled() {
     );
 
     // TODO: register remaining providers as their implementations land.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_registry::{clear_api_providers, registry_test_lock};
+    use crate::types::{Api, AssistantMessageEvent, Context, Model, ModelCost, Provider};
+    use futures::StreamExt;
+
+    struct RestoreBuiltins;
+
+    impl Drop for RestoreBuiltins {
+        fn drop(&mut self) {
+            clear_api_providers();
+            ensure();
+        }
+    }
+
+    fn faux_model() -> Model {
+        Model {
+            id: "faux-model".into(),
+            name: "Faux Model".into(),
+            api: Api::from("faux"),
+            provider: Provider::from("faux"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: ModelCost::default(),
+            context_window: 1,
+            max_tokens: 1,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[cfg(feature = "faux")]
+    #[tokio::test]
+    async fn stream_re_registers_builtins_after_clear() {
+        let _guard = registry_test_lock().lock().await;
+        let _restore = RestoreBuiltins;
+        ensure();
+        clear_api_providers();
+
+        let mut stream = crate::stream::stream(&faux_model(), &Context::default(), None);
+        assert!(matches!(
+            stream.next().await,
+            Some(AssistantMessageEvent::Start { .. })
+        ));
+    }
 }
