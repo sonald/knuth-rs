@@ -1012,7 +1012,7 @@ git diff --check
 - README 状态表与实现一致。
 - 留下完整本地验证记录。
 
-- [ ] **Step 1：更新 README 状态**
+- [x] **Step 1：更新 README 状态**
 
 更新这些行，措辞以最终代码为准：
 
@@ -1024,7 +1024,7 @@ git diff --check
 | Cross-provider transform_messages | implemented helper; providers use local converters, global handoff remains caller-owned |
 ```
 
-- [ ] **Step 2：完整 ai 验证**
+- [x] **Step 2：完整 ai 验证**
 
 运行：
 
@@ -1034,7 +1034,7 @@ cargo test -p ai --features all-providers
 
 预期：PASS。
 
-- [ ] **Step 3：agent consumer 验证**
+- [x] **Step 3：agent consumer 验证**
 
 运行：
 
@@ -1044,7 +1044,7 @@ cargo test -p knuth-agent
 
 预期：PASS。
 
-- [ ] **Step 4：workspace 编译门禁**
+- [x] **Step 4：workspace 编译门禁**
 
 运行：
 
@@ -1054,7 +1054,7 @@ cargo test --workspace --no-run
 
 预期：PASS。
 
-- [ ] **Step 5：最终状态检查**
+- [x] **Step 5：最终状态检查**
 
 运行：
 
@@ -1063,6 +1063,15 @@ git status --short
 ```
 
 预期：只出现本计划涉及的文件。
+
+**结果：**
+
+- `cargo test -p ai --features all-providers`：PASS（201 tests）。
+- `cargo test -p knuth-agent`：PASS（3 tests）。验证过程中发现基线测试仍等待已不再发送的 `TurnMessage::Finished`；已改为验证真实的 `ModelStepStarted` / `ModelStepEnded` actor contract，并通过独立复审。
+- `cargo test --workspace --no-run`：PASS。
+- `cargo fmt -p ai -- --check` 与 `git diff --check`：PASS。
+- `cargo fmt --all -- --check`：仍被本分支基线已有的 `knuth-agent`、`knuth-cli`、`knuth-core` 格式差异阻断；本计划没有扩大到无关生产文件的格式化。
+- tracked worktree：clean；`.superpowers/sdd` 仅保留 ignored 执行记录。
 
 ---
 
