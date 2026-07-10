@@ -42,10 +42,37 @@ pub async fn serve_capture_once(
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 16384];
-        let n = socket.read(&mut buf).await.unwrap_or(0);
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0u8; 4096];
+            let n = socket.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let mut chunk = [0u8; 4096];
+            let n = socket.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+        }
         let _ = tx.send(CapturedRequest {
-            request: String::from_utf8_lossy(&buf[..n]).to_string(),
+            request: String::from_utf8_lossy(&request).to_string(),
         });
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
