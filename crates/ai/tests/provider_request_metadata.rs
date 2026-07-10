@@ -451,10 +451,64 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
     let (base_url, captured) =
         support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
             .await;
+    let model_id =
+        "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/test-profile";
+    let request_target = "/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A123456789012%3Aapplication-inference-profile%2Ftest-profile/converse-stream";
+    let signed_url = url::Url::parse(&format!("{base_url}{request_target}")).unwrap();
     let model = support::model(
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
-        "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/test-profile",
+        model_id,
+        base_url,
+    );
+
+    stream_to_done(&model, &Context::default(), &StreamOptions::default()).await;
+    let request = captured.await.unwrap().request;
+    assert!(request.starts_with(&format!("POST {request_target} HTTP/1.1\r\n")));
+    let authorization = header_values(&request, "authorization");
+    assert_eq!(authorization.len(), 1);
+    assert!(
+        authorization[0].contains("/us-west-2/bedrock/aws4_request"),
+        "ARN region must override the eu-central-1 environment fallback: {}",
+        authorization[0]
+    );
+    let amz_date = header_values(&request, "x-amz-date");
+    let body = request.split_once("\r\n\r\n").expect("request body").1;
+    let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
+        method: "POST",
+        url: &signed_url,
+        headers: &[("content-type", "application/json")],
+        payload: body.as_bytes(),
+        region: "us-west-2",
+        service: "bedrock",
+        access_key: "AKIDEXAMPLE",
+        secret_key: "secret",
+        session_token: None,
+        amz_date: amz_date[0],
+    });
+    assert_eq!(
+        authorization,
+        [expected_signature.authorization],
+        "the signer must use the same encoded path sent on the wire"
+    );
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_sigv4_uses_sagemaker_endpoint_arn_region() {
+    let _lock = support::env_lock().lock().await;
+    let _bearer_absent = EnvVarGuard::remove("AWS_BEARER_TOKEN_BEDROCK");
+    let _access_key = EnvVarGuard::set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    let _secret_key = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", "secret");
+    let _session_token = EnvVarGuard::remove("AWS_SESSION_TOKEN");
+    let _region = EnvVarGuard::set("AWS_REGION", "eu-central-1");
+    let (base_url, captured) =
+        support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
+            .await;
+    let model = support::model(
+        KnownApi::BedrockConverseStream,
+        "amazon-bedrock",
+        "arn:aws:sagemaker:us-west-2:123456789012:endpoint/test-endpoint",
         base_url,
     );
 
@@ -462,10 +516,41 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
     let request = captured.await.unwrap().request;
     let authorization = header_values(&request, "authorization");
     assert_eq!(authorization.len(), 1);
-    assert!(
-        authorization[0].contains("/us-west-2/bedrock/aws4_request"),
-        "ARN region must override the eu-central-1 environment fallback: {}",
-        authorization[0]
+    assert!(authorization[0].contains("/us-west-2/bedrock/aws4_request"));
+    assert!(request.starts_with(
+        "POST /model/arn%3Aaws%3Asagemaker%3Aus-west-2%3A123456789012%3Aendpoint%2Ftest-endpoint/converse-stream HTTP/1.1\r\n"
+    ));
+}
+
+#[cfg(feature = "amazon-bedrock")]
+#[tokio::test]
+async fn bedrock_sagemaker_arn_rejects_endpoint_region_conflict_from_public_stream() {
+    let _lock = support::env_lock().lock().await;
+    let _bearer_absent = EnvVarGuard::remove("AWS_BEARER_TOKEN_BEDROCK");
+    let _access_key = EnvVarGuard::set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    let _secret_key = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", "secret");
+    let _session_token = EnvVarGuard::remove("AWS_SESSION_TOKEN");
+    let _region = EnvVarGuard::set("AWS_REGION", "us-east-1");
+    let model = support::model(
+        KnownApi::BedrockConverseStream,
+        "amazon-bedrock",
+        "arn:aws:sagemaker:us-west-2:123456789012:endpoint/test-endpoint",
+        "http://bedrock-runtime.eu-central-1.amazonaws.com:9".into(),
+    );
+    let abort = tokio_util::sync::CancellationToken::new();
+    abort.cancel();
+    let options = StreamOptions {
+        abort: Some(abort),
+        timeout_ms: Some(50),
+        ..Default::default()
+    };
+
+    let error = stream_to_error(&model, &Context::default(), &options).await;
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some(
+            "Bedrock SigV4: Bedrock model ARN region us-west-2 conflicts with endpoint region eu-central-1"
+        )
     );
 }
 
@@ -1131,6 +1216,112 @@ async fn vertex_adc_token_exchange_honors_timeout_ms() {
     })
     .await
     .expect("timeout_ms must stop a hanging ADC exchange");
+
+    let AssistantMessageEvent::Error { reason, error } = terminal else {
+        panic!("timeout must emit Error");
+    };
+    assert_eq!(reason, ai::ErrorReason::Error);
+    assert_eq!(error.stop_reason, ai::StopReason::Error);
+    let message = error.error_message.expect("named ADC timeout error");
+    assert!(message.starts_with("Vertex ADC auth failed during token exchange: token exchange:"));
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_adc_token_response_body_honors_abort() {
+    let _lock = support::env_lock().lock().await;
+    let (token_uri, token_request) = support::serve_hanging_response_body_once().await;
+    let credentials = write_service_account(
+        &token_uri,
+        "body-abort-project",
+        support::TEST_RSA_PRIVATE_KEY,
+    );
+    let _access_token = EnvVarGuard::remove("GOOGLE_VERTEX_ACCESS_TOKEN");
+    let _project = EnvVarGuard::remove("GOOGLE_VERTEX_PROJECT");
+    let _credentials = EnvVarGuard::set(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        credentials.path().to_str().unwrap(),
+    );
+    let model = support::model(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        "gemini-test",
+        "http://127.0.0.1:9".into(),
+    );
+    let abort = tokio_util::sync::CancellationToken::new();
+    let options = StreamOptions {
+        abort: Some(abort.clone()),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &Context::default(), Some(&options));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), token_request)
+        .await
+        .expect("ADC token response headers must arrive")
+        .expect("captured ADC token request");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    abort.cancel();
+    let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while let Some(event) = events.next().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("Vertex stream ended without a terminal event");
+    })
+    .await
+    .expect("abort must stop a hanging ADC token response body");
+
+    let AssistantMessageEvent::Error { reason, error } = terminal else {
+        panic!("abort must emit Error");
+    };
+    assert_eq!(reason, ai::ErrorReason::Aborted);
+    assert_eq!(error.stop_reason, ai::StopReason::Aborted);
+    assert_eq!(error.error_message.as_deref(), Some("aborted"));
+}
+
+#[cfg(feature = "google-vertex")]
+#[tokio::test]
+async fn vertex_adc_token_response_body_honors_timeout_ms() {
+    let _lock = support::env_lock().lock().await;
+    let (token_uri, token_request) = support::serve_hanging_response_body_once().await;
+    let credentials = write_service_account(
+        &token_uri,
+        "body-timeout-project",
+        support::TEST_RSA_PRIVATE_KEY,
+    );
+    let _access_token = EnvVarGuard::remove("GOOGLE_VERTEX_ACCESS_TOKEN");
+    let _project = EnvVarGuard::remove("GOOGLE_VERTEX_PROJECT");
+    let _credentials = EnvVarGuard::set(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        credentials.path().to_str().unwrap(),
+    );
+    let model = support::model(
+        KnownApi::GoogleVertex,
+        "google-vertex",
+        "gemini-test",
+        "http://127.0.0.1:9".into(),
+    );
+    let options = StreamOptions {
+        timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let mut events = stream(&model, &Context::default(), Some(&options));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), token_request)
+        .await
+        .expect("ADC token response headers must arrive")
+        .expect("captured ADC token request");
+    let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while let Some(event) = events.next().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("Vertex stream ended without a terminal event");
+    })
+    .await
+    .expect("timeout_ms must stop a hanging ADC token response body");
 
     let AssistantMessageEvent::Error { reason, error } = terminal else {
         panic!("timeout must emit Error");

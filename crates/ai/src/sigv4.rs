@@ -120,19 +120,30 @@ fn canonical_uri(url: &url::Url) -> String {
     if path.is_empty() {
         "/".into()
     } else {
-        // Each path segment is URL-encoded once. AWS S3 wants double-encoding but Bedrock
-        // (and most services) use single-encoding.
+        // `Url::path()` is already serialized. Preserve valid percent escapes so a non-greedy
+        // URI label such as a Bedrock model ARN is signed exactly as it appears on the wire.
         let mut out = String::with_capacity(path.len());
-        for (i, seg) in path.split('/').enumerate() {
-            if i > 0 {
-                out.push('/');
-            }
-            for b in seg.bytes() {
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-                    out.push(b as char);
-                } else {
-                    out.push_str(&format!("%{:02X}", b));
-                }
+        let bytes = path.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == b'/'
+                || byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            {
+                out.push(byte as char);
+                index += 1;
+            } else if byte == b'%'
+                && bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit)
+            {
+                out.push('%');
+                out.push(bytes[index + 1].to_ascii_uppercase() as char);
+                out.push(bytes[index + 2].to_ascii_uppercase() as char);
+                index += 3;
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+                index += 1;
             }
         }
         out
@@ -228,7 +239,7 @@ mod tests {
     #[test]
     fn signs_post_with_payload_and_session_token() {
         let url = url::Url::parse(
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude/invoke",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aapplication-inference-profile%2Ftest-profile/converse-stream",
         )
         .unwrap();
         let req = SigningRequest {
@@ -246,7 +257,7 @@ mod tests {
         let signed = sign(&req);
         let canonical_request = concat!(
             "POST\n",
-            "/model/anthropic.claude/invoke\n",
+            "/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aapplication-inference-profile%2Ftest-profile/converse-stream\n",
             "\n",
             "content-type:application/json\n",
             "host:bedrock-runtime.us-east-1.amazonaws.com\n",
@@ -259,11 +270,11 @@ mod tests {
         );
         assert_eq!(
             hex::encode(Sha256::digest(canonical_request.as_bytes())),
-            "711819f1d9f60c749c9a75d265a9de4ae4ac1609db0ee9fcacd3d8a2abb0fca7"
+            "f31d3f4c0234b0b3f75507540c9758953dd1816e0faa3d1edd026e411470c0ec"
         );
         assert_eq!(
             signed.authorization,
-            "AWS4-HMAC-SHA256 Credential=AKIATEST/20250101/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=6c750cebf0103280f0fdaa4fd9ec2f02235dca9feb9b206a63710193aa27c1f9"
+            "AWS4-HMAC-SHA256 Credential=AKIATEST/20250101/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=fb6f262af9731d49f391177ce41bc47873936ec1d468d8e7e55de6fdde0546ba"
         );
         // Generated headers are returned verbatim.
         assert!(

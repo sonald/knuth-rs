@@ -888,6 +888,7 @@ cargo test -p ai --features all-providers
 - 修改：`crates/ai/src/providers/amazon_bedrock.rs`
 - 修改：`crates/ai/src/providers/google_vertex.rs`
 - 修改：`crates/ai/src/bedrock_provider.rs`
+- 修改：`crates/ai/src/sigv4.rs`
 - 修改：`crates/ai/src/vertex_adc.rs`
 - 修改：`crates/ai/tests/support/mod.rs`
 - 修改：`crates/ai/tests/provider_request_metadata.rs`
@@ -905,7 +906,7 @@ cargo test -p ai --features all-providers
 | 路径 | 优先级/行为 | 真实请求测试 |
 |---|---|---|
 | Bedrock bearer | `options.api_key > AWS_BEARER_TOKEN_BEDROCK > SigV4 env credentials`，bearer 分支不附加 SigV4 headers | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
-| Bedrock SigV4 | 对最终 path/body/headers 签名；固定向量覆盖 canonical request hash、SignedHeaders 与 signature，捕获测试覆盖最终发送 headers | `sigv4::tests::signs_post_with_payload_and_session_token`、`bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
+| Bedrock SigV4 | 对最终 path/body/headers 签名；非 greedy `modelId` label 的 `%3A`/`%2F` wire path 不被 canonical URI double-encode；固定向量覆盖 canonical request hash、SignedHeaders 与 signature，捕获测试覆盖最终发送 headers | `sigv4::tests::signs_post_with_payload_and_session_token`、`bedrock_prefers_bearer_token_but_accepts_sigv4_creds`、`bedrock_sigv4_uses_inference_profile_arn_region` |
 | Bedrock reasoning | Claude 4.6/4.7 使用 adaptive `thinking`/`output_config`，旧 Claude 使用严格小于 `maxTokens` 的 fixed budget，Nova 2 Lite 使用 `reasoningConfig`；未知模型 fail closed | `bedrock_simple_reasoning_*`、`bedrock_stream_simple_rejects_unknown_claude_protocol` |
 | Bedrock signing region | ARN 与标准 runtime endpoint 优先于 env/default；二者冲突时本地报错 | `bedrock_sigv4_uses_inference_profile_arn_region`、`bedrock_signing_region_*` |
 | Bedrock 缺认证 | 发具名 Error，连接本地 listener 前返回 | `bedrock_missing_auth_emits_named_error_without_network_request` |
@@ -984,6 +985,21 @@ git diff --check
 ```
 
 结果：全部 PASS。独立 Bedrock 为 76 个 lib、9 个 request metadata、1 个 terminal test；独立 Vertex 为 75+10+1。组合 feature 共 132 tests，`all-providers` 共 197 tests，全部 0 failed；最小 feature 仅显示其他模块已有的 cfg/unused warning，`all-providers` 无 warning。
+
+- [x] **Step 8：第二轮复审窄修复 RED/GREEN**
+
+- RED：公开 Bedrock ARN 捕获测试先看到 raw `:` 与 `/`；切换为结构化 URL 后，wire path 已为 `%3A`/`%2F`，但按实际 request-target 重算的 signature 仍不一致，确认 signer 将既有 `%XX` 再编码为 `%25XX`。
+- RED：SageMaker endpoint ARN 未覆盖 env region，公开 stream 的 authorization 仍使用 `eu-central-1`；SageMaker ARN 与标准 `eu-central-1` endpoint 冲突时继续尝试 HTTP，而非本地拒绝。
+- GREEN：`Url::path_segments_mut()` 隔离 model ID 中的 `/`；`percent_encoding` 只补 `:` 编码，`Url::set_path()` 保留既有 escapes；发送与签名复用同一个 `Url`。SigV4 canonical URI 保留并大写合法 `%XX`，现有固定向量改为 ARN encoded path，防止 double-encode 回归。
+- GREEN：现有 ARN region 解析同时接受 `bedrock` 与 `sagemaker` service，不新增类型；公开测试覆盖 SageMaker region 推导与 endpoint 冲突。
+- ADC response-body abort/timeout 新测试使用 `200`、较长 `Content-Length` 和挂起 body；两条在生产基线直接 GREEN，证明 `response_text_or_abort` 与 reqwest client timeout 已覆盖 body 阶段，因此不改 `vertex_adc.rs`。
+- 删除 integration test 中重复实现的 HMAC/SigV4 辅助，复用生产 signer；两个 hanging mock 复用同一私有 listener 实现。删除 Vertex regional/global 已完成后的过时 TODO。
+
+- [x] **Step 9：第二轮复审最终验证**
+
+运行原 Step 7 全部命令，并确认新增 ARN/SageMaker、ADC response-body 测试、独立 feature、组合 feature、`all-providers`、fmt 与 diff check 全部通过。
+
+结果：全部 PASS。独立 Bedrock 为 76 个 lib、11 个 request metadata、1 个 terminal test；独立 Vertex 为 75+12+1。组合 feature 共 136 tests，`all-providers` 共 201 tests，全部 0 failed；`all-providers` 无 warning，最小 feature 仅显示既有 cfg/unused warning。`cargo fmt -p ai -- --check`、显式 `rustfmt --check` 与 `git diff --check` 均 PASS。
 
 ---
 

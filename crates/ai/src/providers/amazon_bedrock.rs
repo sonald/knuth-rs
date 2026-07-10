@@ -17,6 +17,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
@@ -26,6 +27,8 @@ use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::aws_eventstream::AwsEventStream;
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
+
+const BEDROCK_PATH_COLON_ENCODE_SET: &AsciiSet = &CONTROLS.add(b':');
 
 #[derive(Default)]
 pub struct AmazonBedrockProvider {}
@@ -256,8 +259,17 @@ async fn run(
             return;
         }
     };
-    let base = model.base_url.trim_end_matches('/');
-    let url = format!("{base}/model/{}/converse-stream", model.id);
+    let url = match bedrock_request_url(&model) {
+        Ok(url) => url,
+        Err(error) => {
+            push_error(
+                &mut sender,
+                &model,
+                format!("Bedrock request URL is invalid: {error}"),
+            );
+            return;
+        }
+    };
     let custom_headers = match crate::utils::headers::merged_model_and_option_headers(
         model.headers.as_ref(),
         options.headers.as_ref(),
@@ -296,18 +308,7 @@ async fn run(
         };
         request_headers.insert(AUTHORIZATION, authorization);
     } else if let Some(creds) = sigv4_creds {
-        let parsed_url = match url::Url::parse(&url) {
-            Ok(parsed_url) => parsed_url,
-            Err(error) => {
-                push_error(
-                    &mut sender,
-                    &model,
-                    format!("Bedrock request URL is invalid: {error}"),
-                );
-                return;
-            }
-        };
-        let signing_region = match resolve_signing_region(&model.id, &parsed_url, &creds.region) {
+        let signing_region = match resolve_signing_region(&model.id, &url, &creds.region) {
             Ok(region) => region,
             Err(error) => {
                 push_error(&mut sender, &model, format!("Bedrock SigV4: {error}"));
@@ -336,7 +337,7 @@ async fn run(
         let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let signed = crate::sigv4::sign(&crate::sigv4::SigningRequest {
             method: "POST",
-            url: &parsed_url,
+            url: &url,
             headers: &signing_headers,
             payload: &payload,
             region: &signing_region,
@@ -386,7 +387,7 @@ async fn run(
         }
     }
 
-    let req = client.post(&url).headers(request_headers).body(payload);
+    let req = client.post(url).headers(request_headers).body(payload);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
@@ -439,6 +440,20 @@ fn sigv4_signs_header(name: &HeaderName) -> bool {
     )
 }
 
+fn bedrock_request_url(model: &Model) -> Result<url::Url, String> {
+    let mut url =
+        url::Url::parse(model.base_url.trim_end_matches('/')).map_err(|error| error.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "base URL cannot contain path segments".to_string())?
+        .push("model")
+        .push(&model.id)
+        .push("converse-stream");
+
+    let path = utf8_percent_encode(url.path(), BEDROCK_PATH_COLON_ENCODE_SET).to_string();
+    url.set_path(&path);
+    Ok(url)
+}
+
 fn resolve_signing_region(
     model_id: &str,
     url: &url::Url,
@@ -461,7 +476,8 @@ fn bedrock_arn_region(model_id: &str) -> Option<&str> {
         return None;
     }
     let partition = parts.next()?;
-    if !partition.starts_with("aws") || parts.next()? != "bedrock" {
+    let service = parts.next()?;
+    if !partition.starts_with("aws") || !matches!(service, "bedrock" | "sagemaker") {
         return None;
     }
     let region = parts.next()?;

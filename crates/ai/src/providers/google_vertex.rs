@@ -9,9 +9,6 @@
 //! Authentication prefers `options.api_key`, then `GOOGLE_VERTEX_ACCESS_TOKEN`, then the
 //! service-account ADC JWT exchange in `vertex_adc`. Project selection prefers
 //! `GOOGLE_VERTEX_PROJECT`, then the service account's `project_id`.
-//!
-//! TODO:
-//! - global endpoint vs regional endpoint host selection
 
 use async_trait::async_trait;
 

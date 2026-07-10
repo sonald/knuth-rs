@@ -164,12 +164,29 @@ pub async fn serve_capture_once_with_status(
 }
 
 pub async fn serve_capture_hanging_once() -> (String, oneshot::Receiver<CapturedRequest>) {
+    serve_capture_hanging_once_with_response(None).await
+}
+
+pub async fn serve_hanging_response_body_once() -> (String, oneshot::Receiver<CapturedRequest>) {
+    serve_capture_hanging_once_with_response(Some(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+    ))
+    .await
+}
+
+async fn serve_capture_hanging_once_with_response(
+    response: Option<&'static [u8]>,
+) -> (String, oneshot::Receiver<CapturedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let request = read_request(&mut socket).await;
+        if let Some(response) = response {
+            socket.write_all(response).await.unwrap();
+            socket.flush().await.unwrap();
+        }
         let _ = tx.send(CapturedRequest { request });
         std::future::pending::<()>().await;
     });
