@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
@@ -338,6 +339,8 @@ async fn run(
             });
         }
     }
+
+    calculate_usage_cost(&model, &mut partial.usage);
 
     if !saw_done && finish_reason.is_none() {
         partial.stop_reason = StopReason::Error;

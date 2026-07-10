@@ -24,6 +24,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
@@ -283,7 +284,7 @@ pub(crate) async fn consume_responses_sse(
                 return;
             }
             Ok(ev) => {
-                if !handle_event(&ev, &mut partial, &mut state, sender) {
+                if !handle_event(&ev, model, &mut partial, &mut state, sender) {
                     return;
                 }
             }
@@ -292,6 +293,7 @@ pub(crate) async fn consume_responses_sse(
 
     partial.stop_reason = StopReason::Error;
     partial.error_message = Some("openai-responses stream ended before terminal event".into());
+    calculate_usage_cost(model, &mut partial.usage);
     sender.push(AssistantMessageEvent::Error {
         reason: ErrorReason::Error,
         error: partial,
@@ -311,6 +313,7 @@ struct StreamState {
 
 fn handle_event(
     ev: &crate::utils::sse::SseEvent,
+    model: &Model,
     partial: &mut AssistantMessage,
     state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
@@ -345,6 +348,7 @@ fn handle_event(
             }
             let stop = openai_stop_reason(&payload);
             partial.stop_reason = stop;
+            calculate_usage_cost(model, &mut partial.usage);
             let reason = match stop {
                 StopReason::ToolUse => DoneReason::ToolUse,
                 StopReason::Length => DoneReason::Length,
@@ -361,6 +365,7 @@ fn handle_event(
                 update_usage(&mut partial.usage, u);
             }
             partial.stop_reason = StopReason::Length;
+            calculate_usage_cost(model, &mut partial.usage);
             sender.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Length,
                 message: partial.clone(),
@@ -376,6 +381,7 @@ fn handle_event(
                 .to_string();
             partial.stop_reason = StopReason::Error;
             partial.error_message = Some(msg);
+            calculate_usage_cost(model, &mut partial.usage);
             sender.push(AssistantMessageEvent::Error {
                 reason: ErrorReason::Error,
                 error: partial.clone(),
@@ -709,18 +715,17 @@ fn openai_stop_reason(payload: &Value) -> StopReason {
 }
 
 fn update_usage(usage: &mut Usage, val: &Value) {
+    let cached = val
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     if let Some(n) = val.get("input_tokens").and_then(|v| v.as_u64()) {
-        usage.input += n;
+        usage.input += n.saturating_sub(cached);
     }
     if let Some(n) = val.get("output_tokens").and_then(|v| v.as_u64()) {
         usage.output += n;
     }
-    if let Some(n) = val
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        usage.cache_read += n;
-    }
+    usage.cache_read += cached;
     // Non-standard but reported by local inference servers (ds4): tokens newly
     // written into the prompt cache this request.
     if let Some(n) = val
@@ -1185,6 +1190,7 @@ mod tests {
                     "item": { "type": "reasoning", "id": "rs_1", "summary": [] },
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1203,6 +1209,7 @@ mod tests {
                     },
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1287,6 +1294,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_usage_subtracts_cached_tokens_from_input_tokens() {
+        let mut usage = Usage {
+            input: 5,
+            cache_read: 2,
+            total_tokens: 7,
+            ..Default::default()
+        };
+        update_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 80 },
+            }),
+        );
+
+        assert_eq!(usage.input, 25);
+        assert_eq!(usage.output, 10);
+        assert_eq!(usage.cache_read, 82);
+        assert_eq!(usage.total_tokens, 117);
+
+        let mut underflow = Usage::default();
+        update_usage(
+            &mut underflow,
+            &json!({
+                "input_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 20 },
+            }),
+        );
+        assert_eq!(underflow.input, 0);
+    }
+
+    #[test]
     fn tool_call_serializes_as_function_call() {
         let m = mk_model();
         let mut args = Map::new();
@@ -1347,6 +1387,7 @@ mod tests {
                     },
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1395,6 +1436,7 @@ mod tests {
                         },
                     }),
                 ),
+                &m,
                 &mut partial,
                 &mut state,
                 &mut sender,
@@ -1410,6 +1452,7 @@ mod tests {
                     "delta": "{\"x\":",
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1423,6 +1466,7 @@ mod tests {
                     "delta": "{\"y\":",
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1436,6 +1480,7 @@ mod tests {
                     "arguments": "{\"x\":1}",
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,
@@ -1449,6 +1494,7 @@ mod tests {
                     "arguments": "{\"y\":2}",
                 }),
             ),
+            &m,
             &mut partial,
             &mut state,
             &mut sender,

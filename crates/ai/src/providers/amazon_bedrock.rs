@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::aws_eventstream::AwsEventStream;
@@ -186,6 +187,7 @@ async fn consume(
             let body = String::from_utf8_lossy(&frame.payload);
             partial.stop_reason = StopReason::Error;
             partial.error_message = Some(format!("{exc}: {body}"));
+            calculate_usage_cost(model, &mut partial.usage);
             sender.push(AssistantMessageEvent::Error {
                 reason: ErrorReason::Error,
                 error: partial,
@@ -336,6 +338,8 @@ async fn consume(
             _ => {}
         }
     }
+
+    calculate_usage_cost(model, &mut partial.usage);
 
     if !saw_terminal {
         partial.stop_reason = StopReason::Error;

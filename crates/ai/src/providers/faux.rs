@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::Map;
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 
@@ -126,7 +127,7 @@ impl ApiProvider for FauxProvider {
             error_message: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
-        replay(msg, &mut sender);
+        replay(msg, model, &mut sender);
         stream
     }
 
@@ -142,7 +143,7 @@ impl ApiProvider for FauxProvider {
 }
 
 /// Replay a finished `AssistantMessage` as a normal streaming event sequence.
-fn replay(msg: AssistantMessage, sender: &mut AssistantMessageEventSender) {
+fn replay(mut msg: AssistantMessage, model: &Model, sender: &mut AssistantMessageEventSender) {
     // Build the partial incrementally so each event carries a faithful snapshot.
     let mut partial = AssistantMessage {
         content: vec![],
@@ -220,6 +221,7 @@ fn replay(msg: AssistantMessage, sender: &mut AssistantMessageEventSender) {
         }
     }
 
+    calculate_usage_cost(model, &mut msg.usage);
     partial.stop_reason = msg.stop_reason;
     partial.usage = msg.usage.clone();
     let reason = match msg.stop_reason {
@@ -319,5 +321,26 @@ mod tests {
             .result()
             .await;
         assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn replayed_usage_cost_uses_stream_model_prices() {
+        let _guard = test_lock();
+        clear_faux_responses();
+        let mut response = faux_assistant_message(vec![faux_text("priced")]);
+        response.usage.input = 1_000_000;
+        response.usage.total_tokens = 1_000_000;
+        set_faux_responses(vec![response]);
+        let mut model = faux_model();
+        model.cost.input = 2.0;
+
+        let message = FauxProvider::default()
+            .stream(&model, &Context::default(), None)
+            .result()
+            .await
+            .expect("expected terminal message");
+
+        assert_eq!(message.usage.cost.input, 2.0);
+        assert_eq!(message.usage.cost.total, 2.0);
     }
 }

@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::providers::google_shared::{
     convert_messages, convert_tools, is_thinking_part, map_stop_reason,
 };
@@ -350,6 +351,7 @@ pub(crate) async fn consume_gemini_sse(
     }
 
     close_open_block(open, &mut partial, &mut sender);
+    calculate_usage_cost(model, &mut partial.usage);
 
     if !saw_terminal {
         partial.stop_reason = StopReason::Error;
@@ -430,10 +432,7 @@ fn update_usage(usage: &mut Usage, u: &Value) {
     usage.input = prompt.saturating_sub(cached);
     usage.output = candidates + thoughts;
     usage.cache_read = cached;
-    usage.total_tokens = u
-        .get("totalTokenCount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(usage.input + usage.output + usage.cache_read);
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
 pub(crate) fn build_request_body(context: &Context, options: &StreamOptions) -> Value {
@@ -498,6 +497,26 @@ pub(crate) fn push_error(sender: &mut AssistantMessageEventSender, model: &Model
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_total_tokens_uses_normalized_components() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 80,
+                "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 5,
+                "totalTokenCount": 999,
+            }),
+        );
+
+        assert_eq!(usage.input, 20);
+        assert_eq!(usage.output, 15);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.total_tokens, 115);
+    }
 
     #[test]
     fn body_has_contents_and_system_instruction() {

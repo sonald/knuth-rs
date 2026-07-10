@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::abort::{self, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
@@ -317,7 +318,13 @@ async fn run(
                 return;
             }
             Ok(ev) => {
-                if !handle_sse(&ev, &mut partial, &mut tool_arg_buffers, &mut sender) {
+                if !handle_sse(
+                    &ev,
+                    &model,
+                    &mut partial,
+                    &mut tool_arg_buffers,
+                    &mut sender,
+                ) {
                     saw_terminal = true;
                     break;
                 }
@@ -328,6 +335,7 @@ async fn run(
     if !saw_terminal {
         partial.stop_reason = StopReason::Error;
         partial.error_message = Some("anthropic stream ended before terminal event".into());
+        calculate_usage_cost(&model, &mut partial.usage);
         sender.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
             error: partial,
@@ -342,6 +350,7 @@ async fn run(
 /// Returns `false` after pushing a terminal event so the caller stops draining the stream.
 fn handle_sse(
     ev: &crate::utils::sse::SseEvent,
+    model: &Model,
     partial: &mut AssistantMessage,
     tool_arg_buffers: &mut HashMap<usize, String>,
     sender: &mut AssistantMessageEventSender,
@@ -379,6 +388,7 @@ fn handle_sse(
             }
         }
         "message_stop" => {
+            calculate_usage_cost(model, &mut partial.usage);
             if partial.stop_reason == StopReason::Error {
                 if partial.error_message.is_none() {
                     partial.error_message = Some("anthropic refusal".into());
@@ -408,6 +418,7 @@ fn handle_sse(
                 .to_string();
             partial.stop_reason = StopReason::Error;
             partial.error_message = Some(msg);
+            calculate_usage_cost(model, &mut partial.usage);
             sender.push(AssistantMessageEvent::Error {
                 reason: ErrorReason::Error,
                 error: partial.clone(),

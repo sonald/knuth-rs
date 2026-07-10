@@ -27,6 +27,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
+use crate::models::calculate_usage_cost;
 use crate::types::*;
 use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
@@ -429,6 +430,8 @@ async fn run(
         }
     }
 
+    calculate_usage_cost(&model, &mut partial.usage);
+
     if !saw_done && finish_reason.is_none() {
         partial.stop_reason = StopReason::Error;
         partial.error_message =
@@ -481,17 +484,17 @@ fn map_stop_reason(reason: &str) -> StopReason {
 }
 
 fn update_usage(usage: &mut Usage, val: &Value) {
-    if let Some(n) = val.get("prompt_tokens").and_then(|v| v.as_u64()) {
-        usage.input = n;
-    }
-    if let Some(n) = val.get("completion_tokens").and_then(|v| v.as_u64()) {
-        usage.output = n;
-    }
     if let Some(n) = val
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(|v| v.as_u64())
     {
         usage.cache_read = n;
+    }
+    if let Some(n) = val.get("prompt_tokens").and_then(|v| v.as_u64()) {
+        usage.input = n.saturating_sub(usage.cache_read);
+    }
+    if let Some(n) = val.get("completion_tokens").and_then(|v| v.as_u64()) {
+        usage.output = n;
     }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
@@ -883,6 +886,33 @@ mod tests {
         assert_eq!(map_stop_reason("length"), StopReason::Length);
         assert_eq!(map_stop_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_stop_reason("content_filter"), StopReason::Error);
+    }
+
+    #[test]
+    fn usage_subtracts_cached_tokens_from_openai_prompt_tokens() {
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 80 },
+            }),
+        );
+
+        assert_eq!(usage.input, 20);
+        assert_eq!(usage.output, 10);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.total_tokens, 110);
+
+        update_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 20 },
+            }),
+        );
+        assert_eq!(usage.input, 0);
     }
 
     #[test]

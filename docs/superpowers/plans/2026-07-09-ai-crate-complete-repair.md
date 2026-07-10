@@ -1061,6 +1061,10 @@ git status --short
 | `Usage.cost` 总是 0 | `calculate_usage_cost_uses_per_million_prices`，provider terminal 测试断言 usage 有价格时 cost 非 0 |
 | OpenAI cached tokens 重复计入 input | `usage_subtracts_cached_tokens_from_openai_prompt_tokens` |
 | Responses cached tokens 重复计入 input | `responses_usage_subtracts_cached_tokens_from_input_tokens` |
+| Google `total_tokens` 信任 provider 原值而偏离统一语义 | `usage_total_tokens_uses_normalized_components` |
+| provider 终态未结算 usage cost | `openai_completions_done_usage_has_nonzero_cost` |
+| Responses 共享 consumer 终态未结算 usage cost | `openai_responses_done_usage_has_nonzero_cost` |
+| Faux replay 未按调用模型价格重算 usage cost | `replayed_usage_cost_uses_stream_model_prices` |
 | Codex `max_tokens` 被忽略 | `codex_request_includes_max_output_tokens` |
 | Codex encrypted reasoning 没 replay | `codex_replays_encrypted_reasoning_items` |
 | Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block` |
