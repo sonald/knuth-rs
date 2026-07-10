@@ -123,9 +123,15 @@ mod tests {
     use futures::{TryStreamExt, stream};
 
     async fn parse(input: &'static [u8]) -> Vec<SseEvent> {
-        SseStream::new(stream::iter(vec![Ok::<_, reqwest::Error>(
-            Bytes::from_static(input),
-        )]))
+        parse_chunks(&[input]).await
+    }
+
+    async fn parse_chunks(chunks: &[&'static [u8]]) -> Vec<SseEvent> {
+        SseStream::new(stream::iter(
+            chunks
+                .iter()
+                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
+        ))
         .try_collect()
         .await
         .expect("SSE input is valid")
@@ -154,5 +160,34 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn multiple_events_are_emitted_fifo() {
+        let events = parse(b"event: first\ndata: one\n\nevent: second\ndata: two\n\n").await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("first"));
+        assert_eq!(events[0].data, "one");
+        assert_eq!(events[1].event.as_deref(), Some("second"));
+        assert_eq!(events[1].data, "two");
+    }
+
+    #[tokio::test]
+    async fn line_and_data_split_across_chunks_are_reassembled() {
+        let events = parse_chunks(&[b"eve", b"nt: split\ndata: hel", b"lo\ndata: world\n\n"]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("split"));
+        assert_eq!(events[0].data, "hello\nworld");
+    }
+
+    #[tokio::test]
+    async fn eof_without_blank_line_flushes_current_event() {
+        let events = parse(b"event: final\ndata: done\n").await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("final"));
+        assert_eq!(events[0].data, "done");
     }
 }

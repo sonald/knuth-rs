@@ -76,6 +76,20 @@ pub fn register_api_provider(provider: Box<dyn ApiProvider>, source_id: Option<S
     );
 }
 
+pub(crate) fn register_api_provider_if_absent(
+    provider: Box<dyn ApiProvider>,
+    source_id: Option<String>,
+) {
+    let mut reg = registry().lock().expect("registry poisoned");
+    let api = provider.api().to_string();
+    reg.entries
+        .entry(api)
+        .or_insert_with(|| RegisteredProvider {
+            provider: Arc::from(provider),
+            source_id,
+        });
+}
+
 /// Lookup. Returns a handle that delegates to the registered provider while holding no lock —
 /// we clone-by-reference using a shim because trait objects in a `MutexGuard` can't outlive the
 /// guard. The shim takes a function pointer that re-acquires the lock for each call. This is
@@ -89,22 +103,21 @@ pub fn get_api_provider(api: &Api) -> Option<RegisteredHandle> {
 }
 
 pub fn unregister_api_providers(source_id: &str) {
-    let mut reg = registry().lock().expect("registry poisoned");
-    reg.entries
-        .retain(|_, entry| entry.source_id.as_deref() != Some(source_id));
+    crate::providers::register_builtins::with_provider_lifecycle(|| {
+        let mut reg = registry().lock().expect("registry poisoned");
+        reg.entries
+            .retain(|_, entry| entry.source_id.as_deref() != Some(source_id));
+    });
 }
 
 pub fn clear_api_providers() {
-    let mut reg = registry().lock().expect("registry poisoned");
-    reg.entries.clear();
-}
-
-pub(crate) fn is_empty() -> bool {
-    registry()
-        .lock()
-        .expect("registry poisoned")
-        .entries
-        .is_empty()
+    crate::providers::register_builtins::with_provider_lifecycle(|| {
+        registry()
+            .lock()
+            .expect("registry poisoned")
+            .entries
+            .clear();
+    });
 }
 
 /// Snapshot of currently-registered api ids. The TS `getApiProviders()` returns the internal
