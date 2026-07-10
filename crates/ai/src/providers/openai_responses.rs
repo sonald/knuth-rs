@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::api_registry::ApiProvider;
 use crate::models::calculate_usage_cost;
@@ -310,6 +310,7 @@ struct StreamState {
     output_to_content: HashMap<usize, usize>,
     output_content_to_content: HashMap<(usize, usize), usize>,
     tool_arg_buffers: HashMap<usize, String>,
+    ended_content: HashSet<usize>,
 }
 
 fn handle_event(
@@ -335,6 +336,7 @@ fn handle_event(
         }
         "response.output_item.added" => on_output_item_added(&payload, partial, state, sender),
         "response.output_item.done" => on_output_item_done(&payload, partial, state, sender),
+        "response.content_part.added" => on_content_part_added(&payload, partial, state, sender),
         "response.output_text.delta" => on_text_delta(&payload, partial, state, sender),
         "response.output_text.done" => on_text_done(&payload, partial, state, sender),
         "response.reasoning_summary_text.delta" => {
@@ -480,7 +482,9 @@ fn on_output_item_done(
                 tc.thinking_signature = Some(item.to_string());
                 final_text = Some(tc.thinking.clone());
             }
-            if let Some(content) = final_text {
+            if let Some(content) = final_text
+                && state.ended_content.insert(idx)
+            {
                 sender.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: idx,
                     content,
@@ -503,7 +507,9 @@ fn on_output_item_done(
                     tc.arguments = map;
                 }
             }
-            if let Some(ContentBlock::ToolCall(tc)) = partial.content.get(idx).cloned() {
+            if let Some(ContentBlock::ToolCall(tc)) = partial.content.get(idx).cloned()
+                && state.ended_content.insert(idx)
+            {
                 sender.push(AssistantMessageEvent::ToolCallEnd {
                     content_index: idx,
                     tool_call: tc,
@@ -545,9 +551,14 @@ fn content_index_for_event(payload: &Value, state: &StreamState) -> Option<usize
         })
 }
 
-fn content_index_for_content_event(payload: &Value, state: &StreamState) -> Option<usize> {
+fn content_event_identity(payload: &Value) -> Option<(usize, usize)> {
     let output_index = payload["output_index"].as_u64()? as usize;
     let content_index = payload["content_index"].as_u64()? as usize;
+    Some((output_index, content_index))
+}
+
+fn content_index_for_content_event(payload: &Value, state: &StreamState) -> Option<usize> {
+    let (output_index, content_index) = content_event_identity(payload)?;
     state
         .output_content_to_content
         .get(&(output_index, content_index))
@@ -555,15 +566,12 @@ fn content_index_for_content_event(payload: &Value, state: &StreamState) -> Opti
 }
 
 fn remember_content_event_index(payload: &Value, content_index: usize, state: &mut StreamState) {
-    let Some(output_index) = payload["output_index"].as_u64() else {
-        return;
-    };
-    let Some(part_index) = payload["content_index"].as_u64() else {
+    let Some((output_index, part_index)) = content_event_identity(payload) else {
         return;
     };
     state
         .output_content_to_content
-        .insert((output_index as usize, part_index as usize), content_index);
+        .insert((output_index, part_index), content_index);
 }
 
 fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
@@ -573,6 +581,32 @@ fn responses_tool_call_id(call_id: &str, item_id: Option<&str>) -> String {
     }
 }
 
+fn on_content_part_added(
+    payload: &Value,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) {
+    if payload["part"]["type"].as_str() != Some("output_text") {
+        return;
+    }
+    let Some(identity) = content_event_identity(payload) else {
+        return;
+    };
+    if state.output_content_to_content.contains_key(&identity) {
+        return;
+    }
+
+    let idx = partial.content.len();
+    let text = payload["part"]["text"].as_str().unwrap_or_default();
+    partial.content.push(ContentBlock::text(text));
+    remember_content_event_index(payload, idx, state);
+    sender.push(AssistantMessageEvent::TextStart {
+        content_index: idx,
+        partial: partial.clone(),
+    });
+}
+
 fn on_text_delta(
     payload: &Value,
     partial: &mut AssistantMessage,
@@ -580,19 +614,12 @@ fn on_text_delta(
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    let idx = match content_index_for_content_event(payload, state) {
-        Some(idx) => idx,
-        None => {
-            let i = partial.content.len();
-            partial.content.push(ContentBlock::text(""));
-            remember_content_event_index(payload, i, state);
-            sender.push(AssistantMessageEvent::TextStart {
-                content_index: i,
-                partial: partial.clone(),
-            });
-            i
-        }
+    let Some(idx) = content_index_for_content_event(payload, state) else {
+        return;
     };
+    if state.ended_content.contains(&idx) {
+        return;
+    }
     if let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) {
         tc.text.push_str(&delta);
     } else {
@@ -608,22 +635,28 @@ fn on_text_delta(
 fn on_text_done(
     payload: &Value,
     partial: &mut AssistantMessage,
-    state: &StreamState,
+    state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
-    if let Some(idx) = content_index_for_content_event(payload, state)
-        && let Some(ContentBlock::Text(tc)) = partial.content.get(idx).cloned()
-    {
-        let text = payload["text"]
-            .as_str()
-            .map(|s| s.to_string())
-            .unwrap_or(tc.text);
-        sender.push(AssistantMessageEvent::TextEnd {
-            content_index: idx,
-            content: text,
-            partial: partial.clone(),
-        });
+    let Some(idx) = content_index_for_content_event(payload, state) else {
+        return;
+    };
+    if state.ended_content.contains(&idx) {
+        return;
     }
+    let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) else {
+        return;
+    };
+    if let Some(text) = payload["text"].as_str() {
+        tc.text = text.to_string();
+    }
+    let content = tc.text.clone();
+    state.ended_content.insert(idx);
+    sender.push(AssistantMessageEvent::TextEnd {
+        content_index: idx,
+        content,
+        partial: partial.clone(),
+    });
 }
 
 fn on_thinking_delta(
@@ -1266,13 +1299,13 @@ mod tests {
 
         handle_event(
             &sse_event(
-                "response.output_text.delta",
+                "response.content_part.added",
                 json!({
-                    "type": "response.output_text.delta",
+                    "type": "response.content_part.added",
                     "item_id": "msg_1",
                     "output_index": 0,
                     "content_index": 0,
-                    "delta": "answer",
+                    "part": { "type": "output_text", "text": "answer" },
                 }),
             ),
             &m,
@@ -1324,6 +1357,400 @@ mod tests {
             }
         }
         assert_eq!(ended_text_blocks, vec![(0, "answer".into())]);
+    }
+
+    #[tokio::test]
+    async fn content_part_added_then_text_done_without_delta_preserves_lifecycle() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": "" },
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        for _ in 0..2 {
+            handle_event(
+                &sse_event(
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": "msg_1",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "complete",
+                    }),
+                ),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextStart { content_index, .. } => {
+                    starts.push(content_index)
+                }
+                AssistantMessageEvent::TextEnd {
+                    content_index,
+                    content,
+                    ..
+                } => ends.push((content_index, content)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(starts, vec![0]);
+        assert_eq!(ends, vec![(0, "complete".into())]);
+        assert!(matches!(
+            partial.content.first(),
+            Some(ContentBlock::Text(text)) if text.text == "complete"
+        ));
+    }
+
+    #[tokio::test]
+    async fn text_done_updates_partial_and_terminal_content() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (kind, payload) in [
+            (
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": "seed" },
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": " draft",
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "final",
+                }),
+            ),
+            (
+                "response.completed",
+                json!({ "type": "response.completed", "response": { "status": "completed", "output": [] } }),
+            ),
+        ] {
+            handle_event(
+                &sse_event(kind, payload),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut end_partial = None;
+        let mut terminal = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextEnd {
+                    content, partial, ..
+                } => {
+                    assert_eq!(content, "final");
+                    end_partial = Some(partial);
+                }
+                AssistantMessageEvent::Done { message, .. } => terminal = Some(message),
+                _ => {}
+            }
+        }
+
+        for message in [
+            &partial,
+            end_partial.as_ref().unwrap(),
+            terminal.as_ref().unwrap(),
+        ] {
+            assert!(matches!(
+                message.content.first(),
+                Some(ContentBlock::Text(text)) if text.text == "final"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_text_parts_route_start_delta_end_by_tuple_identity() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        for (kind, payload) in [
+            (
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_left",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": "left" },
+                }),
+            ),
+            (
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": "msg_right",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": "right" },
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_left",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": " +",
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_right",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": " +",
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": "msg_right",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "text": "RIGHT",
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": "msg_left",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "LEFT",
+                }),
+            ),
+        ] {
+            handle_event(
+                &sse_event(kind, payload),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut starts = Vec::new();
+        let mut deltas = Vec::new();
+        let mut ends = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextStart { content_index, .. } => {
+                    starts.push(content_index)
+                }
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => deltas.push((content_index, delta)),
+                AssistantMessageEvent::TextEnd {
+                    content_index,
+                    content,
+                    ..
+                } => ends.push((content_index, content)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(starts, vec![0, 1]);
+        assert_eq!(deltas, vec![(0, " +".into()), (1, " +".into())]);
+        assert_eq!(ends, vec![(1, "RIGHT".into()), (0, "LEFT".into())]);
+        assert!(matches!(
+            partial.content.as_slice(),
+            [ContentBlock::Text(left), ContentBlock::Text(right)]
+                if left.text == "LEFT" && right.text == "RIGHT"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reasoning_output_item_done_emits_one_thinking_end_with_matching_partial() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] },
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        for _ in 0..2 {
+            handle_event(
+                &sse_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [{ "type": "summary_text", "text": "settled" }],
+                        },
+                    }),
+                ),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut ends = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content,
+                partial,
+            } = event
+            {
+                ends.push((content_index, content, partial));
+            }
+        }
+
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].0, 0);
+        assert_eq!(ends[0].1, "settled");
+        assert!(matches!(
+            ends[0].2.content.first(),
+            Some(ContentBlock::Thinking(thinking)) if thinking.thinking == "settled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn function_call_output_item_done_emits_one_tool_call_end_with_matching_partial() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "calc",
+                        "arguments": "",
+                    },
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        for _ in 0..2 {
+            handle_event(
+                &sse_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "calc",
+                            "arguments": "{\"x\":1}",
+                        },
+                    }),
+                ),
+                &m,
+                &mut partial,
+                &mut state,
+                &mut sender,
+            );
+        }
+        drop(sender);
+
+        let mut ends = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::ToolCallEnd {
+                content_index,
+                tool_call,
+                partial,
+            } = event
+            {
+                ends.push((content_index, tool_call, partial));
+            }
+        }
+
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].0, 0);
+        assert_eq!(ends[0].1.arguments["x"], 1);
+        assert!(matches!(
+            ends[0].2.content.first(),
+            Some(ContentBlock::ToolCall(tool_call)) if tool_call.arguments["x"] == 1
+        ));
     }
 
     #[test]
