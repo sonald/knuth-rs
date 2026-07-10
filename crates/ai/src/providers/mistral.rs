@@ -140,12 +140,21 @@ async fn run(
     if let Some(sid) = &options.session_id {
         req = req.header("x-affinity", sid.as_str());
     }
-    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+    let custom_headers = match crate::utils::headers::merged_model_and_option_headers(
         model.headers.as_ref(),
         options.headers.as_ref(),
     ) {
-        req = req.header(k, v);
-    }
+        Ok(headers) => headers,
+        Err(error) => {
+            push_error(
+                &mut sender,
+                &model,
+                format!("custom request headers: {error}"),
+            );
+            return;
+        }
+    };
+    req = req.headers(custom_headers);
 
     let req = req.json(&body);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {

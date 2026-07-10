@@ -211,9 +211,27 @@ async fn run(
     };
 
     let base = if model.base_url.is_empty() {
-        ANTHROPIC_BASE_URL
+        Ok(ANTHROPIC_BASE_URL.to_string())
     } else {
-        model.base_url.as_str()
+        #[cfg(feature = "cloudflare")]
+        {
+            if crate::providers::cloudflare::is_cloudflare_provider(&model.provider.0) {
+                crate::providers::cloudflare::resolve_cloudflare_base_url(&model)
+            } else {
+                Ok(model.base_url.clone())
+            }
+        }
+        #[cfg(not(feature = "cloudflare"))]
+        {
+            Ok::<_, String>(model.base_url.clone())
+        }
+    };
+    let base = match base {
+        Ok(base) => base,
+        Err(error) => {
+            push_error(&mut sender, &model, error);
+            return;
+        }
     };
     let url = format!("{}/v1/messages", base.trim_end_matches('/'));
     let mut req = client
@@ -230,12 +248,21 @@ async fn run(
         }
     }
 
-    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+    let custom_headers = match crate::utils::headers::merged_model_and_option_headers(
         model.headers.as_ref(),
         options.headers.as_ref(),
     ) {
-        req = req.header(k, v);
-    }
+        Ok(headers) => headers,
+        Err(error) => {
+            push_error(
+                &mut sender,
+                &model,
+                format!("custom request headers: {error}"),
+            );
+            return;
+        }
+    };
+    req = req.headers(custom_headers);
 
     let req = req.json(&body);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {

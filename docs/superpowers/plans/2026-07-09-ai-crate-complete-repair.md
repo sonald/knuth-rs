@@ -427,11 +427,15 @@ cargo test -p ai --features mistral --test provider_terminal_events mistral_para
 - 修改：`crates/ai/src/utils/headers.rs`
 - 修改：所有发 HTTP 请求的 provider。
 - 修改：`crates/ai/src/providers/openai_completions.rs`
+- 修改：`crates/ai/src/providers/anthropic.rs`
+- 修改：`crates/ai/src/providers/openai_responses.rs`
 
 **行为：**
 - 请求 header 顺序：provider 默认 header < `model.headers` < `options.headers`。
-- `options.headers` 同名 key 覆盖 `model.headers`。
-- Cloudflare base URL 中的 `{CLOUDFLARE_ACCOUNT_ID}` / `{CLOUDFLARE_GATEWAY_ID}` 必须在请求前解析。
+- HTTP header 名大小写不敏感；`options.headers` 同名 key 覆盖 `model.headers`。
+- 自定义 header 通过 `RequestBuilder::headers(HeaderMap)` 替换 provider 默认值，不能通过会追加值的 `RequestBuilder::header()` 应用。
+- 非法 `HeaderName` / `HeaderValue` 通过公开 stream 产生 `Error`，不能 panic。
+- Cloudflare base URL 中的 `{CLOUDFLARE_ACCOUNT_ID}` / `{CLOUDFLARE_GATEWAY_ID}` 必须在 OpenAI Completions、Anthropic Messages、OpenAI Responses 三条真实请求路径构造 URL 前解析。
 
 - [ ] **Step 1：新增 header 合并失败测试**
 
@@ -439,6 +443,10 @@ cargo test -p ai --features mistral --test provider_terminal_events mistral_para
 
 ```rust
 openai_completions_merges_model_headers_then_options_headers
+model_headers_override_provider_defaults
+options_headers_override_provider_defaults
+options_headers_override_model_headers_case_insensitively
+invalid_custom_header_emits_error
 ```
 
 断言捕获请求包含：
@@ -484,44 +492,65 @@ data: [DONE]
 }
 ```
 
+同时增加并使用能正常产生 provider 原生终止事件的 SSE body：
+
+```rust
+cloudflare_anthropic_placeholders_are_resolved_before_request
+cloudflare_responses_placeholders_are_resolved_before_request
+```
+
+三条 API 路径分别断言：
+
+- OpenAI Completions：解析 placeholder 后再追加 `/chat/completions`。
+- Anthropic Messages：解析 placeholder 后再追加 `/v1/messages`。
+- OpenAI Responses：解析 placeholder 后再追加 `/v1/responses`。
+
+保留 `cloudflare_missing_placeholder_emits_named_error`，断言缺失环境变量名出现在 `Error` event 中。
+
 - [ ] **Step 3：确认失败**
 
 运行：
 
 ```bash
-cargo test -p ai --features openai-completions,cloudflare --test provider_request_metadata
+cargo test -p ai --features openai-completions,anthropic,openai-responses,cloudflare --test provider_request_metadata
 ```
 
-预期：header 测试失败，因为 `model.headers` 被忽略；Cloudflare 测试失败，因为 placeholder 没被替换。
+预期：header 测试失败，因为追加语义不能替换 provider 默认值，也不能保证大小写不敏感覆盖；Anthropic / Responses Cloudflare 测试失败，因为 placeholder 没被替换。
 
 - [ ] **Step 4：增加最小内部 helper**
 
-在 `utils/headers.rs` 中增加：
+在 `utils/headers.rs` 中增加内部 helper，构造大小写不敏感的 `HeaderMap`：
 
 ```rust
-pub fn merged_model_and_option_headers(
+pub(crate) fn merged_model_and_option_headers(
     model_headers: Option<&HashMap<String, String>>,
     option_headers: Option<&HashMap<String, String>>,
-) -> HashMap<String, String> {
-    match model_headers {
-        Some(base) => merge_headers(base, option_headers),
-        None => option_headers.cloned().unwrap_or_default(),
+) -> Result<HeaderMap, String> {
+    let mut merged = HeaderMap::new();
+    for headers in [model_headers, option_headers].into_iter().flatten() {
+        for (name, value) in headers {
+            let name = HeaderName::from_bytes(name.as_bytes())?;
+            let value = HeaderValue::from_str(value)?;
+            merged.insert(name, value);
+        }
     }
+    Ok(merged)
 }
 ```
 
-各 provider 在构造 request 后循环应用这个 map。不要增加 request builder 抽象。
+伪代码中的 `?` 代表将两类 parse error 转成内部错误文本；实现不得新增公开错误类型。各 provider 在构造默认 header 后调用 `RequestBuilder::headers(merged)`，利用 reqwest `replace_headers` 语义替换同名默认值。解析失败时发 `Error` event 并返回。不要增加 request builder 抽象。
 
 - [ ] **Step 5：Cloudflare 复用现有 resolver**
 
-在 `openai_completions.rs` 计算 base URL 时，对 Cloudflare provider 调用现有 Cloudflare resolver。若 env 缺失，返回 `Error` event，错误信息包含缺失变量名。
+在 `openai_completions.rs`、`anthropic.rs`、`openai_responses.rs` 计算 base URL 时，对 Cloudflare provider 调用现有 Cloudflare resolver。若 env 缺失，返回 `Error` event，错误信息包含缺失变量名。
 
 - [ ] **Step 6：测试通过**
 
 运行：
 
 ```bash
-cargo test -p ai --features openai-completions,cloudflare --test provider_request_metadata
+cargo test -p ai --features openai-completions,anthropic,openai-responses,cloudflare --test provider_request_metadata
+cargo test -p ai --features openai-completions,anthropic,openai-responses,cloudflare --lib utils::headers::tests
 cargo test -p ai --features all-providers
 ```
 
@@ -1024,8 +1053,11 @@ git status --short
 | OpenAI Responses 保持 EOF error | `openai_responses_eof_before_terminal_event_is_error` |
 | Mistral 并行 tool calls 被合并 | `mistral_parallel_tool_calls_do_not_merge_arguments` |
 | Mistral 并行 tool-call 事件错用 content index 或丢失 id normalization | `mistral_parallel_tool_call_events_preserve_content_indices` |
-| `model.headers` 被忽略 | `openai_completions_merges_model_headers_then_options_headers`，以及 header helper unit coverage |
-| Cloudflare placeholders 未解析 | `cloudflare_placeholders_are_resolved_before_request` |
+| `model.headers` 被忽略或不能替换 provider 默认值 | `openai_completions_merges_model_headers_then_options_headers`、`model_headers_override_provider_defaults`、`options_headers_override_provider_defaults`，以及 header helper unit coverage |
+| header 大小写覆盖或非法值处理错误 | `options_headers_override_model_headers_case_insensitively`、`invalid_custom_header_emits_error` |
+| Cloudflare Completions placeholders 未解析 | `cloudflare_placeholders_are_resolved_before_request`、`cloudflare_missing_placeholder_emits_named_error` |
+| Cloudflare Anthropic placeholders 未解析 | `cloudflare_anthropic_placeholders_are_resolved_before_request` |
+| Cloudflare Responses placeholders 未解析 | `cloudflare_responses_placeholders_are_resolved_before_request` |
 | `Usage.cost` 总是 0 | `calculate_usage_cost_uses_per_million_prices`，provider terminal 测试断言 usage 有价格时 cost 非 0 |
 | OpenAI cached tokens 重复计入 input | `usage_subtracts_cached_tokens_from_openai_prompt_tokens` |
 | Responses cached tokens 重复计入 input | `responses_usage_subtracts_cached_tokens_from_input_tokens` |

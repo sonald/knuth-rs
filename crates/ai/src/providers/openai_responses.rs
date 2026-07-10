@@ -13,7 +13,7 @@
 //!
 //! TODO:
 //! - Cross-provider transform_messages
-//! - GitHub Copilot dynamic headers + Cloudflare AI Gateway URL rewriting
+//! - GitHub Copilot dynamic headers
 //! - Tool-call id `call|item` normalization across provider handoffs
 //! - service_tier pricing multiplier
 //! - `output_text.done`/`function_call_arguments.done` final-state reconciliation
@@ -167,11 +167,29 @@ async fn run(
     };
 
     let base = if model.base_url.is_empty() {
-        OPENAI_BASE_URL
+        Ok(OPENAI_BASE_URL.to_string())
     } else {
-        model.base_url.as_str()
+        #[cfg(feature = "cloudflare")]
+        {
+            if crate::providers::cloudflare::is_cloudflare_provider(&model.provider.0) {
+                crate::providers::cloudflare::resolve_cloudflare_base_url(&model)
+            } else {
+                Ok(model.base_url.clone())
+            }
+        }
+        #[cfg(not(feature = "cloudflare"))]
+        {
+            Ok::<_, String>(model.base_url.clone())
+        }
     };
-    let url = crate::utils::openai_compat_url::build_responses_url(base);
+    let base = match base {
+        Ok(base) => base,
+        Err(error) => {
+            push_error(&mut sender, &model, error);
+            return;
+        }
+    };
+    let url = crate::utils::openai_compat_url::build_responses_url(&base);
     let mut req = client
         .post(&url)
         .bearer_auth(api_key)
@@ -185,12 +203,21 @@ async fn run(
         req = req.header("x-client-request-id", sid.as_str());
     }
 
-    for (k, v) in crate::utils::headers::merged_model_and_option_headers(
+    let custom_headers = match crate::utils::headers::merged_model_and_option_headers(
         model.headers.as_ref(),
         options.headers.as_ref(),
     ) {
-        req = req.header(k, v);
-    }
+        Ok(headers) => headers,
+        Err(error) => {
+            push_error(
+                &mut sender,
+                &model,
+                format!("custom request headers: {error}"),
+            );
+            return;
+        }
+    };
+    req = req.headers(custom_headers);
 
     let req = req.json(&body);
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
