@@ -26,10 +26,10 @@ pub fn is_cloudflare_provider(provider: &str) -> bool {
     provider == "cloudflare-workers-ai" || provider == "cloudflare-ai-gateway"
 }
 
-/// Substitute `{VAR}` placeholders in a Cloudflare base URL from the environment.
+/// Substitute the supported Cloudflare ID placeholders in a base URL from the environment.
 pub fn resolve_cloudflare_base_url(model: &Model) -> Result<String, String> {
     let url = &model.base_url;
-    if !url.contains('{') {
+    if !url.contains('{') && !url.contains('}') {
         return Ok(url.clone());
     }
     let mut out = String::with_capacity(url.len());
@@ -37,11 +37,25 @@ pub fn resolve_cloudflare_base_url(model: &Model) -> Result<String, String> {
     while let Some(c) = chars.next() {
         if c == '{' {
             let mut name = String::new();
+            let mut closed = false;
             for nc in chars.by_ref() {
                 if nc == '}' {
+                    closed = true;
                     break;
                 }
+                if nc == '{' {
+                    return Err("invalid nested Cloudflare placeholder".into());
+                }
                 name.push(nc);
+            }
+            if !closed {
+                return Err("unterminated Cloudflare placeholder".into());
+            }
+            if !matches!(
+                name.as_str(),
+                "CLOUDFLARE_ACCOUNT_ID" | "CLOUDFLARE_GATEWAY_ID"
+            ) {
+                return Err(format!("unsupported Cloudflare placeholder {{{name}}}"));
             }
             match std::env::var(&name) {
                 Ok(v) if !v.is_empty() => out.push_str(&v),
@@ -52,6 +66,8 @@ pub fn resolve_cloudflare_base_url(model: &Model) -> Result<String, String> {
                     ));
                 }
             }
+        } else if c == '}' {
+            return Err("unmatched closing brace in Cloudflare base URL".into());
         } else {
             out.push(c);
         }
@@ -92,8 +108,55 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_missing_env() {
-        let m = model_with_base("https://x/{CLOUDFLARE_MISSING_VAR_XYZ}/v1");
-        assert!(resolve_cloudflare_base_url(&m).is_err());
+    fn errors_on_missing_allowed_env() {
+        const NAME: &str = "CLOUDFLARE_GATEWAY_ID";
+        let previous = std::env::var_os(NAME);
+        unsafe { std::env::remove_var(NAME) };
+        let result =
+            resolve_cloudflare_base_url(&model_with_base("https://x/{CLOUDFLARE_GATEWAY_ID}/v1"));
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(NAME, value);
+            }
+        }
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_placeholder_is_rejected_even_when_environment_variable_exists() {
+        const NAME: &str = "CLOUDFLARE_ARBITRARY_SECRET_FOR_TEST";
+        const SECRET: &str = "arbitrary-secret-must-not-be-resolved";
+        let previous = std::env::var_os(NAME);
+        unsafe { std::env::set_var(NAME, SECRET) };
+        let result =
+            resolve_cloudflare_base_url(&model_with_base(&format!("https://x/{{{NAME}}}/v1")));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(NAME, value),
+                None => std::env::remove_var(NAME),
+            }
+        }
+
+        let error = result.expect_err("unknown placeholders must be rejected");
+        assert!(!error.contains(SECRET));
+    }
+
+    #[test]
+    fn incomplete_placeholders_are_rejected() {
+        const NAME: &str = "CLOUDFLARE_ACCOUNT_ID";
+        let previous = std::env::var_os(NAME);
+        unsafe { std::env::set_var(NAME, "account-for-incomplete-placeholder") };
+        let missing_close =
+            resolve_cloudflare_base_url(&model_with_base("https://x/{CLOUDFLARE_ACCOUNT_ID"));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(NAME, value),
+                None => std::env::remove_var(NAME),
+            }
+        }
+
+        assert!(missing_close.is_err());
+        assert!(resolve_cloudflare_base_url(&model_with_base("https://x/stray}")).is_err());
     }
 }

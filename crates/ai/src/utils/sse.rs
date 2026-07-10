@@ -103,6 +103,11 @@ where
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => {
+                    if !self.buf.is_empty() {
+                        self.buf.extend_from_slice(b"\n");
+                        self.drain_lines();
+                        self.pending.reverse();
+                    }
                     self.upstream_done = true;
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
@@ -183,8 +188,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_without_blank_line_flushes_current_event() {
-        let events = parse(b"event: final\ndata: done\n").await;
+    async fn eof_without_final_line_feed_flushes_current_event() {
+        let events = parse(b"event: final\ndata: done").await;
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("final"));

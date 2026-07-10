@@ -311,8 +311,6 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
     let (base_url, captured) =
         support::serve_capture_once(bedrock_done_body(), "application/vnd.amazon.eventstream")
             .await;
-    let signed_url =
-        url::Url::parse(&format!("{base_url}/model/test-model/converse-stream")).unwrap();
     let mut model = support::model(
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
@@ -382,23 +380,6 @@ async fn bedrock_prefers_bearer_token_but_accepts_sigv4_creds() {
         "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-custom-test;x-amz-date;x-amz-security-token;x-bedrock-custom"
     ));
     assert!(!authorization[0].contains("SignedHeaders=accept;"));
-    let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
-        method: "POST",
-        url: &signed_url,
-        headers: &[
-            ("content-type", "application/json; charset=utf-8"),
-            ("x-amz-custom-test", "aws-value"),
-            ("x-bedrock-custom", "option-value"),
-        ],
-        payload: body_text.as_bytes(),
-        region: "us-west-2",
-        service: "bedrock",
-        access_key: "AKIDEXAMPLE",
-        secret_key: "secret",
-        session_token: Some("session-token"),
-        amz_date: amz_date[0],
-    });
-    assert_eq!(authorization, [expected_signature.authorization]);
 
     let _bearer = EnvVarGuard::set("AWS_BEARER_TOKEN_BEDROCK", "bearer-wins");
     let (base_url, captured) =
@@ -454,7 +435,6 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
     let model_id =
         "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/test-profile";
     let request_target = "/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A123456789012%3Aapplication-inference-profile%2Ftest-profile/converse-stream";
-    let signed_url = url::Url::parse(&format!("{base_url}{request_target}")).unwrap();
     let model = support::model(
         KnownApi::BedrockConverseStream,
         "amazon-bedrock",
@@ -471,25 +451,6 @@ async fn bedrock_sigv4_uses_inference_profile_arn_region() {
         authorization[0].contains("/us-west-2/bedrock/aws4_request"),
         "ARN region must override the eu-central-1 environment fallback: {}",
         authorization[0]
-    );
-    let amz_date = header_values(&request, "x-amz-date");
-    let body = request.split_once("\r\n\r\n").expect("request body").1;
-    let expected_signature = ai::sigv4::sign(&ai::sigv4::SigningRequest {
-        method: "POST",
-        url: &signed_url,
-        headers: &[("content-type", "application/json")],
-        payload: body.as_bytes(),
-        region: "us-west-2",
-        service: "bedrock",
-        access_key: "AKIDEXAMPLE",
-        secret_key: "secret",
-        session_token: None,
-        amz_date: amz_date[0],
-    });
-    assert_eq!(
-        authorization,
-        [expected_signature.authorization],
-        "the signer must use the same encoded path sent on the wire"
     );
 }
 

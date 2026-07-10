@@ -13,12 +13,26 @@ use chrono::Utc;
 
 use crate::sigv4::{self, SigningRequest};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BedrockCreds {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
     pub region: String,
+}
+
+impl std::fmt::Debug for BedrockCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockCreds")
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl BedrockCreds {
@@ -209,3 +223,28 @@ pub async fn invoke_stream(
 /// Entry-point placeholder kept for backwards compat with prior register() callers; the
 /// streaming/non-streaming invokers above are the actual provider API.
 pub fn register() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_debug_redacts_all_credential_values() {
+        let credentials = BedrockCreds {
+            access_key: "access-key-debug-sentinel".into(),
+            secret_key: "secret-key-debug-sentinel".into(),
+            session_token: Some("session-token-debug-sentinel".into()),
+            region: "us-east-1".into(),
+        };
+
+        let debug = format!("{credentials:?}");
+        for secret in [
+            "access-key-debug-sentinel",
+            "secret-key-debug-sentinel",
+            "session-token-debug-sentinel",
+        ] {
+            assert!(!debug.contains(secret), "debug output: {debug}");
+        }
+        assert!(debug.contains("us-east-1"));
+    }
+}

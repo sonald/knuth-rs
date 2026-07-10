@@ -37,12 +37,10 @@ pub enum AdcError {
     Sign(String),
     #[error("token exchange: {0}")]
     Exchange(String),
-    #[error("aborted")]
-    Aborted,
 }
 
 /// Loaded service-account JSON.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServiceAccount {
     pub client_email: String,
     pub private_key: String,
@@ -52,15 +50,44 @@ pub struct ServiceAccount {
     pub project_id: Option<String>,
 }
 
+impl std::fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccount")
+            .field("client_email", &self.client_email)
+            .field("private_key", &"[REDACTED]")
+            .field("token_uri", &self.token_uri)
+            .field("project_id", &self.project_id)
+            .finish()
+    }
+}
+
 fn default_token_uri() -> String {
     "https://oauth2.googleapis.com/token".to_string()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AccessToken {
     pub token: String,
     pub expires_at: i64,
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AdcExchangeError {
+    #[error(transparent)]
+    Adc(#[from] AdcError),
+    #[error("aborted")]
+    Aborted,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,15 +148,19 @@ pub fn build_jwt(sa: &ServiceAccount, scope: Option<&str>) -> Result<String, Adc
 /// One-shot: load creds → build JWT → POST → return access_token. The caller caches.
 pub async fn fetch_access_token(scope: Option<&str>) -> Result<AccessToken, AdcError> {
     let sa = load_service_account(None)?;
-    fetch_access_token_for_service_account(&sa, scope, &StreamOptions::default()).await
+    match fetch_access_token_for_service_account(&sa, scope, &StreamOptions::default()).await {
+        Ok(token) => Ok(token),
+        Err(AdcExchangeError::Adc(error)) => Err(error),
+        Err(AdcExchangeError::Aborted) => Err(AdcError::Exchange("aborted".into())),
+    }
 }
 
 pub(crate) async fn fetch_access_token_for_service_account(
     sa: &ServiceAccount,
     scope: Option<&str>,
     options: &StreamOptions,
-) -> Result<AccessToken, AdcError> {
-    let jwt = build_jwt(&sa, scope)?;
+) -> Result<AccessToken, AdcExchangeError> {
+    let jwt = build_jwt(sa, scope)?;
     let client =
         crate::utils::node_http_proxy::build_client(Some(options.timeout_ms.unwrap_or(15_000)))
             .map_err(|e| AdcError::Exchange(e.to_string()))?;
@@ -148,14 +179,14 @@ pub(crate) async fn fetch_access_token_for_service_account(
         .await
         .map_err(adc_http_error)?;
     if !status.is_success() {
-        return Err(AdcError::Exchange(format!("HTTP {status}")));
+        return Err(AdcError::Exchange(format!("HTTP {status}")).into());
     }
     let parsed: TokenResponse = serde_json::from_str(&text)
         .map_err(|e| AdcError::Exchange(format!("parse token response: {e}")))?;
     if parsed.access_token.is_empty() {
-        return Err(AdcError::Exchange(
-            "token response contained an empty access_token".into(),
-        ));
+        return Err(
+            AdcError::Exchange("token response contained an empty access_token".into()).into(),
+        );
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -168,10 +199,10 @@ pub(crate) async fn fetch_access_token_for_service_account(
     })
 }
 
-fn adc_http_error(error: AbortErrorOrReqwest) -> AdcError {
+fn adc_http_error(error: AbortErrorOrReqwest) -> AdcExchangeError {
     match error {
-        AbortErrorOrReqwest::Aborted => AdcError::Aborted,
-        AbortErrorOrReqwest::Reqwest(error) => AdcError::Exchange(error.to_string()),
+        AbortErrorOrReqwest::Aborted => AdcExchangeError::Aborted,
+        AbortErrorOrReqwest::Reqwest(error) => AdcError::Exchange(error.to_string()).into(),
     }
 }
 
@@ -239,5 +270,32 @@ mod tests {
         let sa = load_service_account(Some(tmp.path())).unwrap();
         assert_eq!(sa.client_email, "x@y.iam.gserviceaccount.com");
         assert_eq!(sa.token_uri, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn service_account_debug_redacts_private_key() {
+        let private_key = "private-key-debug-sentinel";
+        let account = ServiceAccount {
+            client_email: "svc@example.com".into(),
+            private_key: private_key.into(),
+            token_uri: "https://oauth2.googleapis.com/token".into(),
+            project_id: Some("project".into()),
+        };
+
+        let debug = format!("{account:?}");
+        assert!(!debug.contains(private_key), "debug output: {debug}");
+    }
+
+    #[test]
+    fn access_token_debug_redacts_token() {
+        let token = "access-token-debug-sentinel";
+        let access_token = AccessToken {
+            token: token.into(),
+            expires_at: 123,
+            scope: Some("scope".into()),
+        };
+
+        let debug = format!("{access_token:?}");
+        assert!(!debug.contains(token), "debug output: {debug}");
     }
 }

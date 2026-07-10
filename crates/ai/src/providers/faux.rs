@@ -281,17 +281,17 @@ mod tests {
 
     #[tokio::test]
     async fn replays_queued_text_and_tool_call() {
-        let _guard = test_lock();
-        clear_faux_responses();
-        let mut args = Map::new();
-        args.insert("city".into(), json!("sf"));
-        set_faux_responses(vec![faux_assistant_message(vec![
-            faux_text("hi there"),
-            faux_tool_call("weather", args),
-        ])]);
-
-        let provider = FauxProvider::default();
-        let mut s = provider.stream(&faux_model(), &Context::default(), None);
+        let mut s = {
+            let _guard = test_lock();
+            clear_faux_responses();
+            let mut args = Map::new();
+            args.insert("city".into(), json!("sf"));
+            set_faux_responses(vec![faux_assistant_message(vec![
+                faux_text("hi there"),
+                faux_tool_call("weather", args),
+            ])]);
+            FauxProvider::default().stream(&faux_model(), &Context::default(), None)
+        };
 
         let mut text = String::new();
         let mut tool_name = None;
@@ -313,32 +313,29 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_canned_message() {
-        let _guard = test_lock();
-        clear_faux_responses();
-        let provider = FauxProvider::default();
-        let msg = provider
-            .stream(&faux_model(), &Context::default(), None)
-            .result()
-            .await;
+        let stream = {
+            let _guard = test_lock();
+            clear_faux_responses();
+            FauxProvider::default().stream(&faux_model(), &Context::default(), None)
+        };
+        let msg = stream.result().await;
         assert!(msg.is_some());
     }
 
     #[tokio::test]
     async fn replayed_usage_normalizes_total_tokens_and_cost() {
-        let _guard = test_lock();
-        clear_faux_responses();
-        let mut response = faux_assistant_message(vec![faux_text("priced")]);
-        response.usage.input = 1_000_000;
-        response.usage.total_tokens = 0;
-        set_faux_responses(vec![response]);
-        let mut model = faux_model();
-        model.cost.input = 2.0;
-
-        let message = FauxProvider::default()
-            .stream(&model, &Context::default(), None)
-            .result()
-            .await
-            .expect("expected terminal message");
+        let stream = {
+            let _guard = test_lock();
+            clear_faux_responses();
+            let mut response = faux_assistant_message(vec![faux_text("priced")]);
+            response.usage.input = 1_000_000;
+            response.usage.total_tokens = 0;
+            set_faux_responses(vec![response]);
+            let mut model = faux_model();
+            model.cost.input = 2.0;
+            FauxProvider::default().stream(&model, &Context::default(), None)
+        };
+        let message = stream.result().await.expect("expected terminal message");
 
         assert_eq!(message.usage.total_tokens, 1_000_000);
         assert_eq!(message.usage.cost.input, 2.0);

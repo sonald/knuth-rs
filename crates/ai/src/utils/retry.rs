@@ -70,7 +70,7 @@ pub async fn send_with_retry(
                 if attempt >= max_retries {
                     return Ok(resp);
                 }
-                let server_delay_ms = retry_after_ms(&resp).unwrap_or(0);
+                let server_delay_ms = retry_after_ms(&resp, cap_ms)?.unwrap_or(0);
                 let delay = backoff_delay(attempt, server_delay_ms, cap_ms);
                 tracing::debug!(
                     target: "pie_ai::retry",
@@ -139,14 +139,24 @@ fn is_retryable_reqwest_error(e: &reqwest::Error) -> bool {
         && (e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode())
 }
 
-fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
-    let header = resp.headers().get(reqwest::header::RETRY_AFTER)?;
-    let value = header.to_str().ok()?;
+fn retry_after_ms(resp: &reqwest::Response, cap_ms: u64) -> Result<Option<u64>, RetrySendError> {
+    let Some(header) = resp.headers().get(reqwest::header::RETRY_AFTER) else {
+        return Ok(None);
+    };
+    let Ok(value) = header.to_str() else {
+        return Ok(None);
+    };
     if let Ok(secs) = value.parse::<u64>() {
-        return Some(secs * 1000);
+        return secs
+            .checked_mul(1000)
+            .map(Some)
+            .ok_or(RetrySendError::DelayTooLong {
+                requested_ms: u64::MAX,
+                cap_ms,
+            });
     }
     // HTTP-date form is uncommon for LLM providers; skip.
-    None
+    Ok(None)
 }
 
 fn backoff_delay(attempt: u32, server_delay_ms: u64, cap_ms: u64) -> Duration {
@@ -162,6 +172,44 @@ fn backoff_delay(attempt: u32, server_delay_ms: u64, cap_ms: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn retry_after_error(value: &str, cap_ms: u64) -> RetrySendError {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let value = value.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {value}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let options = StreamOptions {
+            max_retries: Some(1),
+            max_retry_delay_ms: Some(cap_ms),
+            ..Default::default()
+        };
+        let result = send_with_retry(
+            &options,
+            reqwest::Client::new().get(format!("http://{address}")),
+        )
+        .await;
+        server.await.unwrap();
+        result.expect_err("Retry-After must exceed the configured cap")
+    }
 
     #[test]
     fn status_codes_categorize() {
@@ -203,5 +251,34 @@ mod tests {
 
         assert!(error.is_builder());
         assert!(!is_retryable_reqwest_error(&error));
+    }
+
+    #[tokio::test]
+    async fn retry_after_largest_convertible_seconds_reports_exact_milliseconds() {
+        let seconds = u64::MAX / 1000;
+        let requested_ms = seconds * 1000;
+        let error = retry_after_error(&seconds.to_string(), requested_ms - 1).await;
+
+        assert!(matches!(
+            error,
+            RetrySendError::DelayTooLong {
+                requested_ms: actual,
+                cap_ms
+            } if actual == requested_ms && cap_ms == requested_ms - 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_seconds_overflow_is_delay_too_long() {
+        let seconds = u64::MAX / 1000 + 1;
+        let error = retry_after_error(&seconds.to_string(), u64::MAX).await;
+
+        assert!(matches!(
+            error,
+            RetrySendError::DelayTooLong {
+                requested_ms: u64::MAX,
+                cap_ms: u64::MAX
+            }
+        ));
     }
 }

@@ -122,11 +122,11 @@ async fn run(
         .await
         {
             Ok(access_token) => access_token.token,
-            Err(crate::vertex_adc::AdcError::Aborted) => {
+            Err(crate::vertex_adc::AdcExchangeError::Aborted) => {
                 abort_utils::push_aborted(&mut sender, &model);
                 return;
             }
-            Err(error) => {
+            Err(crate::vertex_adc::AdcExchangeError::Adc(error)) => {
                 push_error(
                     &mut sender,
                     &model,
