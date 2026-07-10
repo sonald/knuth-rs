@@ -669,14 +669,19 @@ fn on_thinking_delta(
     let idx = match content_index_for_event(payload, state) {
         Some(i) => i,
         None => {
+            let item_id = payload["item_id"].as_str().filter(|id| !id.is_empty());
+            let output_index = payload["output_index"].as_u64();
+            if item_id.is_none() && output_index.is_none() {
+                return;
+            }
             let i = partial.content.len();
             partial
                 .content
                 .push(ContentBlock::Thinking(ThinkingContent::default()));
-            if let Some(item_id) = payload["item_id"].as_str().filter(|id| !id.is_empty()) {
+            if let Some(item_id) = item_id {
                 state.item_to_content.insert(item_id.to_string(), i);
             }
-            if let Some(output_index) = payload["output_index"].as_u64() {
+            if let Some(output_index) = output_index {
                 state.output_to_content.insert(output_index as usize, i);
             }
             sender.push(AssistantMessageEvent::ThinkingStart {
@@ -1679,6 +1684,38 @@ mod tests {
             ends[0].2.content.first(),
             Some(ContentBlock::Thinking(thinking)) if thinking.thinking == "settled"
         ));
+    }
+
+    #[tokio::test]
+    async fn identityless_reasoning_delta_does_not_create_orphan_block() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "orphan",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        drop(sender);
+
+        assert!(partial.content.is_empty());
+        while let Some(event) = stream.next().await {
+            assert!(!matches!(
+                event,
+                AssistantMessageEvent::ThinkingStart { .. }
+                    | AssistantMessageEvent::ThinkingDelta { .. }
+            ));
+        }
     }
 
     #[tokio::test]

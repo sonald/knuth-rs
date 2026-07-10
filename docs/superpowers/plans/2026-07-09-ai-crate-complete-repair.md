@@ -1082,6 +1082,7 @@ git status --short
 | Responses done event 按最后 block 路由 | `text_done_routes_by_output_index_not_last_block`、`reasoning_done_routes_by_output_index_not_last_same_type_block` |
 | Responses text part 未建立 lifecycle、tuple 路由混淆或 done 未回写终态 | `content_part_added_then_text_done_without_delta_preserves_lifecycle`、`text_done_updates_partial_and_terminal_content`、`interleaved_text_parts_route_start_delta_end_by_tuple_identity` |
 | Responses `output_item.done` 重复发出 block End 或快照不一致 | `reasoning_output_item_done_emits_one_thinking_end_with_matching_partial`、`function_call_output_item_done_emits_one_tool_call_end_with_matching_partial` |
+| Responses 无 identity 的 reasoning delta 创建孤立 block | `identityless_reasoning_delta_does_not_create_orphan_block` |
 | `clear_api_providers()` 后 built-ins 失效 | `stream_re_registers_builtins_after_clear` |
 | retry 防御分支可能 panic | `retryable_reqwest_errors_exclude_request_builder_errors` |
 | SSE 吞掉过多前导空格 | `data_field_removes_only_one_leading_space` |
