@@ -48,9 +48,11 @@
 - 修改：`crates/ai/src/providers/google_vertex.rs`
   - `model.headers`、复用 Google consumer 后的 cost 计算、通过现有 `vertex_adc` 做 ADC fallback。
 - 修改：`crates/ai/src/providers/register_builtins.rs`
-  - 修复 `clear_api_providers()` 后 built-ins 不再注册的问题。
+  - 使用 register-if-absent 恢复缺失 built-ins，保留同 API custom provider，并串行化 lifecycle。
 - 修改：`crates/ai/src/api_registry.rs`
-  - 增加内部 `is_empty()` 查询；不改公开 API。
+  - 增加内部 register-if-absent seam；不改公开 API。
+- 修改：`crates/ai/src/stream.rs`
+  - 在拿到 `RegisteredHandle` 前，复用 lifecycle-protected ensure-and-get lookup。
 - 修改：`crates/ai/src/utils/retry.rs`
   - 去掉会 panic 的防御分支，收窄 retryable request error。
 - 修改：`crates/ai/src/utils/sse.rs`
@@ -767,55 +769,73 @@ cargo test -p ai --features all-providers
 **文件：**
 - 修改：`crates/ai/src/api_registry.rs`
 - 修改：`crates/ai/src/providers/register_builtins.rs`
+- 修改：`crates/ai/src/stream.rs`
 - 修改：`crates/ai/src/utils/retry.rs`
 - 修改：`crates/ai/src/utils/sse.rs`
 
 **行为：**
-- `clear_api_providers()` 后，stream 入口能重新注册 built-ins。
+- 每次 ensure 都补齐缺失 built-ins，不覆盖同 API 的 custom provider。
+- `clear_api_providers()` / unregister 与 stream lookup 不会在 ensure 和 handle 获取之间制造 missing-provider。
 - retry 工具不再在 request builder error 上 panic。
 - SSE `data:` 只移除规范允许的一个前导空格。
 
-- [ ] **Step 1：新增失败测试**
+- [ ] **Step 1：新增 Registry、Retry、SSE 回归测试**
 
 测试名：
 
 ```rust
 stream_re_registers_builtins_after_clear
+ensure_restores_missing_builtins_when_registry_contains_custom_provider
+ensure_preserves_custom_override_for_builtin_api
+clear_racing_with_stream_lookup_does_not_return_missing_provider_error
 retryable_reqwest_errors_exclude_request_builder_errors
 data_field_removes_only_one_leading_space
+multiple_events_are_emitted_fifo
+line_and_data_split_across_chunks_are_reassembled
+eof_without_blank_line_flushes_current_event
 ```
 
-SSE case：
+全局 registry mutation 测试共用 test-only lock，且以 drop guard 恢复 built-ins。并发测试在
+`ensure_and_get` 的 lifecycle lock 内、`register_enabled()` 后且 lookup 前暂停；clear 线程只
+能在释放 hook 后完成。不得使用 sleep 或概率轮询。
+
+SSE 覆盖：
 
 ```text
 data:  two-leading-spaces
+多个 event FIFO
+line/data 跨多个 Bytes chunk
+上游 EOF 无空行时 flush 当前 event
 ```
 
-预期 data 是 `" two-leading-spaces"`。
+预期 `data` 保留一个空格，且保留已有 CRLF、empty data、多 data 行拼接语义。
 
 - [ ] **Step 2：确认失败**
 
 运行：
 
 ```bash
-cargo test -p ai --features all-providers stream_re_registers_builtins_after_clear retryable_reqwest_errors_exclude_request_builder_errors data_field_removes_only_one_leading_space
+cargo test -p ai --features all-providers ensure_restores_missing_builtins_when_registry_contains_custom_provider
+cargo test -p ai --features all-providers ensure_preserves_custom_override_for_builtin_api
+cargo test -p ai --features all-providers clear_racing_with_stream_lookup_does_not_return_missing_provider_error
 ```
 
-预期：FAIL。
+预期：Registry 回归测试在旧实现上 FAIL。SSE FIFO/chunk/EOF 测试可以为 GREEN；如实记录，不为了
+制造 RED 改坏 parser。
 
-- [ ] **Step 3：Registry 只加内部查询**
+- [ ] **Step 3：Registry 使用缺失注册与生命周期锁**
 
-在 `api_registry.rs` 中增加：
+在 `api_registry.rs` 中增加 crate-private register-if-absent seam。每个 built-in 注册使用此 seam：
 
 ```rust
-pub(crate) fn is_empty() -> bool {
-    registry().lock().unwrap().is_empty()
-}
+entries.entry(api).or_insert_with(|| RegisteredProvider { provider, source_id });
 ```
 
-在 built-in ensure 逻辑里：
-- `OnceLock` 只表示“曾经初始化过”不够。
-- 如果 registry 被 clear 后为空，重新注册 built-ins。
+不增加公开 registry 类型或 API；删除不再需要的 `is_empty` / 初始化一次语义。`ensure()` 每次都在
+crate-private lifecycle lock 内执行 built-in register-if-absent。`clear_api_providers()`、
+`unregister_api_providers()` 也使用同一锁。`stream` / `stream_simple` 通过内部
+`ensure_and_get` 在同一临界区完成 ensure 和 `RegisteredHandle` clone，随后立即释放锁，不覆盖网络
+stream 生命周期。
 
 - [ ] **Step 4：Retry 去掉 panic 分支**
 
@@ -834,7 +854,11 @@ let data = raw.strip_prefix(' ').unwrap_or(raw);
 运行：
 
 ```bash
-cargo test -p ai --features all-providers stream_re_registers_builtins_after_clear retryable_reqwest_errors_exclude_request_builder_errors data_field_removes_only_one_leading_space
+cargo test -p ai --features all-providers providers::register_builtins::tests
+cargo test -p ai --features all-providers api_registry::tests
+cargo test -p ai --features all-providers stream::tests
+cargo test -p ai --features all-providers utils::retry::tests
+cargo test -p ai --features all-providers utils::sse::tests
 cargo test -p ai --features all-providers
 ```
 

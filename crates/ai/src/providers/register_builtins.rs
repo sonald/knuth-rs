@@ -7,6 +7,64 @@
 
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+struct EnsureAndGetTestHook {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+fn ensure_and_get_test_hook() -> &'static Mutex<Option<std::sync::Arc<EnsureAndGetTestHook>>> {
+    use std::sync::{Arc, OnceLock};
+
+    static CELL: OnceLock<Mutex<Option<Arc<EnsureAndGetTestHook>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_ensure_and_get_test_hook(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    *ensure_and_get_test_hook()
+        .lock()
+        .expect("ensure-and-get test hook poisoned") =
+        Some(std::sync::Arc::new(EnsureAndGetTestHook {
+            entered,
+            resume: Mutex::new(resume),
+        }));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_ensure_and_get_test_hook() {
+    *ensure_and_get_test_hook()
+        .lock()
+        .expect("ensure-and-get test hook poisoned") = None;
+}
+
+#[cfg(test)]
+pub(crate) fn provider_lifecycle_is_locked_for_test() -> bool {
+    matches!(
+        provider_lifecycle_lock().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
+#[cfg(test)]
+fn pause_ensure_and_get_for_test() {
+    let hook = ensure_and_get_test_hook()
+        .lock()
+        .expect("ensure-and-get test hook poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        if hook.entered.send(()).is_ok() {
+            if let Ok(resume) = hook.resume.lock() {
+                let _ = resume.recv();
+            }
+        }
+    }
+}
+
 fn provider_lifecycle_lock() -> &'static Mutex<()> {
     static CELL: OnceLock<Mutex<()>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(()))
@@ -29,6 +87,8 @@ pub(crate) fn ensure_and_get(
 ) -> Option<crate::api_registry::RegisteredHandle> {
     with_provider_lifecycle(|| {
         register_enabled();
+        #[cfg(test)]
+        pause_ensure_and_get_for_test();
         crate::api_registry::get_api_provider(api)
     })
 }
