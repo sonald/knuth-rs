@@ -8,10 +8,8 @@ through a single `stream(model, context, options)` call that yields a normalized
 
 ## Status
 
-A 1:1 source-level port mirroring the TypeScript file layout. All ten wire-protocol providers are
-implemented (happy-path streaming, message conversion, tool calls, thinking/reasoning, caching),
-plus the cross-cutting utilities. Remaining TODOs are noted per-file (advanced auth transports,
-adaptive thinking variants, image generation).
+A feature-gated source-level port mirroring the TypeScript layout. The table records implemented
+behavior and the explicit remaining limitations.
 
 | Layer | Status |
 |-------|--------|
@@ -24,16 +22,17 @@ adaptive thinking variants, image generation).
 | OpenAI Codex | working (HTTP/SSE path) — instructions body, codex headers; WebSocket transport TODO |
 | Azure OpenAI Responses | working — reuses Responses consumer; deployment-name + api-key header |
 | Google Gemini | working — text/thought parts, functionCall, thinking budget |
-| Google Vertex | working (Bearer token) — reuses Gemini consumer; full ADC/JWT TODO |
-| Amazon Bedrock | working (Bearer token) — Converse Stream + AWS eventstream decoder; SigV4 TODO |
+| Google Vertex | working — access token or service-account ADC via `GOOGLE_APPLICATION_CREDENTIALS`; reuses Gemini consumer |
+| Amazon Bedrock | working — Converse Stream with Bearer token or SigV4 environment credentials |
 | Mistral | working — chat-completions-shaped; x-affinity, alphanumeric tool ids |
-| Cloudflare | base-url placeholder resolver (rides on openai-completions) |
+| Cloudflare | working through OpenAI/Anthropic-compatible providers; base-url placeholders resolve from `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_GATEWAY_ID` |
 | Faux | scriptable — queue `AssistantMessage`s, replayed as event sequences |
-| Models registry | 938 models loaded from `models.generated.json` |
-| Cross-provider transform_messages | implemented (image downgrade, thinking, id normalize, synthetic results) |
+| Models registry | generated catalog loaded from `models.generated.json` |
+| Cost accounting | working for streamed usage across built-in providers; `Usage.cost` is populated from `Model.cost` |
+| Cross-provider `transform_messages` | implemented helper (image downgrade, thinking, id normalization, synthetic results); provider-local conversion remains the default and global handoff is caller-owned |
 | Context-overflow detection (`overflow.rs`) | implemented — all provider error patterns |
 | Anthropic OAuth (PKCE) | implemented — authorize URL, local listener, exchange, refresh |
-| OpenAI Codex / Copilot OAuth | stub |
+| OpenAI Codex / Copilot OAuth | not implemented |
 | Images | unsupported — `images(...)` returns an explicit error |
 
 Mock-SSE end-to-end tests (`tests/anthropic_sse_e2e.rs`) prove the shared HTTP→SSE→event pipeline
@@ -43,7 +42,7 @@ the TS source of truth.
 ### Tests
 
 ```
-cargo test --features all-providers     # 55 unit + 3 SSE e2e + 4 catalog
+cargo test -p ai --features all-providers
 ```
 
 ## Layout
@@ -75,8 +74,9 @@ src/
       ...
 ```
 
-The TypeScript source is at `/Users/dongxu/pi-rs/packages/ai/`. Each Rust file has the same name
-as its TS counterpart (snake_case instead of kebab-case).
+Each Rust file has the same name as its TS counterpart (snake_case instead of kebab-case).
+`scripts/regen_models.sh` reads the TypeScript model catalog from the `TS_PATH` environment
+variable.
 
 ## Build
 
