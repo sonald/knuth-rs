@@ -336,6 +336,7 @@ fn handle_event(
         "response.output_item.added" => on_output_item_added(&payload, partial, state, sender),
         "response.output_item.done" => on_output_item_done(&payload, partial, state, sender),
         "response.content_part.added" => on_content_part_added(&payload, partial, state, sender),
+        "response.content_part.done" => on_content_part_done(&payload, partial, state, sender),
         "response.output_text.delta" => on_text_delta(&payload, partial, state, sender),
         "response.refusal.delta" => on_text_delta(&payload, partial, state, sender),
         "response.output_text.done" => on_text_done(&payload, "text", partial, state, sender),
@@ -375,6 +376,18 @@ fn handle_event(
             sender.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Length,
                 message: partial.clone(),
+            });
+            return false;
+        }
+        "response.cancelled" => {
+            if let Some(u) = payload.pointer("/response/usage") {
+                update_usage(&mut partial.usage, u);
+            }
+            partial.stop_reason = StopReason::Aborted;
+            calculate_usage_cost(model, &mut partial.usage);
+            sender.push(AssistantMessageEvent::Error {
+                reason: ErrorReason::Aborted,
+                error: partial.clone(),
             });
             return false;
         }
@@ -695,21 +708,47 @@ fn on_content_part_added(
     state: &mut StreamState,
     sender: &mut AssistantMessageEventSender,
 ) {
-    let Some(text) = (match payload["part"]["type"].as_str() {
-        Some("output_text") => payload["part"]["text"].as_str(),
-        Some("refusal") => payload["part"]["refusal"].as_str(),
+    let Some(text) = content_part_text(&payload["part"]) else {
+        return;
+    };
+    let _ = ensure_content_part_text(payload, text, partial, state, sender);
+}
+
+fn on_content_part_done(
+    payload: &Value,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) {
+    let Some(text) = content_part_text(&payload["part"]) else {
+        return;
+    };
+    let Some(idx) = ensure_content_part_text(payload, text, partial, state, sender) else {
+        return;
+    };
+    end_text_content(idx, text, partial, state, sender);
+}
+
+fn content_part_text(part: &Value) -> Option<&str> {
+    match part["type"].as_str() {
+        Some("output_text") => part["text"].as_str(),
+        Some("refusal") => part["refusal"].as_str(),
         _ => None,
-    }) else {
-        return;
-    };
-    let Some(identity) = content_event_identity(payload) else {
-        return;
-    };
-    if state.output_content_to_content.contains_key(&identity) {
-        return;
+    }
+}
+
+fn ensure_content_part_text(
+    payload: &Value,
+    initial_text: &str,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) -> Option<usize> {
+    let identity = content_event_identity(payload)?;
+    if let Some(idx) = state.output_content_to_content.get(&identity).copied() {
+        return Some(idx);
     }
 
-    let idx = partial.content.len();
     let text_signature = state
         .output_message_signatures
         .get(&identity.0)
@@ -727,13 +766,38 @@ fn on_content_part_added(
                     .ok()
                 })
         });
+    let idx = partial.content.len();
     partial.content.push(ContentBlock::Text(TextContent {
-        text: text.to_string(),
+        text: initial_text.to_string(),
         text_signature,
     }));
     remember_content_event_index(payload, idx, state);
     sender.push(AssistantMessageEvent::TextStart {
         content_index: idx,
+        partial: partial.clone(),
+    });
+    Some(idx)
+}
+
+fn end_text_content(
+    idx: usize,
+    final_text: &str,
+    partial: &mut AssistantMessage,
+    state: &mut StreamState,
+    sender: &mut AssistantMessageEventSender,
+) {
+    if state.ended_content.contains(&idx) {
+        return;
+    }
+    let Some(ContentBlock::Text(text)) = partial.content.get_mut(idx) else {
+        return;
+    };
+    text.text = final_text.to_string();
+    let content = text.text.clone();
+    state.ended_content.insert(idx);
+    sender.push(AssistantMessageEvent::TextEnd {
+        content_index: idx,
+        content,
         partial: partial.clone(),
     });
 }
@@ -773,22 +837,16 @@ fn on_text_done(
     let Some(idx) = content_index_for_content_event(payload, state) else {
         return;
     };
-    if state.ended_content.contains(&idx) {
-        return;
+    let final_text = payload[final_text_field]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| match partial.content.get(idx) {
+            Some(ContentBlock::Text(text)) => Some(text.text.clone()),
+            _ => None,
+        });
+    if let Some(final_text) = final_text {
+        end_text_content(idx, &final_text, partial, state, sender);
     }
-    let Some(ContentBlock::Text(tc)) = partial.content.get_mut(idx) else {
-        return;
-    };
-    if let Some(text) = payload[final_text_field].as_str() {
-        tc.text = text.to_string();
-    }
-    let content = tc.text.clone();
-    state.ended_content.insert(idx);
-    sender.push(AssistantMessageEvent::TextEnd {
-        content_index: idx,
-        content,
-        partial: partial.clone(),
-    });
 }
 
 fn on_thinking_delta(

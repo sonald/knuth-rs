@@ -242,6 +242,7 @@ fn convert_codex_messages(messages: &[Message]) -> Vec<Value> {
                 .and_then(|signature| serde_json::from_str::<Value>(signature).ok())
                 .is_some_and(|item| {
                     item["type"] == "reasoning"
+                        && item["id"].as_str().is_some_and(|id| !id.is_empty())
                         && item
                             .get("encrypted_content")
                             .is_some_and(|content| content.is_string())

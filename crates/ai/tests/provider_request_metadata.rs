@@ -389,6 +389,21 @@ async fn codex_replays_only_well_formed_encrypted_reasoning_in_mixed_history() {
             thinking(Some(
                 serde_json::json!({
                     "type": "reasoning",
+                    "encrypted_content": "missing-id",
+                })
+                .to_string(),
+            )),
+            thinking(Some(
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "",
+                    "encrypted_content": "empty-id",
+                })
+                .to_string(),
+            )),
+            thinking(Some(
+                serde_json::json!({
+                    "type": "reasoning",
                     "id": "rs_non_string",
                     "encrypted_content": 7,
                 })

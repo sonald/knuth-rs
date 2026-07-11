@@ -53,6 +53,24 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
 "#;
 
 #[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+const RESPONSES_GENERIC_PART_DONE_INCOMPLETE_SSE: &[u8] = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_text","phase":"final_answer","content":[]}}
+
+data: {"type":"response.content_part.done","item_id":"msg_text","output_index":0,"content_index":0,"part":{"id":"part_text","type":"output_text","text":"final text"}}
+
+data: {"type":"response.incomplete","response":{"status":"incomplete","output":[],"usage":{}}}
+
+"#;
+
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+const RESPONSES_GENERIC_PART_DONE_CANCELLED_SSE: &[u8] = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_refusal","phase":"final_answer","content":[]}}
+
+data: {"type":"response.content_part.done","item_id":"msg_refusal","output_index":0,"content_index":0,"part":{"id":"part_refusal","type":"refusal","refusal":"final refusal"}}
+
+data: {"type":"response.cancelled","response":{"status":"cancelled","output":[],"usage":{}}}
+
+"#;
+
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
 async fn assert_responses_refusal_lifecycle(api: KnownApi, provider: &str) {
     let base_url = support::serve_once(RESPONSES_REFUSAL_SSE, "text/event-stream").await;
     let model = support::model(api, provider, "test-model", base_url);
@@ -111,6 +129,56 @@ async fn assert_responses_refusal_lifecycle(api: KnownApi, provider: &str) {
         signature,
         serde_json::json!({ "v": 1, "id": "msg_refusal", "phase": "final_answer" })
     );
+}
+
+#[cfg(any(feature = "openai-responses", feature = "openai-codex-responses"))]
+async fn assert_responses_generic_part_done_lifecycle(api: KnownApi, provider: &str) {
+    for (body, expected_text, expected_terminal) in [
+        (
+            RESPONSES_GENERIC_PART_DONE_INCOMPLETE_SSE,
+            "final text",
+            "length",
+        ),
+        (
+            RESPONSES_GENERIC_PART_DONE_CANCELLED_SSE,
+            "final refusal",
+            "aborted",
+        ),
+    ] {
+        let base_url = support::serve_once(body, "text/event-stream").await;
+        let model = support::model(api, provider, "test-model", base_url);
+        let options = StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let mut events = stream(&model, &context(), Some(&options));
+        let mut lifecycle = Vec::new();
+        let mut final_text = None;
+
+        while let Some(event) = events.next().await {
+            match event {
+                AssistantMessageEvent::TextStart { .. } => lifecycle.push("start"),
+                AssistantMessageEvent::TextEnd { content, .. } => {
+                    final_text = Some(content);
+                    lifecycle.push("end");
+                }
+                AssistantMessageEvent::Done { reason, .. } => {
+                    assert_eq!(expected_terminal, "length");
+                    assert_eq!(reason, ai::DoneReason::Length);
+                    lifecycle.push("length");
+                }
+                AssistantMessageEvent::Error { reason, .. } => {
+                    assert_eq!(expected_terminal, "aborted");
+                    assert_eq!(reason, ai::ErrorReason::Aborted);
+                    lifecycle.push("aborted");
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(final_text.as_deref(), Some(expected_text));
+        assert_eq!(lifecycle, ["start", "end", expected_terminal]);
+    }
 }
 
 #[cfg(any(feature = "google", feature = "amazon-bedrock", feature = "mistral"))]
@@ -862,6 +930,19 @@ async fn openai_responses_refusal_uses_complete_text_lifecycle() {
 #[tokio::test]
 async fn codex_responses_wrapper_reuses_refusal_text_lifecycle() {
     assert_responses_refusal_lifecycle(KnownApi::OpenAICodexResponses, "openai-codex").await;
+}
+
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn openai_responses_generic_content_part_done_ends_before_terminal() {
+    assert_responses_generic_part_done_lifecycle(KnownApi::OpenAIResponses, "openai").await;
+}
+
+#[cfg(feature = "openai-codex-responses")]
+#[tokio::test]
+async fn codex_responses_wrapper_reuses_generic_content_part_done_lifecycle() {
+    assert_responses_generic_part_done_lifecycle(KnownApi::OpenAICodexResponses, "openai-codex")
+        .await;
 }
 
 #[cfg(feature = "openai-responses")]

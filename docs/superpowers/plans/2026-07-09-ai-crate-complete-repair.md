@@ -1,201 +1,172 @@
-# AI Crate 完整修复与最终审查计划
+# AI Crate 完整修复与最终复审计划
 
-**目标：** 在不新增公开领域类型、不回滚既有历史的前提下，完成 `crates/ai`
-最终审查的三个修复 batch，并以公开 provider 流、独立 feature、consumer 和 workspace
-门禁证明行为闭环。
+**目标：** 在不增加公开 provider/领域类型的前提下，修复已确认的 `crates/ai`
+provider 正确性问题，并以真实 provider 入口测试证明每项行为闭环。
 
-**Batch 3 基线：** `49b3e875f801a292253a8548b42847de03a95688`
+**历史参考：** 下列 Task 1-10 结构恢复自
+`49b3e87:docs/superpowers/plans/2026-07-09-ai-crate-complete-repair.md`。所有完成状态保留
+已实施的 Batch 1-3 工作；后续复审发现作为追加记录，而非替换原计划。
 
-**实现原则：**
+## 全局约束
 
-- 如无必要，勿增实体；新增类型或概念必须先通过 YAGNI 检查。
-- 行为修复先写失败测试并保留 RED 证据。
-- Responses refusal 继续使用现有 `ContentBlock::Text` 和 Text lifecycle。
-- Responses message 身份复用现有 `TextContent.text_signature` 与 `TextSignatureV1`。
-- Codex encrypted reasoning 复用现有 `ThinkingContent.thinking_signature`。
-- 不新增依赖，不引入公开 provider/auth/pricing 类型。
-- 只修改 `crates/ai`、本正式计划和 ignored Batch 3 执行记录。
+- 遵守仓库要求：如无必要，勿增实体。
+- 每个生产行为修复先有失败的回归测试。
+- 保持公开 `Model`、`StreamOptions`、`Usage`、`AssistantMessageEvent`、`ApiProvider`
+  契约不变。
+- provider 特有逻辑留在现有模块，复用既有测试支撑；不新增依赖或公开抽象。
+- 同时运行独立 provider feature 和 `all-providers`。
 
-## 真实文件清单
+## 本次窄修复实际文件清单
 
-| 文件 | Batch 3 实际职责 |
+本次 Batch 3 follow-up 实际只修改以下文件：
+
+| 文件 | 实际改动 |
 |---|---|
-| `crates/ai/src/providers/openai_responses.rs` | refusal lifecycle、message `id/phase` 签名、output-item reconciliation、有序 store:false replay |
-| `crates/ai/src/bedrock_anthropic.rs` | 恢复 `Default`/无参 `new()`，新增 `with_model(Model)` cost 路径，明确 utility 边界 |
-| `crates/ai/src/models.rs` | 将 `calculate_usage_cost` 收紧为 `pub(crate)` |
-| `crates/ai/src/providers/anthropic.rs` | 修复严格 clippy 的 `unnecessary_unwrap` |
-| `crates/ai/src/sigv4.rs` | 修复严格 clippy 的两个 `redundant_guard` |
-| `crates/ai/tests/provider_terminal_events.rs` | OpenAI 与 Codex wrapper 的公开 refusal lifecycle |
-| `crates/ai/tests/provider_request_metadata.rs` | Responses 公开两轮回放、Codex malformed/mixed replay、clippy 小修 |
-| `crates/ai/README.md` | 静态目录价、service tier、Bedrock converter utility 契约 |
-| `docs/superpowers/plans/2026-07-09-ai-crate-complete-repair.md` | 唯一 tracked 正式计划、Task 1-8、三 batch 矩阵和最终结果 |
-| `.superpowers/sdd/final-review-batch-3.md` | ignored RED/GREEN 执行记录，不进入 commit |
+| `crates/ai/src/providers/openai_responses.rs` | 消费通用 `response.content_part.done`；只完成一次 text/refusal reconciliation；将 `response.cancelled` 映射到既有 aborted 终态。 |
+| `crates/ai/src/providers/openai_codex_responses.rs` | encrypted reasoning replay 要求非空 reasoning item id。 |
+| `crates/ai/tests/provider_terminal_events.rs` | 为 OpenAI/Codex 共享 consumer 增加 generic part completion 位于 incomplete/cancelled 之前的公开测试。 |
+| `crates/ai/tests/provider_request_metadata.rs` | Codex mixed replay fixture 补充缺失/空 reasoning id。 |
+| `docs/superpowers/plans/2026-07-09-ai-crate-complete-repair.md` | 恢复 Task 1-10、复审可追溯记录和实测回归矩阵。 |
+| `.superpowers/sdd/final-review-batch-3.md` | ignored 的 Batch 3 RED/GREEN 执行记录。 |
 
-`openai_codex_responses.rs`、Azure wrapper、`stream.rs` 和 feature 定义经审计无需生产改动：
-Codex/Azure 已复用 `consume_responses_sse`，Codex 现有过滤器已满足 encrypted item 边界；
-本批只补公开 fixture 与共享实现。
+## Task 1：建立 Provider 级 HTTP/Stream 回归测试支撑
 
-## Task 1：Responses refusal lifecycle
+- [x] 在 `crates/ai/tests/support/mod.rs` 建立共享本地 HTTP/SSE mock 支撑。
+- [x] 增加请求捕获、环境隔离、provider model 构造和 Bedrock eventstream frame，且不增加依赖。
+- [x] 以这些支撑覆盖公开 provider 路径，而不是新增 provider 私有 fake。
 
-- [x] 使用 `ContentBlock::Text` 表达 `refusal`，不新增 refusal block。
-- [x] 支持 `response.content_part.added` 的 `refusal` part。
-- [x] 支持 `response.refusal.delta` 与 `response.refusal.done`。
-- [x] 用 `response.output_item.done` 补全 message 最终内容并避免重复 `TextEnd`。
-- [x] 保持 `TextStart -> TextDelta -> TextEnd -> Done` 的 partial/terminal 内容一致。
-- [x] 真实入口覆盖 OpenAI provider 和 Codex wrapper。
+可追溯证据：`support::serve_once`、`support::serve_capture_once`、`support::env_lock()`
+支撑 request metadata 与 terminal event 测试。
 
-具名测试：
+## Task 2：EOF 必须是 Error，除非收到 Provider 原生终止事件
 
-- `refusal_lifecycle_uses_text_events_and_reconciles_output_item_done`
-- `message_output_item_done_finalizes_unfinished_refusal`
-- `content_part_added_ignores_non_text_and_non_refusal_parts`
-- `openai_responses_refusal_uses_complete_text_lifecycle`
-- `codex_responses_wrapper_reuses_refusal_text_lifecycle`
+- [x] Anthropic、OpenAI Completions、Mistral、Google、Bedrock、Responses 的截断流都产生 Error，
+  不再静默完成。
+- [x] 每个 provider 仅将原生终止事件作为正常 Done 边界。
+- [x] 在 `provider_terminal_events` 覆盖 EOF-before-terminal。
 
-## Task 2：store:false output-item 有序回放
+可追溯证据：`*_eof_before_*_is_error` 和 Responses EOF 公开 fixture。
 
-- [x] message output item 的 `id/phase` 编码为现有 `TextSignatureV1` JSON。
-- [x] replay 时解析 JSON 签名，并兼容旧的纯字符串 message id。
-- [x] 每个 Text block 单独序列化为 `type=message`、`status=completed` output item。
-- [x] 按原 `ContentBlock` 顺序直接输出 reasoning/message/function_call。
-- [x] 不再聚合所有 Text，也不再把全部 function call 后移。
-- [x] 有合法 reasoning signature 时，即使 compat 不要求合成 reasoning，也原样回放。
-- [x] 公开两轮 fixture 覆盖 `reasoning -> message(commentary) -> function_call -> message(final_answer) -> user`。
+## Task 3：Mistral 并行 Tool Calls 不能合并
 
-具名测试：
+- [x] 按 tool-call identity/index 累积 Mistral arguments，不再将并行 call 合并进一个 JSON buffer。
+- [x] 保持规范化 tool id 及每个 call 自己的 Start/Delta/End content index。
+- [x] 覆盖同 chunk 与跨 chunk 的并行 call。
 
-- `responses_replay_preserves_interleaved_output_items_and_message_identity`
-- `responses_store_false_round_trip_preserves_interleaved_output_items`
-- 既有 `reasoning_item_done_is_captured_and_replayed`
-- 既有 `tool_call_id_preserves_response_item_id_for_replay`
+可追溯证据：`mistral_parallel_tool_calls_do_not_merge_arguments`、
+`mistral_parallel_tool_call_events_preserve_content_indices`。
 
-## Task 3：Codex encrypted reasoning 防御性 fixture
+## Task 4：`model.headers` 和 Cloudflare Base URL 必须进入真实请求
 
-- [x] malformed JSON 不回放。
-- [x] 非 `reasoning` type 不回放。
-- [x] 缺失或非字符串 `encrypted_content` 不回放。
-- [x] 无签名普通 thinking 不回放。
-- [x] 仅合法 encrypted reasoning item 原样回放。
-- [x] text、tool、user 和合法 reasoning 的相对顺序保持。
+- [x] 按 provider default、`model.headers`、`options.headers` 的顺序合并，并以大小写无关规则覆盖。
+- [x] 非法 custom header 经公开 Error event 返回。
+- [x] 所有兼容 provider 在构建 URL 前解析 Cloudflare account/gateway placeholder。
 
-具名测试：
+可追溯证据：Completions、Anthropic、Responses 的 request capture Cloudflare 覆盖。
 
-- `codex_replays_encrypted_reasoning_items`
-- `codex_replays_only_well_formed_encrypted_reasoning_in_mixed_history`
+## Task 5：Usage 语义和 Cost 计算
 
-审计结论：现有 `convert_codex_messages` 过滤逻辑已满足边界，因此生产 Codex wrapper
-无需修改；Task 2 的共享 serializer 修复了 mixed history 的顺序问题。
+- [x] 先规范化 input/output/cache-read/cache-write token，再计算 cost。
+- [x] 防止重复 terminal snapshot 与 cached token 的重复计数。
+- [x] provider terminal message 使用调用时静态 `Model.cost` 目录价；适用的 Error terminal 同样结算。
 
-## Task 4：Usage helper 可见性
+可追溯证据：`calculate_usage_cost_uses_per_million_prices`、Responses/Vertex/Bedrock
+terminal usage 测试及 normalized total-token 回归测试。
 
-- [x] `calculate_usage_cost` 从 `pub` 收紧为 `pub(crate)`。
-- [x] 既有模型 unit test 保留。
-- [x] provider terminal usage/cost 公开测试保留。
+## Task 6：Codex Responses 请求行为补齐
 
-具名测试：
+- [x] 只在提供时发送 `max_output_tokens`，并保持 Codex request metadata。
+- [x] encrypted reasoning replay 仅接受可解析为 reasoning item、具有非空 string `id` 和 string
+  `encrypted_content` 的既有签名契约。
+- [x] 保持既有 string-content 契约：空 encrypted string 仍是合法 string；malformed、缺失或
+  非 string content 不回放。
+- [x] 删除无效 thinking 时保持 text/tool/user 的相对顺序。
 
-- `calculate_usage_cost_uses_per_million_prices`
-- `openai_responses_done_usage_has_nonzero_cost`
-- `codex_responses_wrapper_done_usage_has_nonzero_cost`
-- `azure_openai_responses_wrapper_done_usage_has_nonzero_cost`
-- `bedrock_anthropic_message_start_usage_combines_with_delta_output_and_prices_done`
+可追溯证据：`codex_request_includes_max_output_tokens`、
+`codex_request_omits_max_output_tokens_by_default`、`codex_replays_encrypted_reasoning_items`、
+`codex_replays_only_well_formed_encrypted_reasoning_in_mixed_history`。
 
-## Task 5：Bedrock-Anthropic Converter 源码兼容
+## Task 7：OpenAI Responses Done Event 必须按 Block Identity 路由
 
-- [x] 恢复 `impl Default for Converter`。
-- [x] 恢复无参 `Converter::new()`。
-- [x] 带价格上下文改为 `Converter::with_model(Model)`。
-- [x] 仅 with-model 路径结算 `Model.cost`；默认 utility 不伪造价格。
-- [x] 文档明确该 converter 不是 `register_builtins` 的真实 provider。
+- [x] text/reasoning 完成按既有 output/item/content identity 路由，而非按最后一个同类 block。
+- [x] 用 `TextSignatureV1` 保存 message id/phase，供 store:false replay 保持
+  reasoning/message/function-call 原始顺序。
+- [x] 支持 `output_text`、`refusal` 和通用 `content_part.done` 完成。
+- [x] 用最终 `text`/`refusal` 回写 block，且只发出一次 `TextEnd`。
+- [x] `response.incomplete` 为 Length Done；`response.cancelled` 为既有 Aborted Error，
+  且二者之前的 content lifecycle 必须已经完整。
 
-具名测试：
+可追溯证据：`text_done_routes_by_output_index_not_last_block`、
+`interleaved_text_parts_route_start_delta_end_by_tuple_identity`、
+`openai_responses_refusal_uses_complete_text_lifecycle`、
+`openai_responses_generic_content_part_done_ends_before_terminal` 及等价 Codex wrapper 测试。
 
-- `converter_preserves_default_and_no_arg_new_constructors`
-- `bedrock_anthropic_message_start_usage_combines_with_delta_output_and_prices_done`
-- `bedrock_anthropic_error_terminal_calculates_usage_cost`
+## Task 8：Registry、Retry、SSE 的边界修复
 
-## Task 6：严格 clippy 与最小 feature cfg
+- [x] registry clear 后恢复缺失 built-in，同时不覆盖 custom same-API provider。
+- [x] 关闭 ensure-and-get lifecycle race。
+- [x] 收窄 retryable request error，移除会 panic 的防御分支。
+- [x] 保留 SSE data 空格、FIFO、chunk reassembly 与 EOF event flush 语义。
 
-- [x] Anthropic `unnecessary_unwrap`。
-- [x] SigV4 两个 `redundant_guard`。
-- [x] 后续暴露的测试 `clone_on_copy`。
-- [x] 新增 Codex-only refusal fixture 不再使 EOF helper/`StopReason` 成为 unused。
-- [x] `cargo clippy -p ai --features all-providers --all-targets -- -D warnings` 通过。
+可追溯证据：registry lifecycle/race 和 SSE parser 回归套件。
 
-最小 feature 仍可能显示 `openai_compat_url` 等本批前已存在的 dead-code warning；本批不为
-隐藏旧 warning 扩大 cfg 或加 allow。新增测试代码本身不制造新的 unused warning。
+## Task 9：Bedrock SigV4 和 Vertex ADC 接入已有基础设施
 
-## Task 7：README 与 service_tier 契约
+- [x] 以最终 wire URL/body/headers 签名 Bedrock Converse request，并从支持的 ARN/endpoint
+  安全推导 region。
+- [x] 保持 bearer/SigV4 认证选择、reasoning request translation 和缺认证本地 fail-closed 行为。
+- [x] 将 Vertex access-token/ADC 优先级、project fallback、regional/global URL、脱敏错误、
+  abort/timeout 接入既有 request 基础设施。
 
-- [x] README 标明 Responses 支持 refusal 与 output-item replay。
-- [x] README 标明 `Usage.cost` 静态按 `Model.cost` 的每百万 token 目录价计算。
-- [x] `service_tier` 只作为 provider 请求字段透传。
-- [x] 不支持 service-tier-specific 动态计价，不应用 multiplier，不修改模型目录价。
-- [x] README 标明 `bedrock_anthropic::Converter` 是 utility，不是内置 provider。
+可追溯证据：Bedrock request capture/fixed signer vector、reasoning 测试和 Vertex ADC
+public stream 测试。
 
-### service_tier 固定契约
+## Task 10：README 和最终验证
 
-`StreamOptions.provider_extras["service_tier"]` 可以进入 OpenAI Responses 请求 body，
-但当前响应 usage 没有足够且稳定的分层价格信息。`calculate_usage_cost` 因而始终只读
-调用时 `Model.cost`，不会根据请求 tier 或响应 tier 动态调整。支持动态 tier 计价需要
-独立价格来源、版本和回归契约；本计划明确不发明该模型。
+- [x] README provider 状态和静态 cost/service-tier 契约与实现一致。
+- [x] 完成 provider、consumer、workspace、格式、lint 和 diff 检查。
+- [x] ignored SDD 执行记录不进入 tracked commit。
 
-## Task 8：正式计划、最终验证与单 commit
+## 最终复审：Batch 1-3
 
-- [x] 唯一 tracked 正式计划统一为 Task 1-8。
-- [x] 写入真实文件、具名测试、RED/GREEN 和当前检查结果。
-- [x] 写入 Final Review Batch 1/2/3 回归矩阵。
-- [x] 完成 OpenAI/Codex/Azure 独立 feature 验证。
-- [x] 完成 `knuth-agent`、workspace no-run、fmt、diff 和最终 clippy。
-- [x] 五轴自审后修复所有 Critical/Important finding。
-- [x] 提交一个 Batch 3 commit：本提交 `fix(ai): close Responses API review`。
-
-## RED 记录
-
-| RED | 观察结果 | 根因 |
+| Batch | 发现与提交修复 | 主要回归证据 |
 |---|---|---|
-| refusal lifecycle | `starts.len()` 实际为 0，期望 1 | consumer 只接受 `output_text`，忽略 refusal 事件和 message done |
-| interleaved replay | 对 output item `type` 取值时得到 `None` 并 panic | Text 被聚合成无 `type/id/phase` 的 assistant message，reasoning 被丢弃，tool call 被后移 |
-| Converter 构造器 | E0061: `new` 缺少 `&Model`；E0599: 无 `default` | cost 改动破坏旧公开构造 API |
-| unknown content part | `partial.content.is_empty()` 失败 | refusal 分支错误地把未知 part 当成空 Text |
-| 严格 clippy 基线 | Anthropic 1 项、SigV4 2 项 | 分支遗留 lint |
-| 严格 clippy 后续 | `KnownApi::clone()` 为 `clone_on_copy` | 前三项修复后 clippy 才继续暴露测试 lint |
+| Batch 1 | provider 基础设施、EOF/Error、headers/Cloudflare、usage、registry、retry/SSE。 | provider terminal/request 套件和 `all-providers`。 |
+| Batch 2 | Google/Vertex/Bedrock signature、terminal reason、Mistral reasoning/tool streaming fidelity。 | provider round trip、terminal-reason matrix、独立 feature。 |
+| Batch 3 | Responses refusal lifecycle、store:false identity/order、Codex replay filter、converter compatibility、严格 clippy。提交 `91245e5`（`fix(ai): close Responses API review`）。 | Responses public consumer、request replay、converter、严格 clippy。 |
+| Batch 3 follow-up | generic `response.content_part.done` 在 incomplete/cancelled 前完成 output text/refusal；Codex 拒绝缺失/空 encrypted-reasoning id。 | 新增 OpenAI/Codex 共享 public lifecycle 测试和 expanded mixed replay fixture。 |
 
-所有行为 RED 均先确认失败原因，再做最小生产修复；对应具名测试当前均 GREEN。
+### Batch 3 Follow-up：RED 到 GREEN
 
-## 最终审查三 Batch 回归矩阵
+- RED：generic `response.content_part.done` 没有建立或结束 Text lifecycle。OpenAI public fixture
+  的 final text 为 `None`，terminal event 可能掩盖缺失的 `TextEnd`。
+- GREEN：共享 consumer 按 part type 和既有 output/content identity 建立或路由 Text block，
+  以最终 `text`/`refusal` reconciliation，并抑制重复 `TextEnd`。OpenAI 和 Codex wrapper 都断言
+  incomplete/cancelled 时的 `TextStart -> TextEnd -> terminal` 顺序。
+- RED：Codex mixed history replay 会接纳缺失 id 或 `id: ""` 的 `reasoning` signature。
+- GREEN：replay 必须有非空 string id；mixed fixture 证明只剩一个合法 encrypted reasoning item，
+  text/tool/user 顺序不变。
 
-| Batch | 基线/提交 | 契约 | 主要回归证据 | 当前状态 |
-|---|---|---|---|---|
-| Batch 1 基础设施与安全 | `43b54f1..2693b1a` | SigV4 canonical URI、Cloudflare placeholder 白名单、Retry-After overflow、SSE EOF、凭据 Debug 脱敏、ADC 公开 API、Faux lock | SigV4 固定向量、Cloudflare/retry/SSE unit、Bedrock request capture、Vertex ADC public stream、strict clippy | `all-providers` 回归通过 |
-| Batch 2 Provider fidelity | `bcee056`、`49b3e87` | Google/Vertex signature、Bedrock reasoning signature、terminal fail-closed、Mistral mixed reasoning/text 与 replay | Google/Vertex/Bedrock/Mistral public round trip、terminal reason matrix、独立 provider feature | `all-providers` 回归通过 |
-| Batch 3 Responses/API/计划闭环 | 基线 `49b3e87`，本提交 `fix(ai): close Responses API review` | refusal lifecycle、store:false identity/order、Codex malformed replay、usage visibility、Converter compatibility、clippy、static service-tier cost contract、正式计划 | 本计划 Task 1-8 具名测试、OpenAI/Codex/Azure 独立 feature、agent/workspace/clippy/fmt/diff | 完成 |
+## 实测回归矩阵
 
-## 当前检查结果
+下列独立 feature 计数均由实际命令取得，而非从复审基线
+`101/1/3`、`103/4/2`、`105/0/1` 手算：
 
-| 命令/检查 | 结果 |
+| 命令 | 当前结果 |
 |---|---|
-| 两个最小 Responses RED | 按预期失败，修复后 PASS |
-| Converter 构造器编译 RED | 按预期 E0061/E0599，修复后 6 个 converter tests PASS |
-| unknown content part RED | 按预期失败，收紧后 PASS |
-| OpenAI refusal 真实入口 | PASS |
-| Codex refusal wrapper 真实入口 | PASS |
-| Responses 公开两轮 store:false round trip | PASS |
-| Codex malformed/mixed replay | PASS |
-| `cargo test -p ai --features all-providers` | PASS，225 tests，0 failed（153 unit、7 Anthropic E2E、4 catalog、41 request metadata、19 terminal、1 support） |
-| `cargo clippy -p ai --features all-providers --all-targets -- -D warnings` | PASS |
-| OpenAI 独立 feature | PASS（100 lib、1 request metadata、3 terminal） |
-| Codex 独立 feature | PASS（102 lib、4 request metadata、2 terminal） |
-| Azure 独立 feature | PASS（104 lib、1 terminal） |
-| `cargo test -p knuth-agent` | PASS，3 tests，0 failed |
-| `cargo test --workspace --no-run` | PASS |
-| `cargo fmt -p ai -- --check` / `git diff --check` | PASS |
-| Batch 3 commit | PASS，本提交 `fix(ai): close Responses API review` |
+| `cargo test -q -p ai --no-default-features --features openai-responses --lib --test provider_request_metadata --test provider_terminal_events` | 101 lib、1 request metadata、4 terminal，全部 PASS。 |
+| `cargo test -q -p ai --no-default-features --features openai-codex-responses --lib --test provider_request_metadata --test provider_terminal_events` | 103 lib、4 request metadata、3 terminal，全部 PASS。 |
+| `cargo test -q -p ai --no-default-features --features azure-openai-responses --lib --test provider_request_metadata --test provider_terminal_events` | 105 lib、0 request metadata、1 terminal，全部 PASS。 |
+| `cargo test -p ai --features all-providers` | 227 tests PASS：153 lib、7 Anthropic E2E、4 catalog、41 request metadata、21 terminal、1 support。 |
+| `cargo test -p knuth-agent` | 3 tests PASS。 |
+| `cargo test --workspace --no-run` | PASS。 |
+| `cargo clippy -p ai --features all-providers --all-targets -- -D warnings` | PASS；移除了新增测试中的 `clone_on_copy`。 |
+| `cargo fmt -p ai -- --check` 和 `git diff --check` | 最终格式化后 PASS。 |
 
 ## 完成标准
 
-- Task 1-8 全部勾选。
-- 所有具名、独立 feature、`all-providers`、consumer 和 workspace 门禁通过。
-- 严格 ai clippy、ai fmt、diff check 通过。
-- tracked diff 只包含本计划真实文件清单。
-- 一个 Batch 3 commit，ignored 报告不进入 commit。
+- Task 1-10 保持完整、连续和完成状态，不收缩为 Task 1-8。
+- 每项 Batch 3 follow-up 都有 RED 证据、窄修复及 OpenAI/Codex public coverage。
+- `all-providers`、三个独立 feature、`knuth-agent`、workspace no-run、严格 clippy、fmt、diff
+  均通过。
+- tracked diff 仅含本次窄修复文件清单中的 5 个版本控制文件；ignored Batch 3 报告不进入提交。
