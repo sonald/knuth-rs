@@ -1157,6 +1157,7 @@ git status --short
 - [x] **Batch 2**：bcee056、49b3e87。Bedrock/Google/Mistral provider fidelity、reasoning/tool streaming 与 request replay。
 - [x] **Batch 3**：91245e5。Responses identity/lifecycle、usage normalization、README、strict clippy；service_tier 仅作为请求 metadata，usage cost 始终按静态 Model.cost catalog 计算。
 - [x] **Batch 3 follow-up**：c783bc8。generic response.content_part.done 在 incomplete/cancelled terminal 前完成 text/refusal lifecycle；Codex encrypted reasoning replay 拒绝缺失或空 id。
+- [x] **Final review follow-up**：cc41735。Faux 专用 race fixture 与 registry hook 收紧到 `cfg(all(test, feature = "faux"))`，不再污染非 Faux 最小 feature 构建。
 
 ### 新增回归类别
 
@@ -1173,6 +1174,8 @@ git status --short
 | all-providers | 227 PASS。 |
 | knuth-agent | 3 PASS。 |
 | workspace no-run、ai clippy、ai fmt、diff | PASS。workspace-wide fmt 仍受 Task 10 记录的基线格式差异阻断。 |
+
+以上结果由主控在 `cc41735` 当前 HEAD 重新执行确认；不是复用子代理报告。
 
 ### 完成复核
 
