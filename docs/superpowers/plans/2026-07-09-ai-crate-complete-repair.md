@@ -794,7 +794,7 @@ retryable_reqwest_errors_exclude_request_builder_errors
 data_field_removes_only_one_leading_space
 multiple_events_are_emitted_fifo
 line_and_data_split_across_chunks_are_reassembled
-eof_without_blank_line_flushes_current_event
+eof_without_final_line_feed_flushes_current_event
 ```
 
 **必须覆盖的回归矩阵：**
@@ -809,7 +809,7 @@ eof_without_blank_line_flushes_current_event
 | clear 与 stream lookup | `clear_racing_with_stream_lookup_does_not_return_missing_provider_error` |
 | 多 event FIFO | `multiple_events_are_emitted_fifo` |
 | line/data 跨 chunk | `line_and_data_split_across_chunks_are_reassembled` |
-| EOF flush 当前 event | `eof_without_blank_line_flushes_current_event` |
+| EOF flush 当前 event | `eof_without_final_line_feed_flushes_current_event` |
 
 全局 registry mutation 测试共用 test-only lock，且以 drop guard 恢复 built-ins。并发测试在
 `ensure_and_get` 的 lifecycle lock 内、`register_enabled()` 后且 lookup 前暂停；clear 线程只
@@ -907,8 +907,8 @@ cargo test -p ai --features all-providers
 |---|---|---|
 | Bedrock bearer | `options.api_key > AWS_BEARER_TOKEN_BEDROCK > SigV4 env credentials`，bearer 分支不附加 SigV4 headers | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
 | Bedrock SigV4 | 对最终 path/body/headers 签名；非 greedy `modelId` label 的 `%3A`/`%2F` wire path 不被 canonical URI double-encode；固定向量覆盖 canonical request hash、SignedHeaders 与 signature，捕获测试覆盖最终发送 headers | `sigv4::tests::signs_post_with_payload_and_session_token`、`bedrock_prefers_bearer_token_but_accepts_sigv4_creds`、`bedrock_sigv4_uses_inference_profile_arn_region` |
-| Bedrock reasoning | Claude 4.6/4.7 使用 adaptive `thinking`/`output_config`，旧 Claude 使用严格小于 `maxTokens` 的 fixed budget，Nova 2 Lite 使用 `reasoningConfig`；未知模型 fail closed | `bedrock_simple_reasoning_*`、`bedrock_stream_simple_rejects_unknown_claude_protocol` |
-| Bedrock signing region | ARN 与标准 runtime endpoint 优先于 env/default；二者冲突时本地报错 | `bedrock_sigv4_uses_inference_profile_arn_region`、`bedrock_signing_region_*` |
+| Bedrock reasoning | Claude 4.6/4.7 使用 adaptive `thinking`/`output_config`，旧 Claude 使用严格小于 `maxTokens` 的 fixed budget，Nova 2 Lite 使用 `reasoningConfig`；未知模型 fail closed | `bedrock_simple_reasoning_uses_claude_adaptive_fields`、`bedrock_simple_reasoning_keeps_claude_budget_below_max_tokens`、`bedrock_simple_reasoning_respects_explicit_max_tokens`、`bedrock_simple_reasoning_uses_nova_reasoning_config`、`bedrock_simple_reasoning_nova_high_omits_inference_limits`、`bedrock_simple_reasoning_fails_closed_for_unmapped_builtin_model`、`bedrock_stream_simple_rejects_unknown_claude_protocol` |
+| Bedrock signing region | ARN 与标准 runtime endpoint 优先于 env/default；二者冲突时本地报错 | `bedrock_sigv4_uses_inference_profile_arn_region`、`bedrock_signing_region_prefers_standard_endpoint_over_env_fallback`、`bedrock_signing_region_rejects_arn_endpoint_conflict` |
 | Bedrock 缺认证 | 发具名 Error，连接本地 listener 前返回 | `bedrock_missing_auth_emits_named_error_without_network_request` |
 | Vertex token | `options.api_key > GOOGLE_VERTEX_ACCESS_TOKEN > ADC` | `vertex_auth_priority_is_options_then_env_then_adc`、`vertex_can_select_adc_when_access_token_absent` |
 | Vertex project | `GOOGLE_VERTEX_PROJECT > service-account project_id` | `vertex_explicit_project_overrides_service_account_project`、`vertex_can_select_adc_when_access_token_absent` |
@@ -922,7 +922,7 @@ cargo test -p ai --features all-providers
 分别运行三条具名测试；确认失败原因是缺少 SigV4 provider 接线、缺少 `translate_simple_options`、缺少 ADC provider 接线，而不是测试编译或 fixture 假失败。
 
 - `bedrock_prefers_bearer_token_but_accepts_sigv4_creds`：RED 为 provider 返回 “SigV4 signing not yet implemented”。
-- `bedrock_stream_simple_reasoning_sets_additional_model_fields`：RED 为 `translate_simple_options` 不存在。
+- `bedrock_simple_reasoning_uses_claude_adaptive_fields`：RED 为 `translate_simple_options` 不存在。
 - `vertex_can_select_adc_when_access_token_absent`：RED 为 provider 返回 “ADC/JWT flow not yet implemented”。
 
 - [x] **Step 2：Bedrock SigV4 与 simple reasoning GREEN**
@@ -1121,8 +1121,8 @@ git status --short
 | SSE 吞掉过多前导空格 | `data_field_removes_only_one_leading_space` |
 | SSE multiple event FIFO | `multiple_events_are_emitted_fifo` |
 | SSE line/data chunk reassembly | `line_and_data_split_across_chunks_are_reassembled` |
-| SSE EOF flush | `eof_without_blank_line_flushes_current_event` |
-| Bedrock simple stream 丢 reasoning 或 base options | `bedrock_stream_simple_reasoning_sets_additional_model_fields`、`bedrock_stream_simple_preserves_base_options_and_omits_absent_reasoning` |
+| SSE EOF flush | `eof_without_final_line_feed_flushes_current_event` |
+| Bedrock simple stream 丢 reasoning 或 base options | `bedrock_simple_reasoning_uses_claude_adaptive_fields`、`bedrock_stream_simple_preserves_base_options_and_omits_absent_reasoning` |
 | Bedrock bearer/SigV4 优先级错误，或 converse-stream authorization 未绑定实际 path/body/date/session token | `bedrock_prefers_bearer_token_but_accepts_sigv4_creds` |
 | Bedrock 缺认证仍发网络请求 | `bedrock_missing_auth_emits_named_error_without_network_request` |
 | Vertex token/ADC 优先级及本地 ADC exchange 未接入最终 Vertex bearer 请求 | `vertex_auth_priority_is_options_then_env_then_adc`、`vertex_can_select_adc_when_access_token_absent` |
@@ -1178,3 +1178,10 @@ git status --short
 
 - [x] Task 1-10 标题、全部实施步骤、RED/GREEN 命令、原验收矩阵与已完成状态均从 49b3e87 完整恢复。
 - [x] 新增具名测试以 rg 在当前 crates/ai 中核对。
+
+### 结构核查记录
+
+- [x] 标题顺序为 Task 1 至 Task 10，随后是 `Final multi-axis review：Batch 1-3 与 follow-up`；没有重复或缺号任务。
+- [x] 49b3e87 的 Task 1-10 文件清单、步骤、RED/GREEN 命令和验收矩阵均完整保留，未以摘要替代；仅将实施 checkbox 归一为 `[x]`，并把两个已过期测试名改为当前代码中的精确函数名。
+- [x] 所有实施步骤和 Batch 记录均为完成状态，计划中没有遗留未完成 checkbox。
+- [x] 回归矩阵的具名测试通过 `rg` 在当前 `crates/ai` 中存在；SSE EOF 测试使用实际名称 `eof_without_final_line_feed_flushes_current_event`，Bedrock adaptive reasoning 测试使用实际名称 `bedrock_simple_reasoning_uses_claude_adaptive_fields`。
