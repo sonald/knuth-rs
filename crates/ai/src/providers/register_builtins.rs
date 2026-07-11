@@ -7,13 +7,13 @@
 
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 struct EnsureAndGetTestHook {
     entered: std::sync::mpsc::Sender<()>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 fn ensure_and_get_test_hook() -> &'static Mutex<Option<std::sync::Arc<EnsureAndGetTestHook>>> {
     use std::sync::{Arc, OnceLock};
 
@@ -21,7 +21,7 @@ fn ensure_and_get_test_hook() -> &'static Mutex<Option<std::sync::Arc<EnsureAndG
     CELL.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 pub(crate) fn install_ensure_and_get_test_hook(
     entered: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
@@ -35,14 +35,14 @@ pub(crate) fn install_ensure_and_get_test_hook(
         }));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 pub(crate) fn clear_ensure_and_get_test_hook() {
     *ensure_and_get_test_hook()
         .lock()
         .expect("ensure-and-get test hook poisoned") = None;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 pub(crate) fn provider_lifecycle_is_locked_for_test() -> bool {
     matches!(
         provider_lifecycle_lock().try_lock(),
@@ -50,7 +50,7 @@ pub(crate) fn provider_lifecycle_is_locked_for_test() -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 fn pause_ensure_and_get_for_test() {
     let hook = ensure_and_get_test_hook()
         .lock()
@@ -87,7 +87,7 @@ pub(crate) fn ensure_and_get(
 ) -> Option<crate::api_registry::RegisteredHandle> {
     with_provider_lifecycle(|| {
         register_enabled();
-        #[cfg(test)]
+        #[cfg(all(test, feature = "faux"))]
         pause_ensure_and_get_for_test();
         crate::api_registry::get_api_provider(api)
     })
@@ -164,11 +164,11 @@ mod tests {
         ApiProvider, clear_api_providers, get_api_provider, list_api_ids, register_api_provider,
         registry_test_lock,
     };
-    use crate::types::{
-        Api, AssistantMessageEvent, Context, Model, ModelCost, Provider, SimpleStreamOptions,
-        StreamOptions,
-    };
+    use crate::types::{Api, Context, Model, SimpleStreamOptions, StreamOptions};
+    #[cfg(all(test, feature = "faux"))]
+    use crate::types::{AssistantMessageEvent, ModelCost, Provider};
     use crate::utils::event_stream::AssistantMessageEventStream;
+    #[cfg(all(test, feature = "faux"))]
     use futures::StreamExt;
 
     struct RestoreBuiltins;
@@ -180,6 +180,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "faux"))]
     fn faux_model() -> Model {
         Model {
             id: "faux-model".into(),
@@ -227,7 +228,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "faux")]
+    #[cfg(all(test, feature = "faux"))]
     #[tokio::test]
     async fn stream_re_registers_builtins_after_clear() {
         let _guard = registry_test_lock().lock().await;
@@ -262,7 +263,7 @@ mod tests {
         assert!(built_in_apis.iter().all(|api| restored_apis.contains(api)));
     }
 
-    #[cfg(feature = "faux")]
+    #[cfg(all(test, feature = "faux"))]
     #[tokio::test]
     async fn ensure_preserves_custom_override_for_builtin_api() {
         let _guard = registry_test_lock().lock().await;

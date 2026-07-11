@@ -53,7 +53,7 @@ pub async fn complete_simple(
     stream_simple(model, context, options).result().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "faux"))]
 mod tests {
     use super::*;
     use crate::api_registry::{clear_api_providers, registry_test_lock};
@@ -147,7 +147,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "faux")]
+    #[cfg(all(test, feature = "faux"))]
     #[tokio::test]
     async fn clear_racing_with_stream_lookup_does_not_return_missing_provider_error() {
         let _guard = registry_test_lock().lock().await;
