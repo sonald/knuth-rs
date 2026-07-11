@@ -1172,7 +1172,7 @@ git status --short
 | Azure feature | 105/0/1 PASS。 |
 | all-providers | 227 PASS。 |
 | knuth-agent | 3 PASS。 |
-| workspace、clippy、fmt、diff | PASS。 |
+| workspace no-run、ai clippy、ai fmt、diff | PASS。workspace-wide fmt 仍受 Task 10 记录的基线格式差异阻断。 |
 
 ### 完成复核
 
