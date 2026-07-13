@@ -809,8 +809,14 @@ fn on_text_delta(
     sender: &mut AssistantMessageEventSender,
 ) {
     let delta = payload["delta"].as_str().unwrap_or("").to_string();
-    let Some(idx) = content_index_for_content_event(payload, state) else {
-        return;
+    let idx = match content_index_for_content_event(payload, state) {
+        Some(idx) => idx,
+        None => {
+            let Some(idx) = ensure_content_part_text(payload, "", partial, state, sender) else {
+                return;
+            };
+            idx
+        }
     };
     if state.ended_content.contains(&idx) {
         return;
@@ -1100,6 +1106,13 @@ pub(crate) fn convert_messages(
                 out.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant(a) => {
+                let replays_responses_metadata = [
+                    KnownApi::OpenAIResponses,
+                    KnownApi::AzureOpenAIResponses,
+                    KnownApi::OpenAICodexResponses,
+                ]
+                .iter()
+                .any(|api| a.api.0 == api.as_str());
                 for b in &a.content {
                     match b {
                         ContentBlock::Text(t) => {
@@ -1113,8 +1126,9 @@ pub(crate) fn convert_messages(
                                 }],
                                 "status": "completed",
                             });
-                            if let Some((id, phase)) =
-                                parse_text_signature(t.text_signature.as_deref())
+                            if replays_responses_metadata
+                                && let Some((id, phase)) =
+                                    parse_text_signature(t.text_signature.as_deref())
                             {
                                 message["id"] = json!(id);
                                 if let Some(phase) = phase {
@@ -1701,6 +1715,41 @@ mod tests {
     }
 
     #[test]
+    fn responses_replay_does_not_treat_google_thought_signature_as_message_id() {
+        let mut message = assistant_message(vec![ContentBlock::Text(TextContent {
+            text: "answer".into(),
+            text_signature: Some("dGV4dA==".into()),
+        })]);
+        let Message::Assistant(assistant) = &mut message else {
+            unreachable!("assistant_message always returns an assistant message");
+        };
+        assistant.api = Api::known(KnownApi::GoogleGenerativeAi);
+        assistant.provider = Provider::from("google");
+        assistant.model = "gemini-3-pro".into();
+
+        let input = convert_messages(&[message], None, false);
+
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], "answer");
+        assert!(input[0].get("id").is_none());
+    }
+
+    #[test]
+    fn responses_replay_preserves_legacy_plain_message_id() {
+        let input = convert_messages(
+            &[assistant_message(vec![ContentBlock::Text(TextContent {
+                text: "answer".into(),
+                text_signature: Some("msg_legacy".into()),
+            })])],
+            None,
+            false,
+        );
+
+        assert_eq!(input[0]["id"], "msg_legacy");
+        assert!(input[0].get("phase").is_none());
+    }
+
+    #[test]
     fn thinking_replayed_as_reasoning_item_when_compat_requires() {
         // ds4 (DeepSeek V4 local server) does byte-exact KV prefix matching on
         // the rendered history; it accepts `{"type":"reasoning"}` input items
@@ -1931,6 +1980,86 @@ mod tests {
             partial.content.first(),
             Some(ContentBlock::Text(text)) if text.text == "complete"
         ));
+    }
+
+    #[tokio::test]
+    async fn identified_text_delta_without_content_part_added_starts_text_block() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "answer",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        drop(sender);
+
+        let mut starts = Vec::new();
+        let mut deltas = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextStart { content_index, .. } => {
+                    starts.push(content_index)
+                }
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => deltas.push((content_index, delta)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(starts, vec![0]);
+        assert_eq!(deltas, vec![(0, "answer".into())]);
+        assert!(matches!(
+            partial.content.first(),
+            Some(ContentBlock::Text(text)) if text.text == "answer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn identityless_text_delta_does_not_create_orphan_block() {
+        let m = mk_model();
+        let (mut stream, mut sender) = AssistantMessageEventStream::new();
+        let mut partial = empty_partial(&m);
+        let mut state = StreamState::default();
+
+        handle_event(
+            &sse_event(
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "orphan",
+                }),
+            ),
+            &m,
+            &mut partial,
+            &mut state,
+            &mut sender,
+        );
+        drop(sender);
+
+        assert!(partial.content.is_empty());
+        while let Some(event) = stream.next().await {
+            assert!(!matches!(
+                event,
+                AssistantMessageEvent::TextStart { .. } | AssistantMessageEvent::TextDelta { .. }
+            ));
+        }
     }
 
     #[tokio::test]
