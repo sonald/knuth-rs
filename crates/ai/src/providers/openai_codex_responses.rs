@@ -215,9 +215,6 @@ fn build_request_body(model: &Model, context: &Context, options: &StreamOptions)
     if let Some(t) = options.temperature {
         body["temperature"] = json!(t);
     }
-    if let Some(max_tokens) = options.max_tokens {
-        body["max_output_tokens"] = json!(max_tokens);
-    }
     if let Some(tools) = &context.tools {
         if !tools.is_empty() {
             body["tools"] = json!(serialize_tools(tools));

@@ -281,17 +281,8 @@ fn codex_options(max_tokens: Option<u32>) -> StreamOptions {
 
 #[cfg(feature = "openai-codex-responses")]
 #[tokio::test]
-async fn codex_request_includes_max_output_tokens() {
+async fn codex_request_omits_unsupported_max_output_tokens() {
     let body = capture_codex_request(Context::default(), codex_options(Some(1234))).await;
-
-    assert_eq!(body["max_output_tokens"], 1234);
-    assert!(body.get("max_tokens").is_none());
-}
-
-#[cfg(feature = "openai-codex-responses")]
-#[tokio::test]
-async fn codex_request_omits_max_output_tokens_by_default() {
-    let body = capture_codex_request(Context::default(), codex_options(None)).await;
 
     assert!(body.get("max_output_tokens").is_none());
     assert!(body.get("max_tokens").is_none());
