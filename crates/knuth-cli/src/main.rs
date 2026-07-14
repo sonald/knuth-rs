@@ -110,8 +110,14 @@ fn render_event(event: &AgentEvent) {
         AgentEvent::AssistantMessageTextDelta { delta, .. } => {
             print!("{}", delta.as_str().green());
         }
+        AgentEvent::AssistantMessageTextCompleted { .. } => {
+            println!();
+        }
         AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
             print!("{}", delta.as_str().blue());
+        }
+        AgentEvent::AssistantMessageThinkingCompleted { .. } => {
+            println!();
         }
         AgentEvent::ErrorOccurred { message, .. } => {
             eprintln!("{}", message.as_str().red());
@@ -141,13 +147,19 @@ fn render_event(event: &AgentEvent) {
     }
 }
 
-/// Renders events until the current turn ends. Ctrl+C cancels the turn
-/// instead of killing the process; the turn then finishes with a
-/// `Cancelled` step and ends normally.
+/// Renders events until the current turn ends. The first Ctrl+C cancels the
+/// turn (it finishes with a `Cancelled` step and ends normally); a second
+/// Ctrl+C force-quits in case the turn cannot end (e.g. a wedged connection).
 async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscription) -> Result<()> {
+    let mut cancel_requested = false;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                if cancel_requested {
+                    eprintln!("force quit");
+                    std::process::exit(130);
+                }
+                cancel_requested = true;
                 info!("Cancelling current turn...");
                 session.cancel_current_turn().await?;
             }

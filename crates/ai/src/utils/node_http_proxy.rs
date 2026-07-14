@@ -15,11 +15,19 @@ pub fn proxy_from_env() -> Option<reqwest::Proxy> {
     reqwest::Proxy::all(&url).ok()
 }
 
+/// Idle timeout between reads. Streaming responses can legitimately run for
+/// many minutes, so an overall request timeout would break them; but a healthy
+/// SSE stream delivers bytes (data or keepalives) far more often than this. A
+/// connection silent this long is dead — erroring out lets the caller's
+/// retry/error path run instead of hanging forever.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Build a `reqwest::Client` honoring proxy env vars and pie-ai defaults.
 pub fn build_client(timeout_ms: Option<u64>) -> reqwest::Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .user_agent(crate::utils::headers::user_agent())
-        .connect_timeout(std::time::Duration::from_secs(15));
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(READ_TIMEOUT);
     if let Some(p) = proxy_from_env() {
         b = b.proxy(p);
     }
