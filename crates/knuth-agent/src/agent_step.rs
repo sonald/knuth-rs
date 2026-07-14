@@ -43,9 +43,9 @@ impl Actor for AgentStepActor {
 
     async fn on_start(&mut self, ctx: &mut ActorContext<Self::Message>) {
         let _ = self
-            .emit(TurnMessage::Event(AgentEvent::ModelStepStarted {
+            .emit(AgentEvent::ModelStepStarted {
                 step_id: self.step_id,
-            }))
+            })
             .await;
 
         let Some(tx) = ctx.upgrade() else { return };
@@ -113,12 +113,15 @@ impl Actor for AgentStepActor {
             self.step_reason = ModelStepEndReason::Cancelled;
         }
 
+        // Completion is a control signal, not a domain event: the harness
+        // derives and commits `ModelStepEnded` itself.
         let _ = self
-            .emit(TurnMessage::Event(AgentEvent::ModelStepEnded {
+            .store_tx
+            .send(AgentActorMessage::StepFinished {
                 step_id: self.step_id,
                 reason: self.step_reason.clone(),
-                assistant_message: self.assistant_message.clone(),
-            }))
+                assistant_message: self.assistant_message.take(),
+            })
             .await;
     }
 }
@@ -142,7 +145,7 @@ impl AgentStepActor {
         }
     }
 
-    pub async fn emit(&mut self, event: TurnMessage) -> Result<(), AgentStepError> {
+    pub async fn emit(&mut self, event: AgentEvent) -> Result<(), AgentStepError> {
         self.store_tx
             .send(AgentActorMessage::Turn(self.step_id, event))
             .await
@@ -171,20 +174,18 @@ impl AgentStepActor {
             }
 
             ai::AssistantMessageEvent::TextStart { content_index, .. } => {
-                self.emit(TurnMessage::Event(
-                    AgentEvent::AssistantMessageTextStarted { content_index },
-                ))
-                .await?;
+                self.emit(AgentEvent::AssistantMessageTextStarted { content_index })
+                    .await?;
             }
             ai::AssistantMessageEvent::TextDelta {
                 content_index,
                 delta,
                 ..
             } => {
-                self.emit(TurnMessage::Event(AgentEvent::AssistantMessageTextDelta {
+                self.emit(AgentEvent::AssistantMessageTextDelta {
                     content_index,
                     delta,
-                }))
+                })
                 .await?;
             }
             ai::AssistantMessageEvent::TextEnd {
@@ -193,33 +194,27 @@ impl AgentStepActor {
                 partial,
                 ..
             } => {
-                self.emit(TurnMessage::Event(
-                    AgentEvent::AssistantMessageTextCompleted {
-                        content_index,
-                        text_content: content,
-                        assistant_message: partial,
-                    },
-                ))
+                self.emit(AgentEvent::AssistantMessageTextCompleted {
+                    content_index,
+                    text_content: content,
+                    assistant_message: partial,
+                })
                 .await?;
             }
 
             ai::AssistantMessageEvent::ThinkingStart { content_index, .. } => {
-                self.emit(TurnMessage::Event(
-                    AgentEvent::AssistantMessageThinkingStarted { content_index },
-                ))
-                .await?;
+                self.emit(AgentEvent::AssistantMessageThinkingStarted { content_index })
+                    .await?;
             }
             ai::AssistantMessageEvent::ThinkingDelta {
                 content_index,
                 delta,
                 ..
             } => {
-                self.emit(TurnMessage::Event(
-                    AgentEvent::AssistantMessageThinkingDelta {
-                        content_index,
-                        delta,
-                    },
-                ))
+                self.emit(AgentEvent::AssistantMessageThinkingDelta {
+                    content_index,
+                    delta,
+                })
                 .await?;
             }
             ai::AssistantMessageEvent::ThinkingEnd {
@@ -227,12 +222,10 @@ impl AgentStepActor {
                 content,
                 ..
             } => {
-                self.emit(TurnMessage::Event(
-                    AgentEvent::AssistantMessageThinkingCompleted {
-                        content_index,
-                        content,
-                    },
-                ))
+                self.emit(AgentEvent::AssistantMessageThinkingCompleted {
+                    content_index,
+                    content,
+                })
                 .await?;
             }
 
@@ -420,10 +413,7 @@ mod tests {
                 .await
                 .expect("step should emit events")
                 .expect("step channel should stay open until ModelStepEnded");
-            let ended = matches!(
-                message,
-                AgentActorMessage::Turn(_, TurnMessage::Event(AgentEvent::ModelStepEnded { .. }))
-            );
+            let ended = matches!(message, AgentActorMessage::StepFinished { .. });
             messages.push(message);
             if ended {
                 break;
@@ -434,9 +424,9 @@ mod tests {
         let expected_step_id = match messages.first().expect("expected actor messages") {
             AgentActorMessage::Turn(
                 step_id,
-                TurnMessage::Event(AgentEvent::ModelStepStarted {
+                AgentEvent::ModelStepStarted {
                     step_id: event_step_id,
-                }),
+                },
             ) => {
                 assert_eq!(step_id, event_step_id);
                 *step_id
@@ -448,15 +438,14 @@ mod tests {
 
         for message in &messages {
             match message {
-                AgentActorMessage::Turn(step_id, TurnMessage::Event(event)) => {
+                AgentActorMessage::Turn(step_id, event) => {
                     assert_eq!(*step_id, expected_step_id);
-                    match event {
-                        AgentEvent::ModelStepStarted { step_id }
-                        | AgentEvent::ModelStepEnded { step_id, .. } => {
-                            assert_eq!(*step_id, expected_step_id);
-                        }
-                        _ => {}
+                    if let AgentEvent::ModelStepStarted { step_id } = event {
+                        assert_eq!(*step_id, expected_step_id);
                     }
+                }
+                AgentActorMessage::StepFinished { step_id, .. } => {
+                    assert_eq!(*step_id, expected_step_id);
                 }
                 AgentActorMessage::Command(_) => panic!("unexpected actor command"),
                 AgentActorMessage::ToolFinished { .. } => panic!("unexpected ToolFinished"),
@@ -466,35 +455,25 @@ mod tests {
         let lifecycle = messages
             .iter()
             .filter_map(|message| match message {
-                AgentActorMessage::Turn(
-                    _,
-                    TurnMessage::Event(AgentEvent::ModelStepStarted { .. }),
-                ) => Some("started"),
-                AgentActorMessage::Turn(
-                    _,
-                    TurnMessage::Event(AgentEvent::ModelStepEnded { .. }),
-                ) => Some("ended"),
+                AgentActorMessage::Turn(_, AgentEvent::ModelStepStarted { .. }) => Some("started"),
+                AgentActorMessage::StepFinished { .. } => Some("finished"),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(lifecycle, ["started", "ended"]);
+        assert_eq!(lifecycle, ["started", "finished"]);
 
         match messages.last().expect("expected actor messages") {
-            AgentActorMessage::Turn(
+            AgentActorMessage::StepFinished {
                 step_id,
-                TurnMessage::Event(AgentEvent::ModelStepEnded {
-                    step_id: event_step_id,
-                    reason,
-                    assistant_message,
-                }),
-            ) => {
+                reason,
+                assistant_message,
+            } => {
                 assert_eq!(*step_id, expected_step_id);
-                assert_eq!(*event_step_id, expected_step_id);
                 assert_eq!(*reason, ModelStepEndReason::Length);
                 assert_eq!(
                     assistant_message
                         .as_ref()
-                        .expect("ModelStepEnded should include assistant_message")
+                        .expect("StepFinished should include assistant_message")
                         .stop_reason,
                     StopReason::Length
                 );
@@ -503,19 +482,16 @@ mod tests {
         }
     }
 
-    fn recv_step_ended(
+    fn recv_step_finished(
         rx: &mut mpsc::Receiver<AgentActorMessage>,
     ) -> (ModelStepEndReason, Option<AssistantMessage>) {
         loop {
-            match rx.try_recv().expect("expected a ModelStepEnded event") {
-                AgentActorMessage::Turn(
-                    _,
-                    TurnMessage::Event(AgentEvent::ModelStepEnded {
-                        reason,
-                        assistant_message,
-                        ..
-                    }),
-                ) => return (reason, assistant_message),
+            match rx.try_recv().expect("expected a StepFinished message") {
+                AgentActorMessage::StepFinished {
+                    reason,
+                    assistant_message,
+                    ..
+                } => return (reason, assistant_message),
                 _ => continue,
             }
         }
@@ -572,7 +548,7 @@ mod tests {
 
         step.on_stop(&mut ctx).await;
 
-        let (reason, assistant_message) = recv_step_ended(&mut rx);
+        let (reason, assistant_message) = recv_step_finished(&mut rx);
         assert_eq!(reason, ModelStepEndReason::Cancelled);
         assert!(assistant_message.is_none());
     }
@@ -592,7 +568,7 @@ mod tests {
 
         step.on_stop(&mut ctx).await;
 
-        let (reason, assistant_message) = recv_step_ended(&mut rx);
+        let (reason, assistant_message) = recv_step_finished(&mut rx);
         assert_eq!(reason, ModelStepEndReason::Success);
         assert_eq!(
             assistant_message.expect("completed step keeps its message").stop_reason,

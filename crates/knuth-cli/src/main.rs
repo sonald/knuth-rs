@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 use knuth_agent::harness::{AgentConfig, AgentSession};
-use knuth_core::AgentEvent;
+use knuth_core::{AgentEvent, AgentSubscription};
 
 mod config;
 use config::UserSettings;
@@ -87,9 +87,9 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-async fn oneshot(input: String, images: Vec<String>, user_settings: UserSettings) -> Result<()> {
-    let system_prompt = "You are a helpful assistant.".to_string();
+const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
+async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
     let mut session = AgentSession::build(
         "test".to_string(),
         "test".to_string(),
@@ -100,133 +100,83 @@ async fn oneshot(input: String, images: Vec<String>, user_settings: UserSettings
     )
     .await;
 
-    let quit_token = tokio_util::sync::CancellationToken::new();
-    let quit_token_clone = quit_token.clone();
+    let subscription = session.subscribe(None).await?;
+    session.set_system_prompt(SYSTEM_PROMPT.to_string()).await?;
+    Ok((session, subscription))
+}
 
-    let mut subscription = session.subscribe(None).await?;
-
-    tokio::spawn(async move {
-        while let Some(event) = subscription.next().await {
-            match event.event {
-                AgentEvent::AssistantMessageTextDelta { delta, .. } => {
-                    print!("{}", delta.green());
-                }
-                AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
-                    print!("{}", delta.blue());
-                }
-
-                AgentEvent::ErrorOccurred { message, .. } => {
-                    eprintln!("{}", message.red());
-                }
-
-                AgentEvent::AgentTurnEnded { .. } => {
-                    quit_token_clone.cancel();
-                }
-
-                AgentEvent::ToolExecutionStarted {
-                    tool_name,
-                    arguments,
-                    ..
-                } => {
-                    println!(
-                        "{}",
-                        format!(
-                            "* ToolRequest {}({})",
-                            tool_name,
-                            serde_json::to_string(&arguments).unwrap()
-                        )
-                        .cyan()
-                    );
-                }
-                AgentEvent::ToolExecutionEnded { result, .. } => {
-                    println!("{}", format!("* Result: {}", result).cyan());
-                }
-                _ => {
-                    let msg = format!("{}", event);
-                    debug!("Ev: {}", msg.dark_yellow());
-                }
-            }
+fn render_event(event: &AgentEvent) {
+    match event {
+        AgentEvent::AssistantMessageTextDelta { delta, .. } => {
+            print!("{}", delta.as_str().green());
         }
+        AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
+            print!("{}", delta.as_str().blue());
+        }
+        AgentEvent::ErrorOccurred { message, .. } => {
+            eprintln!("{}", message.as_str().red());
+        }
+        AgentEvent::ToolExecutionStarted {
+            tool_name,
+            arguments,
+            ..
+        } => {
+            println!(
+                "{}",
+                format!(
+                    "* Exec {}({})",
+                    tool_name,
+                    serde_json::to_string(arguments).unwrap_or_default()
+                )
+                .cyan()
+            );
+        }
+        AgentEvent::ToolExecutionEnded { result, .. } => {
+            println!("{}", format!("* Result:\n{}", result).cyan());
+        }
+        _ => {
+            let msg = format!("{}", event);
+            debug!("Ev: {}", msg.dark_yellow());
+        }
+    }
+}
 
-        debug!("Session ended");
-    });
-
-    session.set_system_prompt(system_prompt).await?;
-    session.submit_input(input, images).await?;
-
+/// Renders events until the current turn ends. Ctrl+C cancels the turn
+/// instead of killing the process; the turn then finishes with a
+/// `Cancelled` step and ends normally.
+async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscription) -> Result<()> {
     loop {
         tokio::select! {
-            _ = quit_token.cancelled() => {
-                info!("Quitting...");
-                session.close().await?;
-                break;
+            _ = tokio::signal::ctrl_c() => {
+                info!("Cancelling current turn...");
+                session.cancel_current_turn().await?;
+            }
+            maybe_event = subscription.next() => {
+                let Some(stored) = maybe_event else {
+                    anyhow::bail!("event stream closed unexpectedly");
+                };
+                render_event(&stored.event);
+                if matches!(stored.event, AgentEvent::AgentTurnEnded { .. }) {
+                    println!();
+                    return Ok(());
+                }
             }
         }
     }
+}
 
+async fn oneshot(input: String, images: Vec<String>, user_settings: UserSettings) -> Result<()> {
+    let (mut session, mut subscription) = build_session(&user_settings).await?;
+
+    session.submit_input(input, images).await?;
+    run_turn(&mut session, &mut subscription).await?;
+
+    session.close().await?;
     Ok(())
 }
 
 async fn chat_loop(user_settings: UserSettings) -> Result<()> {
-    let system_prompt = "You are a helpful assistant.".to_string();
-
-    let mut session = AgentSession::build(
-        "test".to_string(),
-        "test".to_string(),
-        AgentConfig {
-            model: user_settings.model.clone(),
-            options: user_settings.options.clone(),
-        },
-    )
-    .await;
-
-    let (turn_ended_tx, mut turn_ended) = tokio::sync::mpsc::channel(2);
-
-    let mut subscription = session.subscribe(None).await?;
-    tokio::spawn(async move {
-        while let Some(event) = subscription.next().await {
-            match event.event {
-                AgentEvent::AssistantMessageTextDelta { delta, .. } => {
-                    print!("{}", delta.green());
-                }
-                AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
-                    print!("{}", delta.blue());
-                }
-
-                AgentEvent::ErrorOccurred { message, .. } => {
-                    eprintln!("{}", message.red());
-                }
-
-                AgentEvent::AgentTurnEnded { .. } => {
-                    turn_ended_tx.send(()).await.unwrap();
-                }
-                AgentEvent::ToolExecutionStarted {
-                    tool_name,
-                    arguments,
-                    ..
-                } => {
-                    println!(
-                        "{}",
-                        format!(
-                            "* Exec {}({})",
-                            tool_name,
-                            serde_json::to_string(&arguments).unwrap()
-                        )
-                        .cyan()
-                    );
-                }
-                AgentEvent::ToolExecutionEnded { result, .. } => {
-                    println!("{}", format!("* Result:\n{}", result).cyan());
-                }
-                _ => {
-                    let msg = format!("{}", event);
-                    debug!("{}", msg.dark_yellow());
-                }
-            }
-        }
-    });
-
-    session.set_system_prompt(system_prompt).await?;
+    let (mut session, mut subscription) = build_session(&user_settings).await?;
 
     let history = Box::new(
         FileBackedHistory::with_file(1000, config::default_history_file()?)
@@ -239,14 +189,11 @@ async fn chat_loop(user_settings: UserSettings) -> Result<()> {
         let sig = reedline.read_line(&prompt);
         match sig {
             Ok(Signal::Success(line)) => {
-                session.submit_input(line, vec![]).await?;
-                loop {
-                    tokio::select! {
-                        _ = turn_ended.recv() => {
-                            break;
-                        }
-                    }
+                if line.trim().is_empty() {
+                    continue;
                 }
+                session.submit_input(line, vec![]).await?;
+                run_turn(&mut session, &mut subscription).await?;
             }
             Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => {
                 session.close().await?;

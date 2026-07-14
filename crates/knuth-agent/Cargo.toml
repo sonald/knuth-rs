@@ -19,4 +19,5 @@ tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 once_cell = { workspace = true }
+encoding_rs = "0.8"
 base64 = "0.22"

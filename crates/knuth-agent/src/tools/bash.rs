@@ -50,7 +50,7 @@ impl AgentTool for BashTool {
 
 static BASH_SCHEMA: Lazy<Tool> = Lazy::new(|| Tool {
     name: "bash".to_string(),
-    description: "Execute a command in the shell".to_string(),
+    description: include_str!("descriptions/bash.md").trim().to_string(),
     parameters: serde_json::json!({
         "type": "object",
         "properties": {

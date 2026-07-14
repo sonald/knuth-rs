@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{
     Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, BashTool,
-    EventLog, ToolOutcome, spawn_actor,
+    EditFileTool, EventLog, PythonTool, ReadFileTool, ToolOutcome, WriteFileTool, spawn_actor,
 };
 use ai::{
     AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
@@ -67,18 +67,24 @@ struct PendingInput {
 
 pub enum AgentActorMessage {
     Command(AgentCommand),
-    Turn(Uuid, TurnMessage),
+    /// A domain event reported by the model step identified by the `Uuid`.
+    /// Committed to the log verbatim; never drives the state machine.
+    Turn(Uuid, AgentEvent),
+    /// Control signal from a step runner: the step is over. The actor derives
+    /// and commits the `ModelStepEnded` domain event itself, then advances the
+    /// turn state machine.
+    StepFinished {
+        step_id: Uuid,
+        reason: ModelStepEndReason,
+        assistant_message: Option<AssistantMessage>,
+    },
+    /// Control signal from a spawned tool task: one tool call completed.
     ToolFinished {
         turn_id: Uuid,
         tool_call_id: String,
         tool_name: String,
         result: String,
     },
-}
-
-#[derive(Debug)]
-pub enum TurnMessage {
-    Event(AgentEvent),
 }
 
 pub enum AgentCommand {
@@ -178,25 +184,22 @@ impl Actor for AgentActor {
                 }
             }
 
-            AgentActorMessage::Turn(
-                _,
-                TurnMessage::Event(AgentEvent::ModelStepEnded {
-                    step_id,
-                    reason,
-                    assistant_message,
-                }),
-            ) => {
+            AgentActorMessage::Turn(_, event) => {
+                if let Err(e) = self.log.commit(event).await {
+                    return self.handle_session_error(e.into()).await;
+                }
+            }
+
+            AgentActorMessage::StepFinished {
+                step_id,
+                reason,
+                assistant_message,
+            } => {
                 if let Err(e) = self
                     .handle_step_ended(step_id, reason, assistant_message, ctx)
                     .await
                 {
                     return self.handle_session_error(e).await;
-                }
-            }
-
-            AgentActorMessage::Turn(_, TurnMessage::Event(event)) => {
-                if let Err(e) = self.log.commit(event).await {
-                    return self.handle_session_error(e.into()).await;
                 }
             }
 
@@ -240,6 +243,10 @@ impl AgentActor {
     pub fn new(session_id: Uuid, config: AgentConfig) -> Self {
         let mut tools = AgentToolRegistry::new();
         tools.register(Arc::new(BashTool {}));
+        tools.register(Arc::new(ReadFileTool {}));
+        tools.register(Arc::new(WriteFileTool {}));
+        tools.register(Arc::new(EditFileTool {}));
+        tools.register(Arc::new(PythonTool {}));
 
         Self {
             id: session_id,
