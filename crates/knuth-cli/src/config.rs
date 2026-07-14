@@ -1,10 +1,10 @@
 use ai::{
-    get_model, Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider,
-    StreamOptions,
+    Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
+    get_model,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env, fs,
@@ -406,11 +406,7 @@ fn env_value(name: &str) -> Option<String> {
 
 fn nonempty(value: String) -> Option<String> {
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn nonempty_str(value: &str) -> Option<String> {

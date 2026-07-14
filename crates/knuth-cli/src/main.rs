@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dotenvy::dotenv;
 use reedline::{DefaultPrompt, Reedline, Signal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use futures::StreamExt;
 use knuth_agent::harness::{AgentConfig, AgentSession};
@@ -12,6 +12,7 @@ use config::UserSettings;
 
 use clap::{Parser, Subcommand};
 use crossterm::style::Stylize;
+use serde_json::Value;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
@@ -23,6 +24,9 @@ struct Args {
 
     #[arg(short('c'), long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    #[arg(long)]
+    print_config: bool,
 
     #[command(subcommand)]
     commands: Commands,
@@ -57,16 +61,18 @@ async fn main() -> Result<()> {
     match args.commands {
         Commands::Chat { input, images } => match input {
             Some(input) => {
-                oneshot(
-                    input,
-                    images.unwrap_or_default(),
-                    model.as_deref(),
-                    config.as_deref(),
-                )
-                .await?;
+                let user_settings = UserSettings::load(model.as_deref(), config.as_deref())?;
+                if args.print_config {
+                    print_effective_config(&user_settings);
+                }
+                oneshot(input, images.unwrap_or_default(), user_settings).await?;
             }
             None => {
-                chat_loop(model.as_deref(), config.as_deref()).await?;
+                let user_settings = UserSettings::load(model.as_deref(), config.as_deref())?;
+                if args.print_config {
+                    print_effective_config(&user_settings);
+                }
+                chat_loop(user_settings).await?;
             }
         },
         Commands::Sessions {} => {
@@ -81,13 +87,7 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-async fn oneshot(
-    input: String,
-    images: Vec<String>,
-    model: Option<&str>,
-    config: Option<&Path>,
-) -> Result<()> {
-    let user_settings = UserSettings::load(model, config)?;
+async fn oneshot(input: String, images: Vec<String>, user_settings: UserSettings) -> Result<()> {
     let system_prompt = "You are a helpful assistant.".to_string();
 
     let mut session = AgentSession::build(
@@ -97,7 +97,8 @@ async fn oneshot(
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
         },
-    ).await;
+    )
+    .await;
 
     let quit_token = tokio_util::sync::CancellationToken::new();
     let quit_token_clone = quit_token.clone();
@@ -122,8 +123,20 @@ async fn oneshot(
                     quit_token_clone.cancel();
                 }
 
-                AgentEvent::ToolExecutionStarted { tool_name, arguments, ..} => {
-                    println!("{}", format!("* ToolRequest {}({})", tool_name, serde_json::to_string(&arguments).unwrap()).cyan());
+                AgentEvent::ToolExecutionStarted {
+                    tool_name,
+                    arguments,
+                    ..
+                } => {
+                    println!(
+                        "{}",
+                        format!(
+                            "* ToolRequest {}({})",
+                            tool_name,
+                            serde_json::to_string(&arguments).unwrap()
+                        )
+                        .cyan()
+                    );
                 }
                 AgentEvent::ToolExecutionEnded { result, .. } => {
                     println!("{}", format!("* Result: {}", result).cyan());
@@ -154,8 +167,7 @@ async fn oneshot(
     Ok(())
 }
 
-async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
-    let user_settings = UserSettings::load(model, config)?;
+async fn chat_loop(user_settings: UserSettings) -> Result<()> {
     let system_prompt = "You are a helpful assistant.".to_string();
 
     let mut session = AgentSession::build(
@@ -165,7 +177,8 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
         },
-    ).await;
+    )
+    .await;
 
     let (turn_ended_tx, mut turn_ended) = tokio::sync::mpsc::channel(2);
 
@@ -187,8 +200,20 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
                 AgentEvent::AgentTurnEnded { .. } => {
                     turn_ended_tx.send(()).await.unwrap();
                 }
-                AgentEvent::ToolExecutionStarted { tool_name, arguments, ..} => {
-                    println!("{}", format!("* Exec {}({})", tool_name, serde_json::to_string(&arguments).unwrap()).cyan());
+                AgentEvent::ToolExecutionStarted {
+                    tool_name,
+                    arguments,
+                    ..
+                } => {
+                    println!(
+                        "{}",
+                        format!(
+                            "* Exec {}({})",
+                            tool_name,
+                            serde_json::to_string(&arguments).unwrap()
+                        )
+                        .cyan()
+                    );
                 }
                 AgentEvent::ToolExecutionEnded { result, .. } => {
                     println!("{}", format!("* Result:\n{}", result).cyan());
@@ -232,15 +257,109 @@ async fn chat_loop(model: Option<&str>, config: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn print_effective_config(settings: &UserSettings) {
+    let model = &settings.model;
+    let options = &settings.options;
+
+    eprintln!("{}", "Effective config".bold());
+    eprintln!("  model: {}", model.id);
+    eprintln!("  name: {}", model.name);
+    eprintln!("  provider: {}", model.provider.0);
+    eprintln!("  api: {}", model.api.0);
+    eprintln!("  base_url: {}", empty_dash(&model.base_url));
+    eprintln!("  context_window: {}", model.context_window);
+    eprintln!("  model_max_tokens: {}", model.max_tokens);
+    eprintln!("  model_reasoning: {}", model.reasoning);
+    eprintln!("  input: {:?}", model.input);
+    eprintln!("  options:");
+    eprintln!("    max_tokens: {}", opt(options.max_tokens));
+    eprintln!("    temperature: {}", opt(options.temperature));
+    eprintln!("    cache_retention: {}", opt(options.cache_retention));
+    eprintln!(
+        "    api_key: {}",
+        redacted_presence(options.api_key.as_deref())
+    );
+    eprintln!("    headers: {}", jsonish(&options.headers));
+    eprintln!("    provider_extras: {}", jsonish(&options.provider_extras));
+}
+
+fn opt<T: std::fmt::Debug>(value: Option<T>) -> String {
+    value
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn empty_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+fn redacted_presence(value: Option<&str>) -> String {
+    match value {
+        Some(value) if !value.is_empty() => format!("<set, {} chars>", value.len()),
+        _ => "-".to_string(),
+    }
+}
+
+fn jsonish<T: serde::Serialize>(value: &T) -> String {
+    let mut value = serde_json::to_value(value).unwrap_or(Value::Null);
+    redact_json_value(&mut value);
+    match value {
+        Value::Null => "-".to_string(),
+        Value::Object(ref map) if map.is_empty() => "-".to_string(),
+        _ => serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
+    }
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key.to_ascii_lowercase().contains("key")
+                    || key.to_ascii_lowercase().contains("token")
+                    || key.to_ascii_lowercase().contains("secret")
+                {
+                    *value = Value::String("<redacted>".to_string());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_json_value),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::Path;
 
     #[test]
     fn parses_config_path() {
         let args = Args::parse_from(["knuth", "--config", "/tmp/knuth.yaml", "chat"]);
 
         assert_eq!(args.config.as_deref(), Some(Path::new("/tmp/knuth.yaml")));
+    }
+
+    #[test]
+    fn parses_print_config() {
+        let args = Args::parse_from(["knuth", "--print-config", "chat"]);
+
+        assert!(args.print_config);
+    }
+
+    #[test]
+    fn redacts_secret_like_json_keys() {
+        let mut value = serde_json::json!({
+            "api_key": "secret",
+            "nested": { "access_token": "token", "safe": "shown" }
+        });
+
+        redact_json_value(&mut value);
+
+        assert_eq!(value["api_key"], "<redacted>");
+        assert_eq!(value["nested"]["access_token"], "<redacted>");
+        assert_eq!(value["nested"]["safe"], "shown");
     }
 }

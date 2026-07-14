@@ -2,13 +2,17 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
-use crate::{Actor, ActorContext, ActorRuntime, AgentTool, AgentStepRunner, BashTool, ToolInput, ToolOutcome, spawn_actor};
+use crate::{
+    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, BashTool, ToolInput,
+    ToolOutcome, spawn_actor,
+};
 use ai::{
-    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolResultMessage, ToolResultRole, UserContent, UserContentBlock, UserMessage, UserRole,
+    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolResultMessage,
+    ToolResultRole, UserContent, UserContentBlock, UserMessage, UserRole,
 };
 use knuth_core::{
     AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore,
-    SessionEndReason, StoredEvent, ModelStepEndReason, UserMessageIntent,
+    ModelStepEndReason, SessionEndReason, StoredEvent, UserMessageIntent,
 };
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{mpsc, oneshot};
@@ -55,10 +59,10 @@ pub enum AgentSessionError {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AgentActorState {
     Idle,
-    Running(CancellationToken),
+    Running(AgentStepRunner),
 }
 
 #[derive(Debug, Default)]
@@ -85,7 +89,13 @@ impl ConversationState {
                 reason,
                 assistant_message: Some(assistant_message),
                 ..
-            } if matches!(reason, ModelStepEndReason::Success | ModelStepEndReason::Length | ModelStepEndReason::ToolUse) => {
+            } if matches!(
+                reason,
+                ModelStepEndReason::Success
+                    | ModelStepEndReason::Length
+                    | ModelStepEndReason::ToolUse
+            ) =>
+            {
                 self.add_message(Message::Assistant(assistant_message));
             }
             AgentEvent::UserMessageCommitted { content, .. } => {
@@ -95,7 +105,11 @@ impl ConversationState {
                     timestamp: event.timestamp.timestamp(),
                 }));
             }
-            AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result,} => {
+            AgentEvent::ToolExecutionEnded {
+                tool_call_id,
+                tool_name,
+                result,
+            } => {
                 debug!("append ToolExecutionEnded event to conversation state");
 
                 let content = vec![UserContentBlock::text(result)];
@@ -189,6 +203,7 @@ pub(crate) struct AgentActor {
     store: Box<dyn EventStore>,
 
     state: AgentActorState,
+    tool_registry: AgentToolRegistry,
 
     pending_input_queue: VecDeque<PendingInput>,
 }
@@ -227,11 +242,18 @@ impl Actor for AgentActor {
                 }
             }
 
-            AgentActorMessage::Turn(_, TurnMessage::Event(AgentEvent::ModelStepEnded {
-                 step_id, reason, assistant_message 
-            })) => {
-                debug!("Model step ended, reason: {:?}", reason);
-                if let Err(e) = self.handle_step_ended(step_id, reason, assistant_message, ctx).await {
+            AgentActorMessage::Turn(
+                _,
+                TurnMessage::Event(AgentEvent::ModelStepEnded {
+                    step_id,
+                    reason,
+                    assistant_message,
+                }),
+            ) => {
+                if let Err(e) = self
+                    .handle_step_ended(step_id, reason, assistant_message, ctx)
+                    .await
+                {
                     return self.handle_session_error(e).await;
                 }
             }
@@ -242,12 +264,7 @@ impl Actor for AgentActor {
                 }
             }
 
-            AgentActorMessage::Turn(
-                _,
-                TurnMessage::Finished { ..},
-            ) => {
-
-            }
+            AgentActorMessage::Turn(_, TurnMessage::Finished { .. }) => {}
         }
         ControlFlow::Continue(())
     }
@@ -274,6 +291,9 @@ impl AgentActor {
     pub fn new(session_id: Uuid, config: AgentConfig) -> Self {
         let store = Box::new(InMemoryEventStore::new());
 
+        let mut tool_registry = AgentToolRegistry::new();
+        tool_registry.register(Box::new(BashTool {}));
+
         Self {
             id: session_id,
             conversation_state: ConversationState::new("".to_string()),
@@ -282,6 +302,7 @@ impl AgentActor {
             state: AgentActorState::Idle,
             store: store,
             pending_input_queue: VecDeque::new(),
+            tool_registry: tool_registry,
         }
     }
 
@@ -290,38 +311,67 @@ impl AgentActor {
             .retain_mut(|s| match s.try_send(event.clone()) {
                 Ok(_) => true,
                 Err(TrySendError::Full(e)) => {
-                    debug!("AgentActor: Failed to send event to subscription: {}, remove subscription", e);
+                    debug!(
+                        "AgentActor: Failed to send event to subscription: {}, remove subscription",
+                        e
+                    );
                     false
                 }
                 Err(TrySendError::Closed(e)) => {
-                    debug!("AgentActor: Subscription closed: {}, remove subscription", e);
+                    debug!(
+                        "AgentActor: Subscription closed: {}, remove subscription",
+                        e
+                    );
                     false
                 }
             });
     }
 
-    async fn execute_tool(&mut self, tool_call_id: String, name: String, arguments: ToolInput) -> Result<(), AgentSessionError> {
-        self.persist_and_publish(AgentEvent::ToolExecutionStarted { tool_call_id: tool_call_id.clone(), tool_name: name.clone(), arguments: arguments.clone() }).await?;
+    async fn execute_tool(
+        &mut self,
+        tool_call_id: String,
+        name: String,
+        arguments: ToolInput,
+        cancel_token: CancellationToken,
+    ) -> Result<(), AgentSessionError> {
+        self.persist_and_publish(AgentEvent::ToolExecutionStarted {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: name.clone(),
+            arguments: arguments.clone(),
+        })
+        .await?;
 
-        if name == BashTool::schema().name {
-            let bash_tool = BashTool {};
-            let result = bash_tool.invoke(arguments).await;
-            let tool_name = BashTool::schema().name;
+        if let Some(tool) = self.tool_registry.get(&name) {
+            let result = tool.invoke(arguments, cancel_token).await;
             debug!("tool result: {:?}", result);
 
+            let tool_name = tool.schema().name.clone();
             match result {
                 Ok(ToolOutcome::Success(result)) => {
                     let result = result.get("output").unwrap().as_str().unwrap().to_string();
-                    self.persist_and_publish(AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result }).await?;
+                    self.persist_and_publish(AgentEvent::ToolExecutionEnded {
+                        tool_call_id,
+                        tool_name,
+                        result,
+                    })
+                    .await?;
                 }
                 Err(e) => {
-                    self.persist_and_publish(AgentEvent::ToolExecutionEnded { tool_call_id, tool_name, result: e.to_string() }).await?;
+                    self.persist_and_publish(AgentEvent::ToolExecutionEnded {
+                        tool_call_id,
+                        tool_name,
+                        result: e.to_string(),
+                    })
+                    .await?;
                 }
             }
         } else {
             self.persist_and_publish(AgentEvent::ToolExecutionEnded {
-                 tool_call_id, tool_name: name.clone(), result: format!("Invalid tool name: {}", name) 
-            }).await?;
+                tool_call_id,
+                tool_name: name.clone(),
+                result: format!("Invalid tool name: {}", name),
+            })
+            .await?;
         }
 
         Ok(())
@@ -350,7 +400,11 @@ impl AgentActor {
         Ok(())
     }
 
-    async fn process_pending_tool_calls(&mut self, assistant_message: &Option<AssistantMessage>) -> Result<(), AgentSessionError> {
+    async fn process_pending_tool_calls(
+        &mut self,
+        assistant_message: &Option<AssistantMessage>,
+        cancel_token: CancellationToken,
+    ) -> Result<(), AgentSessionError> {
         let tool_call_events: Vec<_> = assistant_message
             .as_ref()
             .map(|msg| {
@@ -365,7 +419,13 @@ impl AgentActor {
             .unwrap_or_default();
 
         for e in tool_call_events {
-            self.execute_tool(e.id.clone(), e.name.clone(), e.arguments.clone().into()).await?;
+            self.execute_tool(
+                e.id.clone(),
+                e.name.clone(),
+                e.arguments.clone().into(),
+                cancel_token.clone(),
+            )
+            .await?;
         }
 
         Ok(())
@@ -379,6 +439,7 @@ impl AgentActor {
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         debug!("Model step ended, reason: {:?}", reason);
+        self.state = AgentActorState::Idle;
 
         if let ModelStepEndReason::Error(error) = &reason {
             self.persist_and_publish(AgentEvent::ErrorOccurred {
@@ -391,9 +452,9 @@ impl AgentActor {
         }
 
         let has_tool_call = if let Some(msg) = &assistant_message {
-            msg.content.iter().any(|content| {
-                matches!(content, ContentBlock::ToolCall(_))
-            })
+            msg.content
+                .iter()
+                .any(|content| matches!(content, ContentBlock::ToolCall(_)))
         } else {
             false
         };
@@ -405,15 +466,15 @@ impl AgentActor {
         })
         .await?;
 
-        self.state = AgentActorState::Idle;
-
         if has_tool_call {
-            self.process_pending_tool_calls(&assistant_message).await?;
+            self.process_pending_tool_calls(&assistant_message, ctx.shutdown.child_token())
+                .await?;
             self.continue_step(ctx).await
         } else {
             self.persist_and_publish(AgentEvent::AgentTurnEnded {
                 turn_id: Uuid::now_v7(), //TODO: need to get the turn id from turn start
-            }).await?;
+            })
+            .await?;
 
             self.try_dispatch_next_input(ctx).await
         }
@@ -439,7 +500,11 @@ impl AgentActor {
                 self.persist_and_publish(AgentEvent::SystemPromptSet { prompt: prompt })
                     .await?;
             }
-            AgentCommand::Cancel {} => {}
+            AgentCommand::Cancel {} => {
+                if let AgentActorState::Running(step) = &self.state {
+                    step.cancel().await;
+                }
+            }
         }
 
         Ok(())
@@ -469,11 +534,10 @@ impl AgentActor {
     }
 
     async fn assemble_context(&self) -> Result<ai::Context, AgentSessionError> {
-        let tools = Some(vec![BashTool::schema()]);
         let context = ai::Context {
             system_prompt: Some(self.conversation_state.system_prompt.clone()),
             messages: self.conversation_state.messages.clone(),
-            tools,
+            tools: Some(self.tool_registry.schemas()),
         };
         Ok(context)
     }
@@ -482,7 +546,6 @@ impl AgentActor {
         &mut self,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-
         let context = self.assemble_context().await?;
         debug!("current conversation state: \n{}", self.conversation_state);
         self.spawn_model_step(context, ctx).await?;
@@ -528,22 +591,16 @@ impl AgentActor {
                 "Actor context is not upgraded".to_string(),
             ));
         };
-        let step_cancel = actor_ctx.shutdown.child_token();
 
-        let mut current_step = AgentStepRunner::new(
+        let current_step = AgentStepRunner::new(
             self.config.model.clone(),
             self.config.options.clone(),
             store_tx,
             context,
-            step_cancel.clone(),
-        );
+        )
+        .await;
 
-        tokio::task::spawn(async move {
-            let _ = current_step.start_step().await;
-        });
-
-        self.state = AgentActorState::Running(step_cancel);
-
+        self.state = AgentActorState::Running(current_step);
         Ok(())
     }
 

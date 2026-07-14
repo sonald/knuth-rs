@@ -3,8 +3,8 @@
 pub mod harness;
 pub use harness::*;
 
-pub mod agent_loop;
-pub use agent_loop::*;
+pub mod agent_step;
+pub use agent_step::*;
 
 pub mod actor;
 pub use actor::*;
