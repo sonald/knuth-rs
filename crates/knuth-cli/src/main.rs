@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dotenvy::dotenv;
-use reedline::{DefaultPrompt, Reedline, Signal};
+use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
 use std::path::PathBuf;
 
 use futures::StreamExt;
@@ -228,7 +228,11 @@ async fn chat_loop(user_settings: UserSettings) -> Result<()> {
 
     session.set_system_prompt(system_prompt).await?;
 
-    let mut reedline = Reedline::create();
+    let history = Box::new(
+        FileBackedHistory::with_file(1000, config::default_history_file()?)
+            .context("failed to initialize command history")?,
+    );
+    let mut reedline = Reedline::create().with_history(history);
     let prompt = DefaultPrompt::default();
 
     loop {

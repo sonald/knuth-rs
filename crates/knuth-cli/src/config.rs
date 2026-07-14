@@ -13,6 +13,7 @@ use std::{
 
 const CONFIG_DIR_NAME: &str = "knuth";
 const CONFIG_FILE_NAME: &str = "knuth.yaml";
+const HISTORY_FILE_NAME: &str = "history.txt";
 const AUTH_FILE_NAME: &str = "auth.json";
 const CODEX_ACCOUNT_EXTRA: &str = "chatgpt_account_id";
 
@@ -105,6 +106,10 @@ fn default_config_dir() -> Result<PathBuf> {
     platform_config_base()
         .map(|base| base.join(CONFIG_DIR_NAME))
         .ok_or_else(|| anyhow!("could not determine user config directory"))
+}
+
+pub fn default_history_file() -> Result<PathBuf> {
+    default_config_dir().map(|dir| dir.join(HISTORY_FILE_NAME))
 }
 
 fn platform_config_base() -> Option<PathBuf> {
