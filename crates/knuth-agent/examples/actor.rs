@@ -3,15 +3,13 @@ use knuth_agent::actor::*;
 use std::ops::ControlFlow;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 #[derive(Error, Debug)]
 enum MyError {
-    #[error("Failed to receive reply")]
-    FailedToReceiveReply(#[from] oneshot::error::RecvError),
-    #[error("Failed to send message")]
-    FailedToSendMessage(#[from] mpsc::error::SendError<ActorMessage>),
+    #[error("Actor unreachable: {0}")]
+    Ask(#[from] AskError),
 }
 
 struct MyActor {
@@ -68,12 +66,10 @@ impl MyActorHandle {
     }
 
     async fn get_unique_id(&self) -> Result<u32, MyError> {
-        let (tx, rx) = oneshot::channel();
-        self.handle
-            .send(ActorMessage::GetUniqueId { reply: tx })
-            .await?;
-        let id = rx.await?;
-        Ok(id)
+        Ok(self
+            .handle
+            .ask(|reply| ActorMessage::GetUniqueId { reply })
+            .await?)
     }
 }
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -11,8 +11,18 @@ pub struct ActorContext<M> {
 }
 
 impl<M> ActorContext<M> {
-    pub fn ugprade(&self) -> Option<mpsc::Sender<M>> {
+    pub fn upgrade(&self) -> Option<mpsc::Sender<M>> {
         self.self_tx.upgrade()
+    }
+}
+
+/// Build a detached `ActorContext` for unit-testing `handle`/`on_stop` without a runtime.
+#[cfg(test)]
+pub(crate) fn test_actor_context<M>() -> ActorContext<M> {
+    let (tx, _rx) = mpsc::channel(1);
+    ActorContext {
+        self_tx: tx.downgrade(),
+        shutdown: CancellationToken::new(),
     }
 }
 
@@ -34,9 +44,18 @@ pub struct ActorHandle<M> {
     tx: mpsc::Sender<M>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AskError {
+    #[error("Mailbox send error")]
+    MailboxSendError,
+
+    #[error("actor dropped the reply channel")]
+    ReplyDropped,
+}
+
 impl<M> ActorHandle<M> {
-    pub async fn send(&self, message: M) -> Result<(), mpsc::error::SendError<M>> {
-        self.tx.send(message).await
+    pub async fn send(&self, message: M) -> Result<(), AskError> {
+        self.tx.send(message).await.map_err(|_| AskError::MailboxSendError)
     }
 
     pub fn addr(&self) -> ActorHandle<M> {
@@ -44,9 +63,16 @@ impl<M> ActorHandle<M> {
             tx: self.tx.clone(),
         }
     }
-}
 
-impl<A: Actor> ActorHandle<A> {}
+    pub async fn ask<R>(&self, build_msg: impl FnOnce(oneshot::Sender<R>) -> M) -> Result<R, AskError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(build_msg(reply))
+            .await?;
+
+        receiver.await.map_err(|_| AskError::ReplyDropped)
+    }
+
+}
 
 #[derive(Debug)]
 pub struct ActorRuntime<M> {

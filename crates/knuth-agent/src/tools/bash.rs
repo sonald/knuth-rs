@@ -1,28 +1,10 @@
-use std::collections::HashMap;
-
 use ai::Tool;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-pub type ToolInput = serde_json::Map<String, serde_json::Value>;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ToolOutcome {
-    Success(serde_json::Value),
-}
-
-#[async_trait]
-pub trait AgentTool: Send + Sync {
-    fn schema(&self) -> &Tool;
-    async fn invoke(
-        &self,
-        input: ToolInput,
-        cancel_token: CancellationToken,
-    ) -> Result<ToolOutcome, String>;
-}
+use super::{AgentTool, ToolInput, ToolOutcome};
 
 pub struct BashTool {}
 
@@ -76,36 +58,6 @@ static BASH_SCHEMA: Lazy<Tool> = Lazy::new(|| Tool {
         }
     }),
 });
-
-pub struct AgentToolRegistry {
-    tools: HashMap<String, Box<dyn AgentTool>>,
-}
-
-impl std::fmt::Debug for AgentToolRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AgentToolRegistry {{ tools: {:?} }}", self.tools.keys().collect::<Vec<&String>>())
-    }
-}
-
-impl AgentToolRegistry {
-    pub fn new() -> Self {
-        Self {
-            tools: HashMap::new(),
-        }
-    }
-
-    pub fn register(&mut self, tool: Box<dyn AgentTool>) {  
-        self.tools.insert(tool.schema().name.clone(), tool);
-    }
-
-    pub fn get(&self, tool_name: &str) -> Option<&dyn AgentTool> {
-        self.tools.get(tool_name).map(Box::as_ref)
-    }
-
-    pub fn schemas(&self) -> Vec<Tool> {
-        self.tools.values().map(|tool| tool.schema().clone()).collect()
-    }
-}
 
 #[cfg(test)]
 mod tests {

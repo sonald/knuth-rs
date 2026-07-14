@@ -4,7 +4,7 @@ use ai::{AssistantMessage, DoneReason, Model, StreamOptions, stream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use knuth_core::{AgentEvent, ModelStepEndReason};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -23,7 +23,6 @@ pub enum AgentStepError {
 pub enum AgentStepActorMessage {
     StreamEvent(ai::AssistantMessageEvent),
     StreamEnded,
-    GetStepId(oneshot::Sender<Uuid>),
     Cancel,
 }
 
@@ -49,7 +48,7 @@ impl Actor for AgentStepActor {
             }))
             .await;
 
-        let Some(tx) = ctx.ugprade() else { return };
+        let Some(tx) = ctx.upgrade() else { return };
 
         let shutdown = ctx.shutdown.clone();
         let context = self.context.clone();
@@ -64,7 +63,9 @@ impl Actor for AgentStepActor {
                     event = stream.next() => {
                         match event {
                             Some(event) => {
-                                let _ = tx.send(AgentStepActorMessage::StreamEvent(event)).await;
+                                if tx.send(AgentStepActorMessage::StreamEvent(event)).await.is_err() {
+                                    break;
+                                }
                             }
                             None => {
                                 let _ = tx.send(AgentStepActorMessage::StreamEnded).await;
@@ -90,20 +91,25 @@ impl Actor for AgentStepActor {
                     ControlFlow::Break(())
                 }
             },
-            AgentStepActorMessage::StreamEnded => ControlFlow::Break(()),
+            AgentStepActorMessage::StreamEnded => {
+                // A stream that closes without a Done (or Error) event is a broken
+                // stream, not a successful step.
+                if self.assistant_message.is_none() {
+                    self.step_reason = ModelStepEndReason::Error(
+                        "stream ended without a Done event".to_string(),
+                    );
+                }
+                ControlFlow::Break(())
+            }
             AgentStepActorMessage::Cancel => {
                 self.step_reason = ModelStepEndReason::Cancelled;
                 ControlFlow::Break(())
-            }
-            AgentStepActorMessage::GetStepId(tx) => {
-                let _ = tx.send(self.step_id.clone());
-                ControlFlow::Continue(())
             }
         }
     }
 
     async fn on_stop(&mut self, ctx: &mut ActorContext<Self::Message>) {
-        if ctx.shutdown.is_cancelled() {
+        if ctx.shutdown.is_cancelled() && self.assistant_message.is_none() {
             self.step_reason = ModelStepEndReason::Cancelled;
         }
 
@@ -123,13 +129,14 @@ impl AgentStepActor {
         options: StreamOptions,
         store_tx: mpsc::Sender<AgentActorMessage>,
         context: ai::Context,
+        step_id: Uuid,
     ) -> Self {
         Self {
             model,
             options,
             store_tx,
             context,
-            step_id: Uuid::now_v7(),
+            step_id,
             step_reason: ModelStepEndReason::Success,
             assistant_message: None,
         }
@@ -241,6 +248,7 @@ impl AgentStepActor {
 
 #[derive(Debug)]
 pub struct AgentStepRunner {
+    step_id: Uuid,
     step_runtime: ActorRuntime<AgentStepActorMessage>,
 }
 
@@ -251,20 +259,21 @@ impl AgentStepRunner {
         store_tx: mpsc::Sender<AgentActorMessage>,
         context: ai::Context,
     ) -> Self {
-        let step_runtime =
-            spawn_actor(AgentStepActor::new(model, options, store_tx, context), 100).await;
+        let step_id = Uuid::now_v7();
+        let step_runtime = spawn_actor(
+            AgentStepActor::new(model, options, store_tx, context, step_id),
+            100,
+        )
+        .await;
 
-        Self { step_runtime }
+        Self {
+            step_id,
+            step_runtime,
+        }
     }
 
-    pub async fn step_id(&self) -> Uuid {
-        let (tx, rx) = oneshot::channel();
-        self.step_runtime
-            .handle()
-            .send(AgentStepActorMessage::GetStepId(tx))
-            .await
-            .unwrap();
-        rx.await.expect("GetStepId should not block")
+    pub fn step_id(&self) -> Uuid {
+        self.step_id
     }
 
     pub async fn cancel(&self) {
@@ -333,6 +342,7 @@ mod tests {
                 messages: vec![],
                 tools: None,
             },
+            Uuid::now_v7(),
         )
     }
 
@@ -386,6 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_step_emits_started_and_ended_with_length_reason() {
+        let _guard = crate::test_support::faux_lock();
         clear_faux_responses();
         let (tx, mut rx) = mpsc::channel(16);
         let message = mk_message(StopReason::Length, vec![ContentBlock::text("partial")]);
@@ -418,7 +429,6 @@ mod tests {
                 break;
             }
         }
-        runner.step_runtime.shutdown().await;
         clear_faux_responses();
 
         let expected_step_id = match messages.first().expect("expected actor messages") {
@@ -433,6 +443,8 @@ mod tests {
             }
             _ => panic!("first message should be ModelStepStarted"),
         };
+        // step_id stays readable after the actor has exited.
+        assert_eq!(runner.step_id(), expected_step_id);
 
         for message in &messages {
             match message {
@@ -446,10 +458,8 @@ mod tests {
                         _ => {}
                     }
                 }
-                AgentActorMessage::Turn(_, TurnMessage::Finished { .. }) => {
-                    panic!("unexpected TurnMessage::Finished");
-                }
                 AgentActorMessage::Command(_) => panic!("unexpected actor command"),
+                AgentActorMessage::ToolFinished { .. } => panic!("unexpected ToolFinished"),
             }
         }
 
@@ -491,5 +501,102 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn recv_step_ended(
+        rx: &mut mpsc::Receiver<AgentActorMessage>,
+    ) -> (ModelStepEndReason, Option<AssistantMessage>) {
+        loop {
+            match rx.try_recv().expect("expected a ModelStepEnded event") {
+                AgentActorMessage::Turn(
+                    _,
+                    TurnMessage::Event(AgentEvent::ModelStepEnded {
+                        reason,
+                        assistant_message,
+                        ..
+                    }),
+                ) => return (reason, assistant_message),
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_ended_without_done_reports_error() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut step = mk_actor(tx);
+        let mut ctx = test_actor_context();
+
+        let flow = step.handle(AgentStepActorMessage::StreamEnded, &mut ctx).await;
+
+        assert!(flow.is_break());
+        assert!(matches!(step.step_reason, ModelStepEndReason::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn stream_ended_after_done_keeps_done_reason() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut step = mk_actor(tx);
+        let mut ctx = test_actor_context();
+
+        step.handle_event(AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message: mk_message(StopReason::Stop, vec![ContentBlock::text("done")]),
+        })
+        .await
+        .unwrap();
+        let flow = step.handle(AgentStepActorMessage::StreamEnded, &mut ctx).await;
+
+        assert!(flow.is_break());
+        assert_eq!(step.step_reason, ModelStepEndReason::Success);
+    }
+
+    #[tokio::test]
+    async fn cancel_message_breaks_with_cancelled_reason() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut step = mk_actor(tx);
+        let mut ctx = test_actor_context();
+
+        let flow = step.handle(AgentStepActorMessage::Cancel, &mut ctx).await;
+
+        assert!(flow.is_break());
+        assert_eq!(step.step_reason, ModelStepEndReason::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_done_reports_cancelled() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut step = mk_actor(tx);
+        let mut ctx = test_actor_context();
+        ctx.shutdown.cancel();
+
+        step.on_stop(&mut ctx).await;
+
+        let (reason, assistant_message) = recv_step_ended(&mut rx);
+        assert_eq!(reason, ModelStepEndReason::Cancelled);
+        assert!(assistant_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_done_keeps_completed_reason() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut step = mk_actor(tx);
+        step.handle_event(AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message: mk_message(StopReason::Stop, vec![ContentBlock::text("done")]),
+        })
+        .await
+        .unwrap();
+        let mut ctx = test_actor_context();
+        ctx.shutdown.cancel();
+
+        step.on_stop(&mut ctx).await;
+
+        let (reason, assistant_message) = recv_step_ended(&mut rx);
+        assert_eq!(reason, ModelStepEndReason::Success);
+        assert_eq!(
+            assistant_message.expect("completed step keeps its message").stop_reason,
+            StopReason::Stop
+        );
     }
 }

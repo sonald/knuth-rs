@@ -1,24 +1,27 @@
 use async_trait::async_trait;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::{
-    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, BashTool, ToolInput,
-    ToolOutcome, spawn_actor,
+    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, BashTool,
+    EventLog, ToolOutcome, spawn_actor,
 };
 use ai::{
-    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolResultMessage,
-    ToolResultRole, UserContent, UserContentBlock, UserMessage, UserRole,
+    AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
+    UserContentBlock,
 };
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStore, EventStoreError, InMemoryEventStore,
-    ModelStepEndReason, SessionEndReason, StoredEvent, UserMessageIntent,
+    AgentEvent, AgentSubscription, EventStoreError, InMemoryEventStore, ModelStepEndReason,
+    SessionEndReason, UserMessageIntent,
 };
-use tokio::sync::mpsc::error::{SendError, TrySendError};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
+
+const SUBSCRIPTION_BUFFER: usize = 100;
 
 #[derive(Debug)]
 pub struct AgentConfig {
@@ -43,12 +46,6 @@ pub enum AgentSessionError {
     #[error("Failed to send event to store: {0}")]
     ChannelSendError(#[from] SendError<AgentEvent>),
 
-    #[error("Failed to send command to actor: {0}")]
-    ActorSendError(#[from] mpsc::error::SendError<AgentActorMessage>),
-
-    #[error("Failed to receive reply: {0}")]
-    OneshotRecvError(#[from] oneshot::error::RecvError),
-
     #[error("Actor task failed: {0}")]
     ActorTaskFailed(#[from] tokio::task::JoinError),
 
@@ -57,93 +54,9 @@ pub enum AgentSessionError {
         path: String,
         source: std::io::Error,
     },
-}
 
-#[derive(Debug)]
-pub enum AgentActorState {
-    Idle,
-    Running(AgentStepRunner),
-}
-
-#[derive(Debug, Default)]
-struct ConversationState {
-    messages: Vec<Message>,
-    system_prompt: String,
-}
-
-impl ConversationState {
-    fn new(system_prompt: String) -> Self {
-        Self {
-            messages: vec![],
-            system_prompt: system_prompt,
-        }
-    }
-
-    fn add_message(&mut self, message: Message) {
-        self.messages.push(message);
-    }
-
-    pub fn apply_event(&mut self, event: StoredEvent) {
-        match event.event {
-            AgentEvent::ModelStepEnded {
-                reason,
-                assistant_message: Some(assistant_message),
-                ..
-            } if matches!(
-                reason,
-                ModelStepEndReason::Success
-                    | ModelStepEndReason::Length
-                    | ModelStepEndReason::ToolUse
-            ) =>
-            {
-                self.add_message(Message::Assistant(assistant_message));
-            }
-            AgentEvent::UserMessageCommitted { content, .. } => {
-                self.add_message(Message::User(UserMessage {
-                    role: UserRole::User,
-                    content: content,
-                    timestamp: event.timestamp.timestamp(),
-                }));
-            }
-            AgentEvent::ToolExecutionEnded {
-                tool_call_id,
-                tool_name,
-                result,
-            } => {
-                debug!("append ToolExecutionEnded event to conversation state");
-
-                let content = vec![UserContentBlock::text(result)];
-                self.add_message(Message::ToolResult(ToolResultMessage {
-                    role: ToolResultRole::ToolResult,
-                    tool_call_id,
-                    tool_name,
-                    content,
-                    details: None,
-                    is_error: false,
-                    timestamp: event.timestamp.timestamp(),
-                }));
-            }
-            AgentEvent::SystemPromptSet { prompt } => {
-                self.system_prompt = prompt;
-            }
-            _ => {}
-        }
-    }
-}
-
-impl std::fmt::Display for ConversationState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ConversationState (system_prompt: {} chars, {} messages)",
-            self.system_prompt.len(),
-            self.messages.len()
-        )?;
-        for (i, message) in self.messages.iter().enumerate() {
-            write!(f, "\n  [{i}] {message}")?;
-        }
-        Ok(())
-    }
+    #[error("command failed: {0}")]
+    AskError(#[from] AskError),
 }
 
 #[derive(Debug)]
@@ -155,15 +68,17 @@ struct PendingInput {
 pub enum AgentActorMessage {
     Command(AgentCommand),
     Turn(Uuid, TurnMessage),
+    ToolFinished {
+        turn_id: Uuid,
+        tool_call_id: String,
+        tool_name: String,
+        result: String,
+    },
 }
 
 #[derive(Debug)]
 pub enum TurnMessage {
     Event(AgentEvent),
-    Finished {
-        reason: ModelStepEndReason,
-        assistant_message: Option<AssistantMessage>,
-    },
 }
 
 pub enum AgentCommand {
@@ -192,19 +107,39 @@ impl std::fmt::Display for AgentCommand {
     }
 }
 
-/// internal actor for the agent session
+/// Lifecycle of the turn currently being processed. `turn_id` is minted when
+/// an input is dispatched and carried through every phase, so
+/// `AgentTurnStarted`/`AgentTurnEnded` always refer to the same turn.
+#[derive(Debug)]
+enum TurnState {
+    Idle,
+    /// A model step is streaming.
+    Streaming { turn_id: Uuid, step: AgentStepRunner },
+    /// Tool calls from the last step are executing in background tasks;
+    /// `pending` holds the tool_call_ids we are still waiting on.
+    RunningTools {
+        turn_id: Uuid,
+        pending: HashSet<String>,
+        cancel: CancellationToken,
+    },
+}
+
+/// Internal actor for the agent session.
+///
+/// Owns turn orchestration only: queueing inputs, driving the
+/// idle → streaming → running-tools state machine, and reacting to step/tool
+/// completion. Persistence + projection + fan-out live in [`EventLog`]; tool
+/// lookup lives in [`AgentToolRegistry`]; model streaming lives in
+/// [`AgentStepRunner`].
 #[derive(Debug)]
 pub(crate) struct AgentActor {
     id: Uuid,
-    conversation_state: ConversationState,
     config: AgentConfig,
 
-    subscriptions: Vec<mpsc::Sender<StoredEvent>>,
-    store: Box<dyn EventStore>,
+    log: EventLog,
+    tools: AgentToolRegistry,
 
-    state: AgentActorState,
-    tool_registry: AgentToolRegistry,
-
+    turn: TurnState,
     pending_input_queue: VecDeque<PendingInput>,
 }
 
@@ -214,7 +149,8 @@ impl Actor for AgentActor {
 
     async fn on_start(&mut self, ctx: &mut ActorContext<Self::Message>) {
         match self
-            .persist_and_publish(AgentEvent::SessionStarted {
+            .log
+            .commit(AgentEvent::SessionStarted {
                 session_id: self.id,
             })
             .await
@@ -259,12 +195,24 @@ impl Actor for AgentActor {
             }
 
             AgentActorMessage::Turn(_, TurnMessage::Event(event)) => {
-                if let Err(e) = self.persist_and_publish(event.clone()).await {
-                    return self.handle_session_error(e).await;
+                if let Err(e) = self.log.commit(event).await {
+                    return self.handle_session_error(e.into()).await;
                 }
             }
 
-            AgentActorMessage::Turn(_, TurnMessage::Finished { .. }) => {}
+            AgentActorMessage::ToolFinished {
+                turn_id,
+                tool_call_id,
+                tool_name,
+                result,
+            } => {
+                if let Err(e) = self
+                    .handle_tool_finished(turn_id, tool_call_id, tool_name, result, ctx)
+                    .await
+                {
+                    return self.handle_session_error(e).await;
+                }
+            }
         }
         ControlFlow::Continue(())
     }
@@ -272,7 +220,8 @@ impl Actor for AgentActor {
     async fn on_stop(&mut self, _ctx: &mut ActorContext<Self::Message>) {
         //TODO: reason comes from handle() break result
         match self
-            .persist_and_publish(AgentEvent::SessionEnded {
+            .log
+            .commit(AgentEvent::SessionEnded {
                 reason: SessionEndReason::Success,
             })
             .await
@@ -289,92 +238,17 @@ impl Actor for AgentActor {
 
 impl AgentActor {
     pub fn new(session_id: Uuid, config: AgentConfig) -> Self {
-        let store = Box::new(InMemoryEventStore::new());
-
-        let mut tool_registry = AgentToolRegistry::new();
-        tool_registry.register(Box::new(BashTool {}));
+        let mut tools = AgentToolRegistry::new();
+        tools.register(Arc::new(BashTool {}));
 
         Self {
             id: session_id,
-            conversation_state: ConversationState::new("".to_string()),
-            config: config,
-            subscriptions: Vec::new(),
-            state: AgentActorState::Idle,
-            store: store,
+            config,
+            log: EventLog::new(Box::new(InMemoryEventStore::new())),
+            tools,
+            turn: TurnState::Idle,
             pending_input_queue: VecDeque::new(),
-            tool_registry: tool_registry,
         }
-    }
-
-    fn notify_subscriptions(&mut self, event: StoredEvent) {
-        self.subscriptions
-            .retain_mut(|s| match s.try_send(event.clone()) {
-                Ok(_) => true,
-                Err(TrySendError::Full(e)) => {
-                    debug!(
-                        "AgentActor: Failed to send event to subscription: {}, remove subscription",
-                        e
-                    );
-                    false
-                }
-                Err(TrySendError::Closed(e)) => {
-                    debug!(
-                        "AgentActor: Subscription closed: {}, remove subscription",
-                        e
-                    );
-                    false
-                }
-            });
-    }
-
-    async fn execute_tool(
-        &mut self,
-        tool_call_id: String,
-        name: String,
-        arguments: ToolInput,
-        cancel_token: CancellationToken,
-    ) -> Result<(), AgentSessionError> {
-        self.persist_and_publish(AgentEvent::ToolExecutionStarted {
-            tool_call_id: tool_call_id.clone(),
-            tool_name: name.clone(),
-            arguments: arguments.clone(),
-        })
-        .await?;
-
-        if let Some(tool) = self.tool_registry.get(&name) {
-            let result = tool.invoke(arguments, cancel_token).await;
-            debug!("tool result: {:?}", result);
-
-            let tool_name = tool.schema().name.clone();
-            match result {
-                Ok(ToolOutcome::Success(result)) => {
-                    let result = result.get("output").unwrap().as_str().unwrap().to_string();
-                    self.persist_and_publish(AgentEvent::ToolExecutionEnded {
-                        tool_call_id,
-                        tool_name,
-                        result,
-                    })
-                    .await?;
-                }
-                Err(e) => {
-                    self.persist_and_publish(AgentEvent::ToolExecutionEnded {
-                        tool_call_id,
-                        tool_name,
-                        result: e.to_string(),
-                    })
-                    .await?;
-                }
-            }
-        } else {
-            self.persist_and_publish(AgentEvent::ToolExecutionEnded {
-                tool_call_id,
-                tool_name: name.clone(),
-                result: format!("Invalid tool name: {}", name),
-            })
-            .await?;
-        }
-
-        Ok(())
     }
 
     async fn handle_session_error(&mut self, error: AgentSessionError) -> ControlFlow<()> {
@@ -382,101 +256,14 @@ impl AgentActor {
             AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
             e => {
                 let _ = self
-                    .persist_and_publish(AgentEvent::ErrorOccurred {
+                    .log
+                    .commit(AgentEvent::ErrorOccurred {
                         message: e.to_string(),
                         details: None,
                     })
                     .await;
                 ControlFlow::Continue(())
             }
-        }
-    }
-
-    async fn persist_and_publish(&mut self, event: AgentEvent) -> Result<(), AgentSessionError> {
-        let stored = self.store.append(event.clone()).await?;
-        self.conversation_state.apply_event(stored.clone());
-        self.notify_subscriptions(stored);
-
-        Ok(())
-    }
-
-    async fn process_pending_tool_calls(
-        &mut self,
-        assistant_message: &Option<AssistantMessage>,
-        cancel_token: CancellationToken,
-    ) -> Result<(), AgentSessionError> {
-        let tool_call_events: Vec<_> = assistant_message
-            .as_ref()
-            .map(|msg| {
-                msg.content
-                    .iter()
-                    .filter_map(|content| match content {
-                        ContentBlock::ToolCall(tool_call) => Some(tool_call),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for e in tool_call_events {
-            self.execute_tool(
-                e.id.clone(),
-                e.name.clone(),
-                e.arguments.clone().into(),
-                cancel_token.clone(),
-            )
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn handle_step_ended(
-        &mut self,
-        step_id: Uuid,
-        reason: ModelStepEndReason,
-        assistant_message: Option<AssistantMessage>,
-        ctx: &mut ActorContext<AgentActorMessage>,
-    ) -> Result<(), AgentSessionError> {
-        debug!("Model step ended, reason: {:?}", reason);
-        self.state = AgentActorState::Idle;
-
-        if let ModelStepEndReason::Error(error) = &reason {
-            self.persist_and_publish(AgentEvent::ErrorOccurred {
-                message: error.to_string(),
-                details: None,
-            })
-            .await?;
-            debug!("Error occurred in model step: {:?}", error);
-            return Ok(());
-        }
-
-        let has_tool_call = if let Some(msg) = &assistant_message {
-            msg.content
-                .iter()
-                .any(|content| matches!(content, ContentBlock::ToolCall(_)))
-        } else {
-            false
-        };
-
-        self.persist_and_publish(AgentEvent::ModelStepEnded {
-            step_id,
-            reason: reason.clone(),
-            assistant_message: assistant_message.clone(),
-        })
-        .await?;
-
-        if has_tool_call {
-            self.process_pending_tool_calls(&assistant_message, ctx.shutdown.child_token())
-                .await?;
-            self.continue_step(ctx).await
-        } else {
-            self.persist_and_publish(AgentEvent::AgentTurnEnded {
-                turn_id: Uuid::now_v7(), //TODO: need to get the turn id from turn start
-            })
-            .await?;
-
-            self.try_dispatch_next_input(ctx).await
         }
     }
 
@@ -497,14 +284,15 @@ impl AgentActor {
             }
             AgentCommand::Subscribe { reply, from_seq } => self.subscribe(reply, from_seq).await?,
             AgentCommand::SetSystemPrompt(prompt) => {
-                self.persist_and_publish(AgentEvent::SystemPromptSet { prompt: prompt })
+                self.log
+                    .commit(AgentEvent::SystemPromptSet { prompt })
                     .await?;
             }
-            AgentCommand::Cancel {} => {
-                if let AgentActorState::Running(step) = &self.state {
-                    step.cancel().await;
-                }
-            }
+            AgentCommand::Cancel {} => match &self.turn {
+                TurnState::Idle => {}
+                TurnState::Streaming { step, .. } => step.cancel().await,
+                TurnState::RunningTools { cancel, .. } => cancel.cancel(),
+            },
         }
 
         Ok(())
@@ -525,30 +313,8 @@ impl AgentActor {
             }
             UserContent::Blocks(v)
         };
-        self.pending_input_queue.push_back(PendingInput {
-            content,
-            intent: intent,
-        });
+        self.pending_input_queue.push_back(PendingInput { content, intent });
         self.try_dispatch_next_input(ctx).await?;
-        Ok(())
-    }
-
-    async fn assemble_context(&self) -> Result<ai::Context, AgentSessionError> {
-        let context = ai::Context {
-            system_prompt: Some(self.conversation_state.system_prompt.clone()),
-            messages: self.conversation_state.messages.clone(),
-            tools: Some(self.tool_registry.schemas()),
-        };
-        Ok(context)
-    }
-
-    async fn continue_step(
-        &mut self,
-        ctx: &mut ActorContext<AgentActorMessage>,
-    ) -> Result<(), AgentSessionError> {
-        let context = self.assemble_context().await?;
-        debug!("current conversation state: \n{}", self.conversation_state);
-        self.spawn_model_step(context, ctx).await?;
         Ok(())
     }
 
@@ -556,7 +322,7 @@ impl AgentActor {
         &mut self,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        if matches!(self.state, AgentActorState::Running(_)) {
+        if !matches!(self.turn, TurnState::Idle) {
             return Ok(());
         }
 
@@ -564,44 +330,251 @@ impl AgentActor {
             return Ok(());
         };
 
-        self.persist_and_publish(AgentEvent::AgentTurnStarted {
-            turn_id: Uuid::now_v7(),
-        })
-        .await?;
+        let turn_id = Uuid::now_v7();
+        self.log
+            .commit(AgentEvent::AgentTurnStarted { turn_id })
+            .await?;
+        self.log
+            .commit(AgentEvent::UserMessageCommitted {
+                content: input.content,
+                intent: input.intent,
+            })
+            .await?;
 
-        self.persist_and_publish(AgentEvent::UserMessageCommitted {
-            content: input.content,
-            intent: input.intent,
-        })
-        .await?;
+        self.continue_step(turn_id, ctx).await
+    }
 
-        let context = self.assemble_context().await?;
-        debug!("current conversation state: \n{}", self.conversation_state);
-        self.spawn_model_step(context, ctx).await?;
+    /// Runs the next model step of `turn_id` against the current conversation.
+    async fn continue_step(
+        &mut self,
+        turn_id: Uuid,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        let step = self.spawn_model_step(ctx).await?;
+        self.turn = TurnState::Streaming { turn_id, step };
         Ok(())
+    }
+
+    async fn handle_step_ended(
+        &mut self,
+        step_id: Uuid,
+        reason: ModelStepEndReason,
+        assistant_message: Option<AssistantMessage>,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        debug!("Model step ended, reason: {:?}", reason);
+
+        let turn_id = match std::mem::replace(&mut self.turn, TurnState::Idle) {
+            TurnState::Streaming { turn_id, .. } => turn_id,
+            other => {
+                // A step we no longer track (e.g. raced with shutdown): record
+                // the event but leave the state machine alone.
+                self.turn = other;
+                debug!("step {step_id} ended outside Streaming state");
+                self.log
+                    .commit(AgentEvent::ModelStepEnded {
+                        step_id,
+                        reason,
+                        assistant_message,
+                    })
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        self.log
+            .commit(AgentEvent::ModelStepEnded {
+                step_id,
+                reason: reason.clone(),
+                assistant_message: assistant_message.clone(),
+            })
+            .await?;
+
+        let tool_calls: Vec<ToolCall> = assistant_message
+            .as_ref()
+            .map(|msg| {
+                msg.content
+                    .iter()
+                    .filter_map(|content| match content {
+                        ContentBlock::ToolCall(tool_call) => Some(tool_call.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        match reason {
+            ModelStepEndReason::Error(error) => {
+                self.log
+                    .commit(AgentEvent::ErrorOccurred {
+                        message: error,
+                        details: None,
+                    })
+                    .await?;
+                self.end_turn(turn_id, ctx).await
+            }
+            ModelStepEndReason::Cancelled => self.end_turn(turn_id, ctx).await,
+            _ if !tool_calls.is_empty() => self.spawn_tools(turn_id, tool_calls, ctx).await,
+            _ => self.end_turn(turn_id, ctx).await,
+        }
+    }
+
+    /// Spawns one background task per tool call; each reports back with a
+    /// `ToolFinished` message so the actor stays responsive (e.g. to `Cancel`)
+    /// while tools run.
+    async fn spawn_tools(
+        &mut self,
+        turn_id: Uuid,
+        tool_calls: Vec<ToolCall>,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        let Some(self_tx) = ctx.upgrade() else {
+            return Err(AgentSessionError::InvalidState(
+                "actor mailbox is gone".to_string(),
+            ));
+        };
+        let cancel = ctx.shutdown.child_token();
+        let mut pending = HashSet::new();
+
+        for call in tool_calls {
+            self.log
+                .commit(AgentEvent::ToolExecutionStarted {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .await?;
+
+            let Some(tool) = self.tools.get(&call.name) else {
+                self.log
+                    .commit(AgentEvent::ToolExecutionEnded {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        result: format!("Invalid tool name: {}", call.name),
+                    })
+                    .await?;
+                continue;
+            };
+
+            pending.insert(call.id.clone());
+            let tx = self_tx.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let result = match tool.invoke(call.arguments, cancel).await {
+                    Ok(ToolOutcome::Success(value)) => value
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string()),
+                    Err(e) => e,
+                };
+                let _ = tx
+                    .send(AgentActorMessage::ToolFinished {
+                        turn_id,
+                        tool_call_id: call.id,
+                        tool_name: call.name,
+                        result,
+                    })
+                    .await;
+            });
+        }
+
+        if pending.is_empty() {
+            // Every call had an unknown tool name; their error results are
+            // already committed, so go straight back to the model.
+            self.continue_step(turn_id, ctx).await
+        } else {
+            self.turn = TurnState::RunningTools {
+                turn_id,
+                pending,
+                cancel,
+            };
+            Ok(())
+        }
+    }
+
+    async fn handle_tool_finished(
+        &mut self,
+        turn_id: Uuid,
+        tool_call_id: String,
+        tool_name: String,
+        result: String,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        self.log
+            .commit(AgentEvent::ToolExecutionEnded {
+                tool_call_id: tool_call_id.clone(),
+                tool_name,
+                result,
+            })
+            .await?;
+
+        let TurnState::RunningTools {
+            turn_id: current_turn,
+            pending,
+            cancel,
+        } = &mut self.turn
+        else {
+            debug!("ToolFinished for turn {turn_id} arrived outside RunningTools state");
+            return Ok(());
+        };
+        if *current_turn != turn_id {
+            debug!("ToolFinished for stale turn {turn_id}");
+            return Ok(());
+        }
+
+        pending.remove(&tool_call_id);
+        if !pending.is_empty() {
+            return Ok(());
+        }
+
+        let cancelled = cancel.is_cancelled();
+        if cancelled {
+            self.end_turn(turn_id, ctx).await
+        } else {
+            self.continue_step(turn_id, ctx).await
+        }
+    }
+
+    async fn end_turn(
+        &mut self,
+        turn_id: Uuid,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        self.log
+            .commit(AgentEvent::AgentTurnEnded { turn_id })
+            .await?;
+        self.turn = TurnState::Idle;
+        self.try_dispatch_next_input(ctx).await
+    }
+
+    fn assemble_context(&self) -> ai::Context {
+        ai::Context {
+            system_prompt: Some(self.log.system_prompt().to_string()),
+            messages: self.log.messages().to_vec(),
+            tools: Some(self.tools.schemas()),
+        }
     }
 
     async fn spawn_model_step(
         &mut self,
-        context: ai::Context,
         actor_ctx: &mut ActorContext<AgentActorMessage>,
-    ) -> Result<(), AgentSessionError> {
-        let Some(store_tx) = actor_ctx.ugprade() else {
+    ) -> Result<AgentStepRunner, AgentSessionError> {
+        let Some(store_tx) = actor_ctx.upgrade() else {
             return Err(AgentSessionError::InvalidState(
-                "Actor context is not upgraded".to_string(),
+                "actor mailbox is gone".to_string(),
             ));
         };
 
-        let current_step = AgentStepRunner::new(
+        debug!("current conversation state: \n{}", self.log.conversation());
+
+        Ok(AgentStepRunner::new(
             self.config.model.clone(),
             self.config.options.clone(),
             store_tx,
-            context,
+            self.assemble_context(),
         )
-        .await;
-
-        self.state = AgentActorState::Running(current_step);
-        Ok(())
+        .await)
     }
 
     //TODO: impl from_seq
@@ -610,9 +583,7 @@ impl AgentActor {
         reply: oneshot::Sender<AgentSubscription>,
         _from_seq: Option<u64>,
     ) -> Result<(), AgentSessionError> {
-        let (tx, rx) = mpsc::channel(100);
-        self.subscriptions.push(tx);
-        let _ = reply.send(AgentSubscription::new(rx));
+        let _ = reply.send(self.log.subscribe(SUBSCRIPTION_BUFFER));
         Ok(())
     }
 }
@@ -665,45 +636,34 @@ impl AgentSession {
         input: String,
         images: Vec<String>,
     ) -> Result<(), AgentSessionError> {
-        let (reply, receiver) = oneshot::channel();
         let images = self.load_images(images).await?;
-        self.runtime
-            .handle()
-            .send(AgentActorMessage::Command(AgentCommand::SubmitInput {
+        self.runtime.handle()
+            .ask(|reply| AgentActorMessage::Command(AgentCommand::SubmitInput {
                 intent: UserMessageIntent::Normal,
                 reply: reply,
                 input: input,
                 images: images,
-            }))
-            .await?;
-
-        receiver.await?
+            })).await?
     }
 
     pub async fn subscribe(
         &mut self,
         from_seq: Option<u64>,
     ) -> Result<AgentSubscription, AgentSessionError> {
-        let (reply, receiver) = oneshot::channel();
-        self.runtime
-            .handle()
-            .send(AgentActorMessage::Command(AgentCommand::Subscribe {
+        Ok(self.runtime.handle()
+            .ask(move |reply| AgentActorMessage::Command(AgentCommand::Subscribe {
                 reply,
                 from_seq,
-            }))
-            .await?;
-
-        Ok(receiver.await?)
+            })).await?)
     }
 
     pub async fn set_system_prompt(&mut self, prompt: String) -> Result<(), AgentSessionError> {
-        self.runtime
+        Ok(self.runtime
             .handle()
             .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(
                 prompt,
             )))
-            .await?;
-        Ok(())
+            .await?)
     }
 
     pub async fn close(self) -> Result<(), AgentSessionError> {
@@ -737,4 +697,126 @@ fn mime_type_from_path(path: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::faux_lock;
+    use ai::providers::faux::{
+        clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call,
+        set_faux_responses,
+    };
+    use ai::{Api, ModelCost, Provider};
+    use futures::StreamExt;
+    use serde_json::Map;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    fn faux_model() -> Model {
+        Model {
+            id: "faux".into(),
+            name: "Faux".into(),
+            api: Api::from("faux"),
+            provider: Provider::from("faux"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    async fn mk_session() -> AgentSession {
+        AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            AgentConfig {
+                model: faux_model(),
+                options: StreamOptions::default(),
+            },
+        )
+        .await
+    }
+
+    async fn next_event(sub: &mut AgentSubscription) -> AgentEvent {
+        timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("timed out waiting for event")
+            .expect("subscription closed unexpectedly")
+            .event
+    }
+
+    #[tokio::test]
+    async fn turn_with_tool_call_keeps_turn_id_and_resumes_after_tools() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf tool-ran"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut session = mk_session().await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session.submit_input("run it".to_string(), vec![]).await.unwrap();
+
+        let mut turn_started = None;
+        let mut tool_result = None;
+        let mut step_reasons = vec![];
+        let turn_ended = loop {
+            match next_event(&mut sub).await {
+                AgentEvent::AgentTurnStarted { turn_id } => turn_started = Some(turn_id),
+                AgentEvent::ToolExecutionEnded { result, .. } => tool_result = Some(result),
+                AgentEvent::ModelStepEnded { reason, .. } => step_reasons.push(reason),
+                AgentEvent::AgentTurnEnded { turn_id } => break turn_id,
+                _ => {}
+            }
+        };
+        clear_faux_responses();
+
+        assert_eq!(
+            turn_started.expect("turn should start"),
+            turn_ended,
+            "AgentTurnStarted and AgentTurnEnded must carry the same turn_id"
+        );
+        assert_eq!(tool_result.as_deref(), Some("tool-ran"));
+        assert_eq!(
+            step_reasons,
+            vec![ModelStepEndReason::ToolUse, ModelStepEndReason::Success]
+        );
+
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_inputs_run_as_separate_turns() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_text("first")]),
+            faux_assistant_message(vec![faux_text("second")]),
+        ]);
+
+        let mut session = mk_session().await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session.submit_input("one".to_string(), vec![]).await.unwrap();
+        session.submit_input("two".to_string(), vec![]).await.unwrap();
+
+        let mut turns = vec![];
+        while turns.len() < 2 {
+            if let AgentEvent::AgentTurnEnded { turn_id } = next_event(&mut sub).await {
+                turns.push(turn_id);
+            }
+        }
+        clear_faux_responses();
+
+        assert_ne!(turns[0], turns[1], "each input should get its own turn");
+        session.close().await.unwrap();
+    }
 }
