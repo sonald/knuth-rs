@@ -1,7 +1,13 @@
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 use futures::StreamExt;
 use knuth_agent::harness::{AgentConfig, AgentSession};
@@ -105,44 +111,109 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
     Ok((session, subscription))
 }
 
-fn render_event(event: &AgentEvent) {
-    match event {
-        AgentEvent::AssistantMessageTextDelta { delta, .. } => {
-            print!("{}", delta.as_str().green());
+struct CliRenderer {
+    progress: MultiProgress,
+    thinking: Option<ProgressBar>,
+    tools: HashMap<String, ProgressBar>,
+}
+
+impl CliRenderer {
+    fn new() -> Self {
+        Self {
+            progress: MultiProgress::new(),
+            thinking: None,
+            tools: HashMap::new(),
         }
-        AgentEvent::AssistantMessageTextCompleted { .. } => {
-            println!();
-        }
-        AgentEvent::AssistantMessageThinkingDelta { delta, .. } => {
-            print!("{}", delta.as_str().blue());
-        }
-        AgentEvent::AssistantMessageThinkingCompleted { .. } => {
-            println!();
-        }
-        AgentEvent::ErrorOccurred { message, .. } => {
-            eprintln!("{}", message.as_str().red());
-        }
-        AgentEvent::ToolExecutionStarted {
-            tool_name,
-            arguments,
-            ..
-        } => {
-            println!(
-                "{}",
-                format!(
-                    "* Exec {}({})",
+    }
+
+    fn spinner(&self, message: String) -> ProgressBar {
+        let spinner = self.progress.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .expect("hard-coded spinner template is valid")
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        spinner.set_message(message);
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner
+    }
+
+    fn print(&self, text: impl std::fmt::Display) {
+        self.progress.suspend(|| {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        });
+    }
+
+    fn render_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::AssistantMessageTextDelta { delta, .. } => {
+                self.print(delta.as_str().green());
+            }
+            AgentEvent::AssistantMessageTextCompleted { .. } => {
+                self.print('\n');
+            }
+            AgentEvent::AssistantMessageThinkingStarted { .. } => {
+                if self.thinking.is_none() {
+                    self.thinking = Some(self.spinner("Thinking".to_string()));
+                }
+            }
+            AgentEvent::AssistantMessageThinkingDelta { .. } => {
+                if self.thinking.is_none() {
+                    self.thinking = Some(self.spinner("Thinking".to_string()));
+                }
+            }
+            AgentEvent::AssistantMessageThinkingCompleted { content, .. } => {
+                if let Some(spinner) = self.thinking.take() {
+                    spinner.finish_and_clear();
+                }
+                self.print(format!("* Thinking:\n{content}\n").blue());
+            }
+            AgentEvent::ErrorOccurred { message, .. } => {
+                self.progress
+                    .suspend(|| eprintln!("{}", message.as_str().red()));
+            }
+            AgentEvent::ToolExecutionStarted {
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            } => {
+                let message = format!(
+                    "Exec {}({})",
                     tool_name,
                     serde_json::to_string(arguments).unwrap_or_default()
-                )
-                .cyan()
-            );
+                );
+                self.tools
+                    .insert(tool_call_id.clone(), self.spinner(message));
+            }
+            AgentEvent::ToolExecutionEnded {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                if let Some(spinner) = self.tools.remove(tool_call_id) {
+                    let message = spinner.message().to_string();
+                    spinner.finish_and_clear();
+                    self.print(format!("* {message}\n").cyan());
+                }
+                self.print(format!("* Result:\n{result}\n").cyan());
+            }
+            _ => {
+                let msg = format!("{}", event);
+                debug!("Ev: {}", msg.dark_yellow());
+            }
         }
-        AgentEvent::ToolExecutionEnded { result, .. } => {
-            println!("{}", format!("* Result:\n{}", result).cyan());
+    }
+}
+
+impl Drop for CliRenderer {
+    fn drop(&mut self) {
+        if let Some(spinner) = self.thinking.take() {
+            spinner.finish_and_clear();
         }
-        _ => {
-            let msg = format!("{}", event);
-            debug!("Ev: {}", msg.dark_yellow());
+        for (_, spinner) in self.tools.drain() {
+            spinner.finish_and_clear();
         }
     }
 }
@@ -152,6 +223,7 @@ fn render_event(event: &AgentEvent) {
 /// Ctrl+C force-quits in case the turn cannot end (e.g. a wedged connection).
 async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscription) -> Result<()> {
     let mut cancel_requested = false;
+    let mut renderer = CliRenderer::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -167,7 +239,7 @@ async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscripti
                 let Some(stored) = maybe_event else {
                     anyhow::bail!("event stream closed unexpectedly");
                 };
-                render_event(&stored.event);
+                renderer.render_event(&stored.event);
                 if matches!(stored.event, AgentEvent::AgentTurnEnded { .. }) {
                     println!();
                     return Ok(());
@@ -324,5 +396,33 @@ mod tests {
         assert_eq!(value["api_key"], "<redacted>");
         assert_eq!(value["nested"]["access_token"], "<redacted>");
         assert_eq!(value["nested"]["safe"], "shown");
+    }
+
+    #[test]
+    fn renderer_tracks_thinking_and_tool_lifetimes() {
+        let mut renderer = CliRenderer::new();
+
+        renderer.render_event(&AgentEvent::AssistantMessageThinkingStarted { content_index: 0 });
+        assert!(renderer.thinking.is_some());
+
+        renderer.render_event(&AgentEvent::AssistantMessageThinkingCompleted {
+            content_index: 0,
+            content: "done".to_string(),
+        });
+        assert!(renderer.thinking.is_none());
+
+        renderer.render_event(&AgentEvent::ToolExecutionStarted {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            arguments: serde_json::Map::new(),
+        });
+        assert!(renderer.tools.contains_key("call-1"));
+
+        renderer.render_event(&AgentEvent::ToolExecutionEnded {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            result: "ok".to_string(),
+        });
+        assert!(renderer.tools.is_empty());
     }
 }
