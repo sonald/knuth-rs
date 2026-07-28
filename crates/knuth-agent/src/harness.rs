@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::{
     Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, BashTool,
-    EditFileTool, EventLog, PythonTool, ReadFileTool, ToolOutcome, WriteFileTool, spawn_actor,
+    EditFileTool, EventLog, PythonTool, ReadFileTool, ToolResult, WriteFileTool, spawn_actor,
 };
 use ai::{
     AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
@@ -506,11 +506,9 @@ impl AgentActor {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let result = match tool.invoke(call.arguments, cancel).await {
-                    Ok(ToolOutcome::Success(value)) => value
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string()),
+                    Ok(ToolResult { content, .. }) => {
+                        String::from_utf8_lossy(&content).into_owned()
+                    }
                     Err(e) => e,
                 };
                 let _ = tx
@@ -910,7 +908,12 @@ mod tests {
             turn_ended,
             "AgentTurnStarted and AgentTurnEnded must carry the same turn_id"
         );
-        assert_eq!(tool_result.as_deref(), Some("tool-ran"));
+        assert!(
+            tool_result
+                .as_deref()
+                .is_some_and(|result| result.contains("tool-ran")),
+            "tool result should include command stdout, got {tool_result:?}"
+        );
         assert_eq!(tool_started_step, Some(step_ends[0].0));
         assert_eq!(tool_ended_step, Some(step_ends[0].0));
         assert_eq!(

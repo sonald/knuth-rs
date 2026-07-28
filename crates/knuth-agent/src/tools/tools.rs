@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use ai::Tool;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-pub type ToolInput = serde_json::Map<String, serde_json::Value>;
+use knuth_core::ToolOutcome;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ToolOutcome {
-    Success(serde_json::Value),
+pub struct ToolResult {
+    pub outcome: ToolOutcome,
+    pub content: Vec<u8>,
 }
 
+pub type ToolInput = serde_json::Map<String, serde_json::Value>;
 #[async_trait]
 pub trait AgentTool: Send + Sync {
     fn schema(&self) -> &Tool;
@@ -20,7 +20,7 @@ pub trait AgentTool: Send + Sync {
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolOutcome, String>;
+    ) -> Result<ToolResult, String>;
 }
 
 pub struct AgentToolRegistry {

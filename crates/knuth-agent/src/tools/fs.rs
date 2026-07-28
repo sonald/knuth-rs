@@ -3,11 +3,12 @@ use std::path::Path;
 use ai::Tool;
 use async_trait::async_trait;
 use encoding_rs::{Encoding, GB18030, UTF_8, UTF_16BE, UTF_16LE};
+use knuth_core::ToolOutcome;
 use once_cell::sync::Lazy;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentTool, ToolInput, ToolOutcome};
+use super::{AgentTool, ToolInput, ToolResult};
 
 const MAX_READ_BYTES: usize = 32 * 1024;
 
@@ -17,10 +18,6 @@ fn required_string<'a>(input: &'a ToolInput, name: &str) -> Result<&'a str, Stri
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{name} must be a non-empty string"))
-}
-
-fn output(value: String) -> ToolOutcome {
-    ToolOutcome::Success(serde_json::json!({ "output": value }))
 }
 
 pub struct ReadFileTool {}
@@ -35,7 +32,7 @@ impl AgentTool for ReadFileTool {
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolOutcome, String> {
+    ) -> Result<ToolResult, String> {
         let path = required_string(&input, "path")?;
         let offset = input.get("offset").map_or(Ok(1), |value| {
             value
@@ -51,7 +48,10 @@ impl AgentTool for ReadFileTool {
         })? as usize;
 
         let content = tokio::select! {
-            _ = cancel_token.cancelled() => return Err("File read cancelled".to_string()),
+            _ = cancel_token.cancelled() => return Ok(ToolResult {
+                outcome: ToolOutcome::Cancelled,
+                content: b"File read cancelled".to_vec(),
+            }),
             result = fs::read_to_string(path) => result.map_err(|error| error.to_string())?,
         };
         let lines: Vec<&str> = content.split_inclusive('\n').collect();
@@ -63,15 +63,21 @@ impl AgentTool for ReadFileTool {
             let line_number = offset + index;
             let line_bytes = line.len();
             if line_bytes > MAX_READ_BYTES {
-                return Err(format!(
-                    "Line {line_number} is {line_bytes} bytes, exceeding read_file max of {MAX_READ_BYTES} bytes; no content returned"
-                ));
+                return Ok(ToolResult {
+                    outcome: ToolOutcome::Error,
+                    content: format!(
+                        "Line {line_number} is {line_bytes} bytes, exceeding read_file max of {MAX_READ_BYTES} bytes; no content returned"
+                    ).into_bytes(),
+                });
             }
             bytes += line_bytes;
             if bytes > MAX_READ_BYTES {
-                return Err(format!(
-                    "Requested content exceeds read_file max of {MAX_READ_BYTES} bytes ({bytes} bytes needed); no content returned"
-                ));
+                return Ok(ToolResult {
+                    outcome: ToolOutcome::Error,
+                    content: format!(
+                        "Requested content exceeds read_file max of {MAX_READ_BYTES} bytes ({bytes} bytes needed); no content returned"
+                    ).into_bytes(),
+                });
             }
             rendered.push(format!(
                 "{line_number:4}: {}",
@@ -80,18 +86,24 @@ impl AgentTool for ReadFileTool {
         }
 
         if rendered.is_empty() {
-            return Ok(output(format!(
-                "No content found in the specified range (file has {} total lines)",
-                lines.len()
-            )));
+            return Ok(ToolResult {
+                outcome: ToolOutcome::Error,
+                content: format!(
+                    "No content found in the specified range (file has {} total lines)",
+                    lines.len()
+                ).into_bytes(),
+            });
         }
 
         let end_line = offset + rendered.len() - 1;
-        Ok(output(format!(
-            "File({path}) - Lines {offset}-{end_line} of {} total:\n{}",
-            lines.len(),
-            rendered.join("\n")
-        )))
+        Ok(ToolResult {
+            outcome: ToolOutcome::ExecSuccess,
+            content: format!(
+                "File({path}) - Lines {offset}-{end_line} of {} total:\n{}",
+                lines.len(),
+                rendered.join("\n")
+            ).into_bytes(),
+        })
     }
 }
 
@@ -107,7 +119,7 @@ impl AgentTool for WriteFileTool {
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolOutcome, String> {
+    ) -> Result<ToolResult, String> {
         let path = required_string(&input, "path")?;
         let content = input
             .get("content")
@@ -115,7 +127,10 @@ impl AgentTool for WriteFileTool {
             .ok_or("content must be a string")?;
 
         tokio::select! {
-            _ = cancel_token.cancelled() => return Err("File write cancelled".to_string()),
+            _ = cancel_token.cancelled() => return Ok(ToolResult {
+                outcome: ToolOutcome::Cancelled,
+                content: b"File write cancelled".to_vec(),
+            }),
             result = async {
                 if let Some(parent) = Path::new(path).parent().filter(|parent| !parent.as_os_str().is_empty()) {
                     fs::create_dir_all(parent).await?;
@@ -123,7 +138,10 @@ impl AgentTool for WriteFileTool {
                 fs::write(path, content).await
             } => result.map_err(|error| error.to_string())?,
         }
-        Ok(output(format!("Wrote {path}")))
+        Ok(ToolResult {
+            outcome: ToolOutcome::ExecSuccess,
+            content: format!("Wrote {path}").into_bytes(),
+        })
     }
 }
 
@@ -139,7 +157,7 @@ impl AgentTool for EditFileTool {
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolOutcome, String> {
+    ) -> Result<ToolResult, String> {
         let path = required_string(&input, "path")?;
         let old_string = required_string(&input, "old_string")?;
         let new_string = input
@@ -147,7 +165,10 @@ impl AgentTool for EditFileTool {
             .and_then(|value| value.as_str())
             .ok_or("new_string must be a string")?;
         if old_string == new_string {
-            return Err("new_string must be different from old_string".to_string());
+            return Ok(ToolResult {
+                outcome: ToolOutcome::Error,
+                content: b"new_string must be different from old_string".to_vec(),
+            });
         }
         let replace_all = input.get("replace_all").map_or(Ok(false), |value| {
             value
@@ -156,18 +177,27 @@ impl AgentTool for EditFileTool {
         })?;
 
         let raw = tokio::select! {
-            _ = cancel_token.cancelled() => return Err("File edit cancelled".to_string()),
+            _ = cancel_token.cancelled() => return Ok(ToolResult {
+                outcome: ToolOutcome::Cancelled,
+                content: b"File edit cancelled".to_vec(),
+            }),
             result = fs::read(path) => result.map_err(|error| error.to_string())?,
         };
         let (text, encoding) = decode_text(&raw)?;
         let count = text.matches(old_string).count();
         if count == 0 {
-            return Err("old_string was not found".to_string());
+            return Ok(ToolResult {
+                outcome: ToolOutcome::Error,
+                content: b"old_string was not found".to_vec(),
+            });
         }
         if count > 1 && !replace_all {
-            return Err(format!(
-                "old_string found {count} matches; set replace_all=true to replace all"
-            ));
+            return Ok(ToolResult {
+                outcome: ToolOutcome::Error,
+                content: format!(
+                    "old_string found {count} matches; set replace_all=true to replace all"
+                ).into_bytes(),
+            });
         }
 
         let edited = if replace_all {
@@ -177,14 +207,20 @@ impl AgentTool for EditFileTool {
         };
         let encoded = encode_text(&edited, encoding)?;
         tokio::select! {
-            _ = cancel_token.cancelled() => return Err("File edit cancelled".to_string()),
+            _ = cancel_token.cancelled() => return Ok(ToolResult {
+                outcome: ToolOutcome::Cancelled,
+                content: b"File edit cancelled".to_vec(),
+            }),
             result = fs::write(path, encoded) => result.map_err(|error| error.to_string())?,
         }
-        Ok(output(format!(
+        Ok(ToolResult {
+            outcome: ToolOutcome::ExecSuccess,
+            content: format!(
             "Edited {path} (replacements={}, encoding={})",
             if replace_all { count } else { 1 },
             encoding.name
-        )))
+        ).into_bytes(),
+        })
     }
 }
 
@@ -351,11 +387,9 @@ mod tests {
             .await
             .unwrap();
 
-        match result {
-            ToolOutcome::Success(value) => {
-                assert!(value["output"].as_str().unwrap().contains("   2: beta"))
-            }
-        }
+        assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
+        let content = String::from_utf8_lossy(&result.content);
+        assert!(content.contains("   2: beta"), "content={content}");
         fs::remove_dir_all(path.parent().unwrap()).await.unwrap();
     }
 

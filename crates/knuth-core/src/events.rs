@@ -4,6 +4,16 @@ use std::hash::{Hash, Hasher};
 
 use crate::ids::*;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolOutcome {
+    ExecSuccess,
+    Denied,
+    Cancelled,
+    Interrupted,
+    Error,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelStepEndReason {
     Success,
@@ -76,6 +86,11 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         arguments: serde_json::Map<String, serde_json::Value>,
+    },
+
+    ToolResultReceived {
+        outcome: ToolOutcome,
+        content: Vec<u8>,
     },
 
     // Live events
@@ -152,22 +167,26 @@ impl AgentEvent {
             AgentEvent::ToolExecutionUpdated { .. } => "ToolExecutionUpdated",
             AgentEvent::ToolExecutionEnded { .. } => "ToolExecutionEnded",
             AgentEvent::ToolExecutionRequested { .. } => "ToolExecutionRequested",
+            AgentEvent::ToolResultReceived { .. } => "ToolResultReceived",
             AgentEvent::ErrorOccurred { .. } => "ErrorOccurred",
             AgentEvent::SystemPromptSet { .. } => "SystemPromptSet",
         }
     }
 
     pub fn is_durable(&self) -> bool {
-        !matches! {
+        matches! {
             self,
-            AgentEvent::AssistantMessageTextStarted { .. } |
-            AgentEvent::AssistantMessageTextDelta { .. } |
-            AgentEvent::AssistantMessageTextCompleted { .. } |
-            AgentEvent::AssistantMessageThinkingStarted { .. } |
-            AgentEvent::AssistantMessageThinkingDelta { .. } |
-            AgentEvent::AssistantMessageThinkingCompleted { .. } |
-            AgentEvent::ToolExecutionStarted { .. } |
-            AgentEvent::ToolExecutionUpdated { .. }
+            AgentEvent::SessionStarted { .. } |
+            AgentEvent::SessionEnded { .. } |
+            AgentEvent::AgentTurnStarted { .. } |
+            AgentEvent::AgentTurnEnded { .. } |
+            AgentEvent::ModelStepStarted { .. } |
+            AgentEvent::ModelStepEnded { .. } |
+            AgentEvent::UserMessageCommitted { .. } |
+            AgentEvent::ErrorOccurred { .. } |
+            AgentEvent::SystemPromptSet { .. } |
+            AgentEvent::ToolExecutionRequested { .. } |
+            AgentEvent::ToolResultReceived { .. }
         }
     }
 
@@ -183,7 +202,7 @@ impl AgentEvent {
             AgentEvent::ErrorOccurred { .. } => "error.occurred",
             AgentEvent::SystemPromptSet { .. } => "system_prompt.set",
             AgentEvent::ToolExecutionRequested { .. } => "tool.execution_requested",
-            AgentEvent::ToolExecutionEnded { .. } => "tool.execution_ended",
+            AgentEvent::ToolResultReceived { .. } => "tool.result_received",
 
             AgentEvent::AssistantMessageTextStarted { .. } => "live",
             AgentEvent::AssistantMessageTextDelta { .. } => "live",
@@ -191,6 +210,7 @@ impl AgentEvent {
             AgentEvent::AssistantMessageThinkingStarted { .. } => "live",
             AgentEvent::AssistantMessageThinkingDelta { .. } => "live",
             AgentEvent::AssistantMessageThinkingCompleted { .. } => "live",
+            AgentEvent::ToolExecutionEnded { .. } => "live",
             AgentEvent::ToolExecutionStarted { .. } => "live",
             AgentEvent::ToolExecutionUpdated { .. } => "live",
         }
@@ -360,6 +380,9 @@ impl std::fmt::Display for AgentEvent {
                     "ToolExecutionRequested(invocation_id={invocation_id}, tool_call_id={tool_call_id}, tool_name={tool_name})"
                 )
             }
+            AgentEvent::ToolResultReceived { outcome, content } => {
+                write!(f, "ToolResultReceived(outcome={outcome:?}, content={content:?})")
+            }
             AgentEvent::ToolExecutionEnded {
                 step_id,
                 tool_call_id,
@@ -391,7 +414,11 @@ mod tests {
             tool_name: "bash".to_string(),
             arguments: serde_json::Map::new(),
         };
-        let completed = AgentEvent::ToolExecutionEnded {
+        let completed = AgentEvent::ToolResultReceived {
+            outcome: ToolOutcome::ExecSuccess,
+            content: b"ok".to_vec(),
+        };
+        let live_ended = AgentEvent::ToolExecutionEnded {
             step_id: StepId::new(),
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
@@ -406,7 +433,9 @@ mod tests {
         assert!(requested.is_durable());
         assert_eq!(requested.event_type(), "tool.execution_requested");
         assert!(completed.is_durable());
-        assert_eq!(completed.event_type(), "tool.execution_ended");
+        assert_eq!(completed.event_type(), "tool.result_received");
+        assert!(!live_ended.is_durable());
+        assert_eq!(live_ended.event_type(), "live");
         assert!(!progress.is_durable());
         assert_eq!(progress.event_type(), "live");
     }
