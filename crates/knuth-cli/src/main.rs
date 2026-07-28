@@ -368,6 +368,7 @@ fn redact_json_value(value: &mut Value) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use knuth_core::ids::StepId;
     use std::path::Path;
 
     #[test]
@@ -401,17 +402,23 @@ mod tests {
     #[test]
     fn renderer_tracks_thinking_and_tool_lifetimes() {
         let mut renderer = CliRenderer::new();
+        let step_id = StepId::new();
 
-        renderer.render_event(&AgentEvent::AssistantMessageThinkingStarted { content_index: 0 });
+        renderer.render_event(&AgentEvent::AssistantMessageThinkingStarted {
+            step_id,
+            content_index: 0,
+        });
         assert!(renderer.thinking.is_some());
 
         renderer.render_event(&AgentEvent::AssistantMessageThinkingCompleted {
+            step_id,
             content_index: 0,
             content: "done".to_string(),
         });
         assert!(renderer.thinking.is_none());
 
         renderer.render_event(&AgentEvent::ToolExecutionStarted {
+            step_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             arguments: serde_json::Map::new(),
@@ -419,6 +426,7 @@ mod tests {
         assert!(renderer.tools.contains_key("call-1"));
 
         renderer.render_event(&AgentEvent::ToolExecutionEnded {
+            step_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             result: "ok".to_string(),

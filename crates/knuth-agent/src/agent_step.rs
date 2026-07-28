@@ -3,10 +3,12 @@ use std::ops::ControlFlow;
 use ai::{AssistantMessage, DoneReason, Model, StreamOptions, stream};
 use async_trait::async_trait;
 use futures::StreamExt;
-use knuth_core::{AgentEvent, ModelStepEndReason};
+use knuth_core::{
+    AgentEvent, ModelStepEndReason,
+    ids::{Generation, StepId},
+};
 use tokio::sync::mpsc;
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::*;
 
@@ -31,7 +33,8 @@ struct AgentStepActor {
     options: StreamOptions,
     store_tx: mpsc::Sender<AgentActorMessage>,
     context: ai::Context,
-    step_id: Uuid,
+    step_id: StepId,
+    generation: Generation,
 
     step_reason: ModelStepEndReason,
     assistant_message: Option<AssistantMessage>,
@@ -95,9 +98,8 @@ impl Actor for AgentStepActor {
                 // A stream that closes without a Done (or Error) event is a broken
                 // stream, not a successful step.
                 if self.assistant_message.is_none() {
-                    self.step_reason = ModelStepEndReason::Error(
-                        "stream ended without a Done event".to_string(),
-                    );
+                    self.step_reason =
+                        ModelStepEndReason::Error("stream ended without a Done event".to_string());
                 }
                 ControlFlow::Break(())
             }
@@ -119,6 +121,7 @@ impl Actor for AgentStepActor {
             .store_tx
             .send(AgentActorMessage::StepFinished {
                 step_id: self.step_id,
+                generation: self.generation,
                 reason: self.step_reason.clone(),
                 assistant_message: self.assistant_message.take(),
             })
@@ -132,7 +135,8 @@ impl AgentStepActor {
         options: StreamOptions,
         store_tx: mpsc::Sender<AgentActorMessage>,
         context: ai::Context,
-        step_id: Uuid,
+        step_id: StepId,
+        generation: Generation,
     ) -> Self {
         Self {
             model,
@@ -140,6 +144,7 @@ impl AgentStepActor {
             store_tx,
             context,
             step_id,
+            generation,
             step_reason: ModelStepEndReason::Success,
             assistant_message: None,
         }
@@ -147,7 +152,7 @@ impl AgentStepActor {
 
     pub async fn emit(&mut self, event: AgentEvent) -> Result<(), AgentStepError> {
         self.store_tx
-            .send(AgentActorMessage::Turn(self.step_id, event))
+            .send(AgentActorMessage::Step(self.step_id, event))
             .await
             .map_err(|e| AgentStepError::EventSendError(e.to_string()))
     }
@@ -174,8 +179,11 @@ impl AgentStepActor {
             }
 
             ai::AssistantMessageEvent::TextStart { content_index, .. } => {
-                self.emit(AgentEvent::AssistantMessageTextStarted { content_index })
-                    .await?;
+                self.emit(AgentEvent::AssistantMessageTextStarted {
+                    step_id: self.step_id,
+                    content_index,
+                })
+                .await?;
             }
             ai::AssistantMessageEvent::TextDelta {
                 content_index,
@@ -183,6 +191,7 @@ impl AgentStepActor {
                 ..
             } => {
                 self.emit(AgentEvent::AssistantMessageTextDelta {
+                    step_id: self.step_id,
                     content_index,
                     delta,
                 })
@@ -195,6 +204,7 @@ impl AgentStepActor {
                 ..
             } => {
                 self.emit(AgentEvent::AssistantMessageTextCompleted {
+                    step_id: self.step_id,
                     content_index,
                     text_content: content,
                     assistant_message: partial,
@@ -203,8 +213,11 @@ impl AgentStepActor {
             }
 
             ai::AssistantMessageEvent::ThinkingStart { content_index, .. } => {
-                self.emit(AgentEvent::AssistantMessageThinkingStarted { content_index })
-                    .await?;
+                self.emit(AgentEvent::AssistantMessageThinkingStarted {
+                    step_id: self.step_id,
+                    content_index,
+                })
+                .await?;
             }
             ai::AssistantMessageEvent::ThinkingDelta {
                 content_index,
@@ -212,6 +225,7 @@ impl AgentStepActor {
                 ..
             } => {
                 self.emit(AgentEvent::AssistantMessageThinkingDelta {
+                    step_id: self.step_id,
                     content_index,
                     delta,
                 })
@@ -223,6 +237,7 @@ impl AgentStepActor {
                 ..
             } => {
                 self.emit(AgentEvent::AssistantMessageThinkingCompleted {
+                    step_id: self.step_id,
                     content_index,
                     content,
                 })
@@ -241,32 +256,39 @@ impl AgentStepActor {
 
 #[derive(Debug)]
 pub struct AgentStepRunner {
-    step_id: Uuid,
+    step_id: StepId,
+    generation: Generation,
     step_runtime: ActorRuntime<AgentStepActorMessage>,
 }
 
 impl AgentStepRunner {
     pub async fn new(
+        step_id: StepId,
+        generation: Generation,
         model: Model,
         options: StreamOptions,
         store_tx: mpsc::Sender<AgentActorMessage>,
         context: ai::Context,
     ) -> Self {
-        let step_id = Uuid::now_v7();
         let step_runtime = spawn_actor(
-            AgentStepActor::new(model, options, store_tx, context, step_id),
+            AgentStepActor::new(model, options, store_tx, context, step_id, generation),
             100,
         )
         .await;
 
         Self {
             step_id,
+            generation,
             step_runtime,
         }
     }
 
-    pub fn step_id(&self) -> Uuid {
+    pub fn step_id(&self) -> StepId {
         self.step_id
+    }
+
+    pub fn generation(&self) -> Generation {
+        self.generation
     }
 
     pub async fn cancel(&self) {
@@ -281,7 +303,7 @@ impl AgentStepRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai::providers::faux::{clear_faux_responses, set_faux_responses};
+    use ai::providers::faux::{clear_faux_responses, faux_thinking, set_faux_responses};
     use ai::{
         Api, AssistantMessage, AssistantMessageEvent, AssistantRole, ContentBlock, KnownApi,
         ModelCost, Provider, StopReason, ToolCall, Usage,
@@ -335,7 +357,8 @@ mod tests {
                 messages: vec![],
                 tools: None,
             },
-            Uuid::now_v7(),
+            StepId::new(),
+            Generation::new(),
         )
     }
 
@@ -392,10 +415,15 @@ mod tests {
         let _guard = crate::test_support::faux_lock();
         clear_faux_responses();
         let (tx, mut rx) = mpsc::channel(16);
-        let message = mk_message(StopReason::Length, vec![ContentBlock::text("partial")]);
+        let message = mk_message(
+            StopReason::Length,
+            vec![ContentBlock::text("partial"), faux_thinking("reasoning")],
+        );
         set_faux_responses(vec![message]);
 
         let runner = AgentStepRunner::new(
+            StepId::new(),
+            Generation::new(),
             mk_model(),
             StreamOptions::default(),
             tx,
@@ -422,7 +450,7 @@ mod tests {
         clear_faux_responses();
 
         let expected_step_id = match messages.first().expect("expected actor messages") {
-            AgentActorMessage::Turn(
+            AgentActorMessage::Step(
                 step_id,
                 AgentEvent::ModelStepStarted {
                     step_id: event_step_id,
@@ -438,7 +466,7 @@ mod tests {
 
         for message in &messages {
             match message {
-                AgentActorMessage::Turn(step_id, event) => {
+                AgentActorMessage::Step(step_id, event) => {
                     assert_eq!(*step_id, expected_step_id);
                     if let AgentEvent::ModelStepStarted { step_id } = event {
                         assert_eq!(*step_id, expected_step_id);
@@ -455,16 +483,59 @@ mod tests {
         let lifecycle = messages
             .iter()
             .filter_map(|message| match message {
-                AgentActorMessage::Turn(_, AgentEvent::ModelStepStarted { .. }) => Some("started"),
+                AgentActorMessage::Step(_, AgentEvent::ModelStepStarted { .. }) => Some("started"),
                 AgentActorMessage::StepFinished { .. } => Some("finished"),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(lifecycle, ["started", "finished"]);
 
+        let live_events = messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageTextStarted { step_id, .. },
+                ) => Some(("text.started", *step_id)),
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageTextDelta { step_id, .. },
+                ) => Some(("text.delta", *step_id)),
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageTextCompleted { step_id, .. },
+                ) => Some(("text.completed", *step_id)),
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageThinkingStarted { step_id, .. },
+                ) => Some(("thinking.started", *step_id)),
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageThinkingDelta { step_id, .. },
+                ) => Some(("thinking.delta", *step_id)),
+                AgentActorMessage::Step(
+                    _,
+                    AgentEvent::AssistantMessageThinkingCompleted { step_id, .. },
+                ) => Some(("thinking.completed", *step_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live_events,
+            [
+                ("text.started", expected_step_id),
+                ("text.delta", expected_step_id),
+                ("text.completed", expected_step_id),
+                ("thinking.started", expected_step_id),
+                ("thinking.delta", expected_step_id),
+                ("thinking.completed", expected_step_id),
+            ]
+        );
+
         match messages.last().expect("expected actor messages") {
             AgentActorMessage::StepFinished {
                 step_id,
+                generation: _,
                 reason,
                 assistant_message,
             } => {
@@ -503,7 +574,9 @@ mod tests {
         let mut step = mk_actor(tx);
         let mut ctx = test_actor_context();
 
-        let flow = step.handle(AgentStepActorMessage::StreamEnded, &mut ctx).await;
+        let flow = step
+            .handle(AgentStepActorMessage::StreamEnded, &mut ctx)
+            .await;
 
         assert!(flow.is_break());
         assert!(matches!(step.step_reason, ModelStepEndReason::Error(_)));
@@ -521,7 +594,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let flow = step.handle(AgentStepActorMessage::StreamEnded, &mut ctx).await;
+        let flow = step
+            .handle(AgentStepActorMessage::StreamEnded, &mut ctx)
+            .await;
 
         assert!(flow.is_break());
         assert_eq!(step.step_reason, ModelStepEndReason::Success);
@@ -571,7 +646,9 @@ mod tests {
         let (reason, assistant_message) = recv_step_finished(&mut rx);
         assert_eq!(reason, ModelStepEndReason::Success);
         assert_eq!(
-            assistant_message.expect("completed step keeps its message").stop_reason,
+            assistant_message
+                .expect("completed step keeps its message")
+                .stop_reason,
             StopReason::Stop
         );
     }

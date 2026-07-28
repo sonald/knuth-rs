@@ -58,10 +58,7 @@ impl EventLog {
             .retain_mut(|s| match s.try_send(event.clone()) {
                 Ok(_) => true,
                 Err(TrySendError::Full(e)) => {
-                    debug!(
-                        "EventLog: subscription is full, dropping it (event: {})",
-                        e
-                    );
+                    debug!("EventLog: subscription is full, dropping it (event: {})", e);
                     false
                 }
                 Err(TrySendError::Closed(e)) => {
@@ -111,6 +108,7 @@ impl ConversationState {
                 tool_call_id,
                 tool_name,
                 result,
+                ..
             } => {
                 debug!("append ToolExecutionEnded event to conversation state");
 
@@ -152,7 +150,7 @@ impl std::fmt::Display for ConversationState {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use knuth_core::{InMemoryEventStore, UserMessageIntent};
+    use knuth_core::{InMemoryEventStore, UserMessageIntent, ids::MessageId};
 
     fn mk_log() -> EventLog {
         EventLog::new(Box::new(InMemoryEventStore::new()))
@@ -168,6 +166,7 @@ mod tests {
         .await
         .unwrap();
         log.commit(AgentEvent::UserMessageCommitted {
+            message_id: MessageId::new(),
             content: ai::UserContent::Blocks(vec![UserContentBlock::text("hi")]),
             intent: UserMessageIntent::Normal,
         })

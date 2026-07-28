@@ -52,7 +52,7 @@ impl AgentTool for PythonTool {
 }
 
 static PYTHON_SCHEMA: Lazy<Tool> = Lazy::new(|| Tool {
-    name: "python".to_string(),
+    name: "python_exec".to_string(),
     description: include_str!("descriptions/python.md").trim().to_string(),
     parameters: serde_json::json!({
         "type": "object",

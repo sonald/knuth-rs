@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ai::Tool;
 use async_trait::async_trait;
-use encoding_rs::{Encoding, GB18030, UTF_16BE, UTF_16LE, UTF_8};
+use encoding_rs::{Encoding, GB18030, UTF_8, UTF_16BE, UTF_16LE};
 use once_cell::sync::Lazy;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;

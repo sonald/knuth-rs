@@ -77,15 +77,23 @@ impl StoredEvent {
 }
 
 fn short_hash(s: &str) -> String {
-    format!( "{}", s.chars().take(8).collect::<String>())
+    format!("{}", s.chars().take(8).collect::<String>())
 }
-
 
 impl std::fmt::Display for StoredEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "#{}: {}: ts: {}, hash: {}, parent_hash: {}",
-        self.stream_seq, self.event, self.timestamp, short_hash(&self.hash),
-         self.parent_hash.as_deref().map(|h| short_hash(h)).unwrap_or_default())
+        write!(
+            f,
+            "#{}: {}: ts: {}, hash: {}, parent_hash: {}",
+            self.stream_seq,
+            self.event,
+            self.timestamp,
+            short_hash(&self.hash),
+            self.parent_hash
+                .as_deref()
+                .map(|h| short_hash(h))
+                .unwrap_or_default()
+        )
     }
 }
 

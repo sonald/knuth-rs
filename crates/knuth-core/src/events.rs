@@ -1,7 +1,8 @@
 use ai::{AssistantMessage, UserContent};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-use uuid::Uuid;
+
+use crate::ids::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelStepEndReason {
@@ -30,7 +31,7 @@ pub enum UserMessageIntent {
 #[serde(tag = "type", content = "data")]
 pub enum AgentEvent {
     SessionStarted {
-        session_id: Uuid,
+        session_id: SessionId,
     },
     SessionEnded {
         reason: SessionEndReason,
@@ -40,72 +41,91 @@ pub enum AgentEvent {
         prompt: String,
     },
 
+    // only one agent turn can be active at a time
     AgentTurnStarted {
-        turn_id: Uuid,
+        turn_id: TurnId,
     },
 
     AgentTurnEnded {
-        turn_id: Uuid,
+        turn_id: TurnId,
     },
 
     ModelStepStarted {
-        step_id: Uuid,
+        step_id: StepId,
     },
 
     ModelStepEnded {
-        step_id: Uuid,
+        step_id: StepId,
         reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
     },
 
     UserMessageCommitted {
+        message_id: MessageId, // for idempotency
         content: UserContent,
         intent: UserMessageIntent,
     },
 
+    ErrorOccurred {
+        message: String,
+        details: Option<serde_json::Value>,
+    },
+
+    ToolExecutionRequested {
+        invocation_id: ToolInvocationId,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
+
+    // Live events
     AssistantMessageTextStarted {
+        step_id: StepId,
         content_index: usize,
     },
     AssistantMessageTextDelta {
+        step_id: StepId,
         content_index: usize,
         delta: String,
     },
     AssistantMessageTextCompleted {
+        step_id: StepId,
         content_index: usize,
         text_content: String,
         assistant_message: AssistantMessage,
     },
 
     AssistantMessageThinkingStarted {
+        step_id: StepId,
         content_index: usize,
     },
     AssistantMessageThinkingDelta {
+        step_id: StepId,
         content_index: usize,
         delta: String,
     },
     AssistantMessageThinkingCompleted {
+        step_id: StepId,
         content_index: usize,
         content: String,
     },
 
     ToolExecutionStarted {
+        step_id: StepId,
         tool_call_id: String,
         tool_name: String,
         arguments: serde_json::Map<String, serde_json::Value>,
     },
     ToolExecutionUpdated {
+        step_id: StepId,
         tool_call_id: String,
         delta: String,
     },
     ToolExecutionEnded {
+        step_id: StepId,
         tool_call_id: String,
         tool_name: String,
         result: String,
-    },
-
-    ErrorOccurred {
-        message: String,
-        details: Option<serde_json::Value>,
     },
 }
 
@@ -131,8 +151,48 @@ impl AgentEvent {
             AgentEvent::ToolExecutionStarted { .. } => "ToolExecutionStarted",
             AgentEvent::ToolExecutionUpdated { .. } => "ToolExecutionUpdated",
             AgentEvent::ToolExecutionEnded { .. } => "ToolExecutionEnded",
+            AgentEvent::ToolExecutionRequested { .. } => "ToolExecutionRequested",
             AgentEvent::ErrorOccurred { .. } => "ErrorOccurred",
             AgentEvent::SystemPromptSet { .. } => "SystemPromptSet",
+        }
+    }
+
+    pub fn is_durable(&self) -> bool {
+        !matches! {
+            self,
+            AgentEvent::AssistantMessageTextStarted { .. } |
+            AgentEvent::AssistantMessageTextDelta { .. } |
+            AgentEvent::AssistantMessageTextCompleted { .. } |
+            AgentEvent::AssistantMessageThinkingStarted { .. } |
+            AgentEvent::AssistantMessageThinkingDelta { .. } |
+            AgentEvent::AssistantMessageThinkingCompleted { .. } |
+            AgentEvent::ToolExecutionStarted { .. } |
+            AgentEvent::ToolExecutionUpdated { .. }
+        }
+    }
+
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            AgentEvent::SessionStarted { .. } => "session.started",
+            AgentEvent::SessionEnded { .. } => "session.ended",
+            AgentEvent::AgentTurnStarted { .. } => "turn.started",
+            AgentEvent::AgentTurnEnded { .. } => "turn.ended",
+            AgentEvent::ModelStepStarted { .. } => "model_step.started",
+            AgentEvent::ModelStepEnded { .. } => "model_step.ended",
+            AgentEvent::UserMessageCommitted { .. } => "user_message.committed",
+            AgentEvent::ErrorOccurred { .. } => "error.occurred",
+            AgentEvent::SystemPromptSet { .. } => "system_prompt.set",
+            AgentEvent::ToolExecutionRequested { .. } => "tool.execution_requested",
+            AgentEvent::ToolExecutionEnded { .. } => "tool.execution_ended",
+
+            AgentEvent::AssistantMessageTextStarted { .. } => "live",
+            AgentEvent::AssistantMessageTextDelta { .. } => "live",
+            AgentEvent::AssistantMessageTextCompleted { .. } => "live",
+            AgentEvent::AssistantMessageThinkingStarted { .. } => "live",
+            AgentEvent::AssistantMessageThinkingDelta { .. } => "live",
+            AgentEvent::AssistantMessageThinkingCompleted { .. } => "live",
+            AgentEvent::ToolExecutionStarted { .. } => "live",
+            AgentEvent::ToolExecutionUpdated { .. } => "live",
         }
     }
 }
@@ -149,17 +209,6 @@ impl Hash for AgentEvent {
             Err(_) => self.name().hash(state),
         }
     }
-}
-
-/// Formats a UUID showing only its trailing hex digits.
-///
-/// IDs in this crate are generated with `Uuid::now_v7`, which packs a
-/// millisecond timestamp into the leading bits. Events emitted close
-/// together therefore share a long, uninformative common prefix; only the
-/// tail carries enough entropy to tell IDs apart at a glance in logs.
-fn short_uuid(id: &Uuid) -> impl std::fmt::Display {
-    let s = id.simple().to_string();
-    format!("…{}", &s[s.len() - 8..])
 }
 
 fn short_string(s: &str) -> impl std::fmt::Display {
@@ -185,41 +234,51 @@ impl std::fmt::Display for AgentEvent {
                 write!(f, "SystemPromptSet(prompt={})", short_string(prompt))
             }
             AgentEvent::SessionStarted { session_id } => {
-                write!(f, "SessionStarted(session_id={})", short_uuid(session_id))
+                write!(f, "SessionStarted(session_id={})", session_id.short())
             }
             AgentEvent::SessionEnded { reason } => {
                 write!(f, "SessionEnded(reason={reason:?})")
             }
             AgentEvent::AgentTurnStarted { turn_id } => {
-                write!(f, "AgentTurnStarted(turn_id={})", short_uuid(turn_id))
+                write!(f, "AgentTurnStarted(turn_id={})", turn_id.short())
             }
             AgentEvent::AgentTurnEnded { turn_id } => {
-                write!(f, "AgentTurnEnded(turn_id={})", short_uuid(turn_id))
+                write!(f, "AgentTurnEnded(turn_id={})", turn_id.short())
             }
             AgentEvent::ModelStepStarted { step_id } => {
-                write!(f, "ModelStepStarted(step_id={})", short_uuid(step_id))
+                write!(f, "ModelStepStarted(step_id={})", step_id.short())
             }
-            AgentEvent::ModelStepEnded { step_id, reason, .. } => {
-                write!(f, "ModelStepEnded(step_id={}, reason={reason:?})", short_uuid(step_id))
-            }
-            AgentEvent::UserMessageCommitted {
-                intent, ..
+            AgentEvent::ModelStepEnded {
+                step_id, reason, ..
             } => {
                 write!(
                     f,
-                    "UserMessageCommitted(intent={intent:?})",
+                    "ModelStepEnded(step_id={}, reason={reason:?})",
+                    step_id.short()
                 )
             }
-            AgentEvent::AssistantMessageTextStarted { content_index } => {
+            AgentEvent::UserMessageCommitted { intent, .. } => {
+                write!(f, "UserMessageCommitted(intent={intent:?})",)
+            }
+            AgentEvent::AssistantMessageTextStarted {
+                step_id,
+                content_index,
+            } => {
                 write!(
                     f,
-                    "AssistantMessageTextStarted(#{content_index})",
+                    "AssistantMessageTextStarted(step_id={}, #{content_index})",
+                    step_id.short()
                 )
             }
-            AgentEvent::AssistantMessageTextDelta { content_index, delta } => {
+            AgentEvent::AssistantMessageTextDelta {
+                step_id,
+                content_index,
+                delta,
+            } => {
                 write!(
                     f,
-                    "AssistantMessageTextDelta(#{content_index}, delta={})",
+                    "AssistantMessageTextDelta(step_id={}, #{content_index}, delta={})",
+                    step_id.short(),
                     short_string(delta)
                 )
             }
@@ -234,53 +293,121 @@ impl std::fmt::Display for AgentEvent {
                     short_string(text_content)
                 )
             }
-            AgentEvent::AssistantMessageThinkingStarted { content_index } => {
+            AgentEvent::AssistantMessageThinkingStarted {
+                step_id,
+                content_index,
+            } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingStarted(#{content_index})",
+                    "AssistantMessageThinkingStarted(step_id={}, #{content_index})",
+                    step_id.short()
                 )
             }
-            AgentEvent::AssistantMessageThinkingDelta { content_index, delta } => {
+            AgentEvent::AssistantMessageThinkingDelta {
+                step_id,
+                content_index,
+                delta,
+            } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingDelta(#{content_index}, delta={delta:?})",
+                    "AssistantMessageThinkingDelta(step_id={}, #{content_index}, delta={delta:?})",
+                    step_id.short(),
                 )
             }
             AgentEvent::AssistantMessageThinkingCompleted {
+                step_id,
                 content_index,
                 content,
             } => {
                 write!(
                     f,
-                    "AssistantMessageThinkingCompleted(#{content_index}, content={})",
+                    "AssistantMessageThinkingCompleted(step_id={}, #{content_index}, content={})",
+                    step_id.short(),
                     short_string(content)
                 )
             }
-            AgentEvent::ToolExecutionStarted { tool_call_id, tool_name, arguments } => {
-                write!(f, "ToolExecutionStarted(tool_call_id={tool_call_id}, tool_name={tool_name}, arguments={arguments:?})")
+            AgentEvent::ToolExecutionStarted {
+                step_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                write!(
+                    f,
+                    "ToolExecutionStarted(step_id={}, tool_call_id={tool_call_id}, tool_name={tool_name}, arguments={arguments:?})",
+                    step_id.short(),
+                )
             }
             AgentEvent::ToolExecutionUpdated {
+                step_id,
                 tool_call_id,
                 delta,
             } => {
                 write!(
                     f,
-                    "ToolExecutionUpdated(tool_call_id={tool_call_id}, delta={delta:?})"
+                    "ToolExecutionUpdated(step_id={}, tool_call_id={tool_call_id}, delta={delta:?})",
+                    step_id.short(),
+                )
+            }
+            AgentEvent::ToolExecutionRequested {
+                invocation_id,
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ToolExecutionRequested(invocation_id={invocation_id}, tool_call_id={tool_call_id}, tool_name={tool_name})"
                 )
             }
             AgentEvent::ToolExecutionEnded {
+                step_id,
                 tool_call_id,
                 tool_name,
                 result,
             } => {
                 write!(
                     f,
-                    "ToolExecutionEnded(tool_call_id={tool_call_id}, tool_name={tool_name}, result={result})"
+                    "ToolExecutionEnded(step_id={}, tool_call_id={tool_call_id}, tool_name={tool_name}, result={result})",
+                    step_id.short(),
                 )
             }
             AgentEvent::ErrorOccurred { message, details } => {
                 write!(f, "ErrorOccurred(message={message:?}, details={details:?})")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_tool_events_are_distinct_from_live_progress() {
+        let requested = AgentEvent::ToolExecutionRequested {
+            invocation_id: ToolInvocationId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            arguments: serde_json::Map::new(),
+        };
+        let completed = AgentEvent::ToolExecutionEnded {
+            step_id: StepId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            result: "ok".to_string(),
+        };
+        let progress = AgentEvent::AssistantMessageTextDelta {
+            step_id: StepId::new(),
+            content_index: 0,
+            delta: "partial".to_string(),
+        };
+
+        assert!(requested.is_durable());
+        assert_eq!(requested.event_type(), "tool.execution_requested");
+        assert!(completed.is_durable());
+        assert_eq!(completed.event_type(), "tool.execution_ended");
+        assert!(!progress.is_durable());
+        assert_eq!(progress.event_type(), "live");
     }
 }

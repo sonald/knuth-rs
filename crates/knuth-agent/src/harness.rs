@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use knuth_core::ids::*;
 use std::collections::{HashSet, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use uuid::Uuid;
 
 const SUBSCRIPTION_BUFFER: usize = 100;
 
@@ -69,18 +69,20 @@ pub enum AgentActorMessage {
     Command(AgentCommand),
     /// A domain event reported by the model step identified by the `Uuid`.
     /// Committed to the log verbatim; never drives the state machine.
-    Turn(Uuid, AgentEvent),
+    Step(StepId, AgentEvent),
     /// Control signal from a step runner: the step is over. The actor derives
     /// and commits the `ModelStepEnded` domain event itself, then advances the
     /// turn state machine.
     StepFinished {
-        step_id: Uuid,
+        step_id: StepId,
+        generation: Generation,
         reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
     },
     /// Control signal from a spawned tool task: one tool call completed.
     ToolFinished {
-        turn_id: Uuid,
+        turn_id: TurnId,
+        step_id: StepId,
         tool_call_id: String,
         tool_name: String,
         result: String,
@@ -120,11 +122,16 @@ impl std::fmt::Display for AgentCommand {
 enum TurnState {
     Idle,
     /// A model step is streaming.
-    Streaming { turn_id: Uuid, step: AgentStepRunner },
+    Streaming {
+        turn_id: TurnId,
+        step_id: StepId,
+        generation: Generation,
+        step: AgentStepRunner,
+    },
     /// Tool calls from the last step are executing in background tasks;
     /// `pending` holds the tool_call_ids we are still waiting on.
     RunningTools {
-        turn_id: Uuid,
+        turn_id: TurnId,
         pending: HashSet<String>,
         cancel: CancellationToken,
     },
@@ -139,11 +146,14 @@ enum TurnState {
 /// [`AgentStepRunner`].
 #[derive(Debug)]
 pub(crate) struct AgentActor {
-    id: Uuid,
+    id: SessionId,
     config: AgentConfig,
 
     log: EventLog,
     tools: AgentToolRegistry,
+
+    generation: Generation,
+    next_step_id: Option<StepId>,
 
     turn: TurnState,
     pending_input_queue: VecDeque<PendingInput>,
@@ -184,7 +194,7 @@ impl Actor for AgentActor {
                 }
             }
 
-            AgentActorMessage::Turn(_, event) => {
+            AgentActorMessage::Step(_, event) => {
                 if let Err(e) = self.log.commit(event).await {
                     return self.handle_session_error(e.into()).await;
                 }
@@ -192,11 +202,12 @@ impl Actor for AgentActor {
 
             AgentActorMessage::StepFinished {
                 step_id,
+                generation,
                 reason,
                 assistant_message,
             } => {
                 if let Err(e) = self
-                    .handle_step_ended(step_id, reason, assistant_message, ctx)
+                    .handle_step_ended(step_id, generation, reason, assistant_message, ctx)
                     .await
                 {
                     return self.handle_session_error(e).await;
@@ -205,12 +216,13 @@ impl Actor for AgentActor {
 
             AgentActorMessage::ToolFinished {
                 turn_id,
+                step_id,
                 tool_call_id,
                 tool_name,
                 result,
             } => {
                 if let Err(e) = self
-                    .handle_tool_finished(turn_id, tool_call_id, tool_name, result, ctx)
+                    .handle_tool_finished(turn_id, step_id, tool_call_id, tool_name, result, ctx)
                     .await
                 {
                     return self.handle_session_error(e).await;
@@ -240,7 +252,7 @@ impl Actor for AgentActor {
 }
 
 impl AgentActor {
-    pub fn new(session_id: Uuid, config: AgentConfig) -> Self {
+    pub fn new(session_id: SessionId, config: AgentConfig) -> Self {
         let mut tools = AgentToolRegistry::new();
         tools.register(Arc::new(BashTool {}));
         tools.register(Arc::new(ReadFileTool {}));
@@ -253,6 +265,8 @@ impl AgentActor {
             config,
             log: EventLog::new(Box::new(InMemoryEventStore::new())),
             tools,
+            generation: Generation::new(),
+            next_step_id: None,
             turn: TurnState::Idle,
             pending_input_queue: VecDeque::new(),
         }
@@ -320,7 +334,8 @@ impl AgentActor {
             }
             UserContent::Blocks(v)
         };
-        self.pending_input_queue.push_back(PendingInput { content, intent });
+        self.pending_input_queue
+            .push_back(PendingInput { content, intent });
         self.try_dispatch_next_input(ctx).await?;
         Ok(())
     }
@@ -337,12 +352,14 @@ impl AgentActor {
             return Ok(());
         };
 
-        let turn_id = Uuid::now_v7();
+        let turn_id = TurnId::new();
+
         self.log
             .commit(AgentEvent::AgentTurnStarted { turn_id })
             .await?;
         self.log
             .commit(AgentEvent::UserMessageCommitted {
+                message_id: MessageId::new(),
                 content: input.content,
                 intent: input.intent,
             })
@@ -354,22 +371,38 @@ impl AgentActor {
     /// Runs the next model step of `turn_id` against the current conversation.
     async fn continue_step(
         &mut self,
-        turn_id: Uuid,
+        turn_id: TurnId,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         let step = self.spawn_model_step(ctx).await?;
-        self.turn = TurnState::Streaming { turn_id, step };
+        self.turn = TurnState::Streaming {
+            turn_id,
+            step_id: step.step_id(),
+            generation: step.generation(),
+            step,
+        };
         Ok(())
     }
 
     async fn handle_step_ended(
         &mut self,
-        step_id: Uuid,
+        step_id: StepId,
+        generation: Generation,
         reason: ModelStepEndReason,
         assistant_message: Option<AssistantMessage>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         debug!("Model step ended, reason: {:?}", reason);
+        let is_current = matches! {
+            self.turn,
+           TurnState::Streaming { step_id: current_step_id, generation: current_generation, ..}
+                if current_step_id == step_id && current_generation == generation
+        };
+
+        if !is_current {
+            debug!("StepFinished for stale step {step_id}");
+            return Ok(());
+        }
 
         let turn_id = match std::mem::replace(&mut self.turn, TurnState::Idle) {
             TurnState::Streaming { turn_id, .. } => turn_id,
@@ -421,7 +454,9 @@ impl AgentActor {
                 self.end_turn(turn_id, ctx).await
             }
             ModelStepEndReason::Cancelled => self.end_turn(turn_id, ctx).await,
-            _ if !tool_calls.is_empty() => self.spawn_tools(turn_id, tool_calls, ctx).await,
+            _ if !tool_calls.is_empty() => {
+                self.spawn_tools(turn_id, step_id, tool_calls, ctx).await
+            }
             _ => self.end_turn(turn_id, ctx).await,
         }
     }
@@ -431,7 +466,8 @@ impl AgentActor {
     /// while tools run.
     async fn spawn_tools(
         &mut self,
-        turn_id: Uuid,
+        turn_id: TurnId,
+        step_id: StepId,
         tool_calls: Vec<ToolCall>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
@@ -446,6 +482,7 @@ impl AgentActor {
         for call in tool_calls {
             self.log
                 .commit(AgentEvent::ToolExecutionStarted {
+                    step_id,
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
@@ -455,6 +492,7 @@ impl AgentActor {
             let Some(tool) = self.tools.get(&call.name) else {
                 self.log
                     .commit(AgentEvent::ToolExecutionEnded {
+                        step_id,
                         tool_call_id: call.id.clone(),
                         tool_name: call.name.clone(),
                         result: format!("Invalid tool name: {}", call.name),
@@ -478,6 +516,7 @@ impl AgentActor {
                 let _ = tx
                     .send(AgentActorMessage::ToolFinished {
                         turn_id,
+                        step_id,
                         tool_call_id: call.id,
                         tool_name: call.name,
                         result,
@@ -502,7 +541,8 @@ impl AgentActor {
 
     async fn handle_tool_finished(
         &mut self,
-        turn_id: Uuid,
+        turn_id: TurnId,
+        step_id: StepId,
         tool_call_id: String,
         tool_name: String,
         result: String,
@@ -510,6 +550,7 @@ impl AgentActor {
     ) -> Result<(), AgentSessionError> {
         self.log
             .commit(AgentEvent::ToolExecutionEnded {
+                step_id,
                 tool_call_id: tool_call_id.clone(),
                 tool_name,
                 result,
@@ -545,7 +586,7 @@ impl AgentActor {
 
     async fn end_turn(
         &mut self,
-        turn_id: Uuid,
+        turn_id: TurnId,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         self.log
@@ -563,6 +604,12 @@ impl AgentActor {
         }
     }
 
+    fn next_step_id(&mut self) -> (StepId, Generation) {
+        self.generation = self.generation.next();
+        self.next_step_id = Some(StepId::new());
+        (self.next_step_id.unwrap(), self.generation)
+    }
+
     async fn spawn_model_step(
         &mut self,
         actor_ctx: &mut ActorContext<AgentActorMessage>,
@@ -575,7 +622,11 @@ impl AgentActor {
 
         debug!("current conversation state: \n{}", self.log.conversation());
 
+        let (step_id, generation) = self.next_step_id();
+
         Ok(AgentStepRunner::new(
+            step_id,
+            generation,
             self.config.model.clone(),
             self.config.options.clone(),
             store_tx,
@@ -596,7 +647,7 @@ impl AgentActor {
 }
 
 pub struct AgentSession {
-    pub id: Uuid,
+    pub id: SessionId,
     pub name: String,
     pub description: String,
     runtime: ActorRuntime<AgentActorMessage>,
@@ -604,7 +655,7 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub async fn build(name: String, description: String, config: AgentConfig) -> Self {
-        let id = Uuid::now_v7();
+        let id = SessionId::new();
 
         let actor = AgentActor::new(id, config);
         let runtime = spawn_actor(actor, 100).await;
@@ -644,28 +695,35 @@ impl AgentSession {
         images: Vec<String>,
     ) -> Result<(), AgentSessionError> {
         let images = self.load_images(images).await?;
-        self.runtime.handle()
-            .ask(|reply| AgentActorMessage::Command(AgentCommand::SubmitInput {
-                intent: UserMessageIntent::Normal,
-                reply: reply,
-                input: input,
-                images: images,
-            })).await?
+        self.runtime
+            .handle()
+            .ask(|reply| {
+                AgentActorMessage::Command(AgentCommand::SubmitInput {
+                    intent: UserMessageIntent::Normal,
+                    reply: reply,
+                    input: input,
+                    images: images,
+                })
+            })
+            .await?
     }
 
     pub async fn subscribe(
         &mut self,
         from_seq: Option<u64>,
     ) -> Result<AgentSubscription, AgentSessionError> {
-        Ok(self.runtime.handle()
-            .ask(move |reply| AgentActorMessage::Command(AgentCommand::Subscribe {
-                reply,
-                from_seq,
-            })).await?)
+        Ok(self
+            .runtime
+            .handle()
+            .ask(move |reply| {
+                AgentActorMessage::Command(AgentCommand::Subscribe { reply, from_seq })
+            })
+            .await?)
     }
 
     pub async fn set_system_prompt(&mut self, prompt: String) -> Result<(), AgentSessionError> {
-        Ok(self.runtime
+        Ok(self
+            .runtime
             .handle()
             .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(
                 prompt,
@@ -711,8 +769,7 @@ mod tests {
     use super::*;
     use crate::test_support::faux_lock;
     use ai::providers::faux::{
-        clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call,
-        set_faux_responses,
+        clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call, set_faux_responses,
     };
     use ai::{Api, ModelCost, Provider};
     use futures::StreamExt;
@@ -759,6 +816,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_step_completion_is_not_published() {
+        let actor = AgentActor::new(
+            SessionId::new(),
+            AgentConfig {
+                model: faux_model(),
+                options: StreamOptions::default(),
+            },
+        );
+        let runtime = spawn_actor(actor, 8).await;
+        let mut sub = runtime
+            .handle()
+            .ask(|reply| {
+                AgentActorMessage::Command(AgentCommand::Subscribe {
+                    from_seq: None,
+                    reply,
+                })
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .handle()
+            .send(AgentActorMessage::StepFinished {
+                step_id: StepId::new(),
+                generation: Generation::new(),
+                reason: ModelStepEndReason::Success,
+                assistant_message: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(
+                "after stale completion".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next_event(&mut sub).await,
+            AgentEvent::SystemPromptSet { prompt } if prompt == "after stale completion"
+        ));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn turn_with_tool_call_keeps_turn_id_and_resumes_after_tools() {
         let _guard = faux_lock();
         clear_faux_responses();
@@ -771,16 +874,31 @@ mod tests {
 
         let mut session = mk_session().await;
         let mut sub = session.subscribe(None).await.unwrap();
-        session.submit_input("run it".to_string(), vec![]).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
 
         let mut turn_started = None;
         let mut tool_result = None;
-        let mut step_reasons = vec![];
+        let mut tool_started_step = None;
+        let mut tool_ended_step = None;
+        let mut step_ends = vec![];
         let turn_ended = loop {
             match next_event(&mut sub).await {
                 AgentEvent::AgentTurnStarted { turn_id } => turn_started = Some(turn_id),
-                AgentEvent::ToolExecutionEnded { result, .. } => tool_result = Some(result),
-                AgentEvent::ModelStepEnded { reason, .. } => step_reasons.push(reason),
+                AgentEvent::ToolExecutionStarted { step_id, .. } => {
+                    tool_started_step = Some(step_id)
+                }
+                AgentEvent::ToolExecutionEnded {
+                    step_id, result, ..
+                } => {
+                    tool_ended_step = Some(step_id);
+                    tool_result = Some(result);
+                }
+                AgentEvent::ModelStepEnded {
+                    step_id, reason, ..
+                } => step_ends.push((step_id, reason)),
                 AgentEvent::AgentTurnEnded { turn_id } => break turn_id,
                 _ => {}
             }
@@ -793,8 +911,13 @@ mod tests {
             "AgentTurnStarted and AgentTurnEnded must carry the same turn_id"
         );
         assert_eq!(tool_result.as_deref(), Some("tool-ran"));
+        assert_eq!(tool_started_step, Some(step_ends[0].0));
+        assert_eq!(tool_ended_step, Some(step_ends[0].0));
         assert_eq!(
-            step_reasons,
+            step_ends
+                .into_iter()
+                .map(|(_, reason)| reason)
+                .collect::<Vec<_>>(),
             vec![ModelStepEndReason::ToolUse, ModelStepEndReason::Success]
         );
 
@@ -812,8 +935,14 @@ mod tests {
 
         let mut session = mk_session().await;
         let mut sub = session.subscribe(None).await.unwrap();
-        session.submit_input("one".to_string(), vec![]).await.unwrap();
-        session.submit_input("two".to_string(), vec![]).await.unwrap();
+        session
+            .submit_input("one".to_string(), vec![])
+            .await
+            .unwrap();
+        session
+            .submit_input("two".to_string(), vec![])
+            .await
+            .unwrap();
 
         let mut turns = vec![];
         while turns.len() < 2 {

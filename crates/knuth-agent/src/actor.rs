@@ -55,7 +55,10 @@ pub enum AskError {
 
 impl<M> ActorHandle<M> {
     pub async fn send(&self, message: M) -> Result<(), AskError> {
-        self.tx.send(message).await.map_err(|_| AskError::MailboxSendError)
+        self.tx
+            .send(message)
+            .await
+            .map_err(|_| AskError::MailboxSendError)
     }
 
     pub fn addr(&self) -> ActorHandle<M> {
@@ -64,14 +67,15 @@ impl<M> ActorHandle<M> {
         }
     }
 
-    pub async fn ask<R>(&self, build_msg: impl FnOnce(oneshot::Sender<R>) -> M) -> Result<R, AskError> {
+    pub async fn ask<R>(
+        &self,
+        build_msg: impl FnOnce(oneshot::Sender<R>) -> M,
+    ) -> Result<R, AskError> {
         let (reply, receiver) = oneshot::channel();
-        self.send(build_msg(reply))
-            .await?;
+        self.send(build_msg(reply)).await?;
 
         receiver.await.map_err(|_| AskError::ReplyDropped)
     }
-
 }
 
 #[derive(Debug)]
