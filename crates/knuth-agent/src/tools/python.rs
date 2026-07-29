@@ -7,7 +7,9 @@ use once_cell::sync::Lazy;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentTool, ToolInput, ToolResult};
+use crate::{ToolCapabilities, ToolDescription, ToolError};
+
+use super::{required_string, AgentTool, ToolInput, ToolResult};
 
 pub struct PythonTool {}
 
@@ -17,17 +19,20 @@ impl AgentTool for PythonTool {
         &PYTHON_SCHEMA
     }
 
+    fn description(&self) -> ToolDescription {
+        ToolDescription {
+            id: (&PYTHON_SCHEMA.name).into(),
+            introduction: None,
+            capabilities: ToolCapabilities::ALL,
+        }
+    }
+
     async fn invoke(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolResult, String> {
-        let code = input
-            .get("code")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .ok_or("code must be a non-empty string")?;
-
+    ) -> Result<ToolResult, ToolError> {
+        let code = required_string(&input, "code")?;
 
         let mut command = Command::new("python3");
         let output = tokio::select! {
@@ -37,9 +42,9 @@ impl AgentTool for PythonTool {
                     content: b"Python execution cancelled".to_vec(),
                 })
             },
-            _ = tokio::time::sleep(Duration::from_secs(30)) => return Err("Python execution timed out after 30 seconds".to_string()),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => return Err(ToolError::TimeoutError(Duration::from_secs(30))),
             result = command.kill_on_drop(true).arg("-c").arg(code).output() => {
-                result.map_err(|error| error.to_string())?
+                result.map_err(|error| ToolError::Message(error.to_string()))?
             }
         };
 

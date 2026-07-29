@@ -560,7 +560,7 @@ impl AgentActor {
             tokio::spawn(async move {
                 let (outcome, content) = match tool.invoke(call.arguments, cancel).await {
                     Ok(ToolResult { outcome, content }) => (outcome, content),
-                    Err(e) => (ToolOutcome::Error, e.into_bytes()),
+                    Err(e) => (ToolOutcome::Error, e.to_string().into_bytes()),
                 };
                 let _ = tx
                     .send(AgentActorMessage::ToolFinished {

@@ -64,6 +64,31 @@ impl Generation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolId(String);
+
+impl ToolId {
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty() && self.0.contains('.')
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<ToolId> for String {
+    fn from(id: ToolId) -> Self {
+        id.as_str().to_string()
+    }
+}
+
+impl<T: AsRef<str> + ?Sized> From<&T> for ToolId {
+    fn from(s: &T) -> Self {
+        Self(s.as_ref().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

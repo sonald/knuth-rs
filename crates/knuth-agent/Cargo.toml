@@ -21,3 +21,4 @@ async-trait = { workspace = true }
 once_cell = { workspace = true }
 encoding_rs = "0.8"
 base64 = "0.22"
+bitflags = { version = "2.13.1", features = ["serde"] }

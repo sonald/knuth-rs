@@ -8,17 +8,11 @@ use once_cell::sync::Lazy;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentTool, ToolInput, ToolResult};
+use crate::{ToolCapabilities, ToolDescription, ToolError};
+
+use super::{required_string, required_string_allow_empty, AgentTool, ToolInput, ToolResult};
 
 const MAX_READ_BYTES: usize = 32 * 1024;
-
-fn required_string<'a>(input: &'a ToolInput, name: &str) -> Result<&'a str, String> {
-    input
-        .get(name)
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{name} must be a non-empty string"))
-}
 
 pub struct ReadFileTool {}
 
@@ -28,23 +22,31 @@ impl AgentTool for ReadFileTool {
         &READ_FILE_SCHEMA
     }
 
+    fn description(&self) -> ToolDescription {
+        ToolDescription {
+            id: (&READ_FILE_SCHEMA.name).into(),
+            introduction: None,
+            capabilities: ToolCapabilities::READ_FILE,
+        }
+    }
+
     async fn invoke(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolResult, String> {
+    ) -> Result<ToolResult, ToolError> {
         let path = required_string(&input, "path")?;
         let offset = input.get("offset").map_or(Ok(1), |value| {
             value
                 .as_u64()
                 .filter(|value| *value >= 1)
-                .ok_or_else(|| "offset must be an integer >= 1".to_string())
+                .ok_or_else(|| ToolError::ArgumentError("offset must be an integer >= 1".to_string()))
         })? as usize;
         let limit = input.get("limit").map_or(Ok(200), |value| {
             value
                 .as_u64()
                 .filter(|value| *value >= 1)
-                .ok_or_else(|| "limit must be an integer >= 1".to_string())
+                .ok_or_else(|| ToolError::ArgumentError("limit must be an integer >= 1".to_string()))
         })? as usize;
 
         let content = tokio::select! {
@@ -52,7 +54,7 @@ impl AgentTool for ReadFileTool {
                 outcome: ToolOutcome::Cancelled,
                 content: b"File read cancelled".to_vec(),
             }),
-            result = fs::read_to_string(path) => result.map_err(|error| error.to_string())?,
+            result = fs::read_to_string(path) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         };
         let lines: Vec<&str> = content.split_inclusive('\n').collect();
         let selected = lines.iter().skip(offset - 1).take(limit);
@@ -115,16 +117,21 @@ impl AgentTool for WriteFileTool {
         &WRITE_FILE_SCHEMA
     }
 
+    fn description(&self) -> ToolDescription {
+        ToolDescription {
+            id: (&WRITE_FILE_SCHEMA.name).into(),
+            introduction: None,
+            capabilities: ToolCapabilities::WRITE_FILE,
+        }
+    }
+
     async fn invoke(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolResult, String> {
+    ) -> Result<ToolResult, ToolError> {
         let path = required_string(&input, "path")?;
-        let content = input
-            .get("content")
-            .and_then(|value| value.as_str())
-            .ok_or("content must be a string")?;
+        let content = required_string_allow_empty(&input, "content")?;
 
         tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
@@ -136,7 +143,7 @@ impl AgentTool for WriteFileTool {
                     fs::create_dir_all(parent).await?;
                 }
                 fs::write(path, content).await
-            } => result.map_err(|error| error.to_string())?,
+            } => result.map_err(|error| ToolError::Message(error.to_string()))?,
         }
         Ok(ToolResult {
             outcome: ToolOutcome::ExecSuccess,
@@ -153,17 +160,22 @@ impl AgentTool for EditFileTool {
         &EDIT_FILE_SCHEMA
     }
 
+    fn description(&self) -> ToolDescription {
+        ToolDescription {
+            id: (&EDIT_FILE_SCHEMA.name).into(),
+            introduction: None,
+            capabilities: ToolCapabilities::READ_FILE | ToolCapabilities::WRITE_FILE,
+        }
+    }
+
     async fn invoke(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolResult, String> {
+    ) -> Result<ToolResult, ToolError> {
         let path = required_string(&input, "path")?;
         let old_string = required_string(&input, "old_string")?;
-        let new_string = input
-            .get("new_string")
-            .and_then(|value| value.as_str())
-            .ok_or("new_string must be a string")?;
+        let new_string = required_string_allow_empty(&input, "new_string")?;
         if old_string == new_string {
             return Ok(ToolResult {
                 outcome: ToolOutcome::Error,
@@ -173,7 +185,7 @@ impl AgentTool for EditFileTool {
         let replace_all = input.get("replace_all").map_or(Ok(false), |value| {
             value
                 .as_bool()
-                .ok_or_else(|| "replace_all must be a boolean".to_string())
+                .ok_or_else(|| ToolError::ArgumentError("replace_all must be a boolean".to_string()))
         })?;
 
         let raw = tokio::select! {
@@ -181,7 +193,7 @@ impl AgentTool for EditFileTool {
                 outcome: ToolOutcome::Cancelled,
                 content: b"File edit cancelled".to_vec(),
             }),
-            result = fs::read(path) => result.map_err(|error| error.to_string())?,
+            result = fs::read(path) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         };
         let (text, encoding) = decode_text(&raw)?;
         let count = text.matches(old_string).count();
@@ -211,7 +223,7 @@ impl AgentTool for EditFileTool {
                 outcome: ToolOutcome::Cancelled,
                 content: b"File edit cancelled".to_vec(),
             }),
-            result = fs::write(path, encoded) => result.map_err(|error| error.to_string())?,
+            result = fs::write(path, encoded) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         }
         Ok(ToolResult {
             outcome: ToolOutcome::ExecSuccess,
@@ -231,7 +243,7 @@ struct TextEncoding {
     name: &'static str,
 }
 
-fn decode_text(raw: &[u8]) -> Result<(String, TextEncoding), String> {
+fn decode_text(raw: &[u8]) -> Result<(String, TextEncoding), ToolError> {
     let candidates = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         vec![(UTF_8, &raw[3..], &b"\xEF\xBB\xBF"[..], "utf-8-sig")]
     } else if raw.starts_with(&[0xFF, 0xFE]) {
@@ -279,10 +291,10 @@ fn decode_text(raw: &[u8]) -> Result<(String, TextEncoding), String> {
             ));
         }
     }
-    Err("file is not a supported text encoding; supported encodings are utf-8-sig, utf-8, utf-16, utf-16-le, utf-16-be, gb18030".to_string())
+    Err(ToolError::Message("file is not a supported text encoding; supported encodings are utf-8-sig, utf-8, utf-16, utf-16-le, utf-16-be, gb18030".to_string()))
 }
 
-fn encode_text(text: &str, encoding: TextEncoding) -> Result<Vec<u8>, String> {
+fn encode_text(text: &str, encoding: TextEncoding) -> Result<Vec<u8>, ToolError> {
     let encoded = if encoding.encoding == UTF_16LE {
         text.encode_utf16()
             .flat_map(u16::to_le_bytes)
@@ -294,10 +306,10 @@ fn encode_text(text: &str, encoding: TextEncoding) -> Result<Vec<u8>, String> {
     } else {
         let (encoded, _, had_errors) = encoding.encoding.encode(text);
         if had_errors {
-            return Err(format!(
+            return Err(ToolError::Message(format!(
                 "edited content cannot be encoded as {}",
                 encoding.name
-            ));
+            )));
         }
         encoded.into_owned()
     };
@@ -425,5 +437,38 @@ mod tests {
             assert_eq!(detected.name, encoding.name);
             fs::remove_file(path).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn write_file_error_reports_mistyped_content_key() {
+        let error = WriteFileTool {}
+            .invoke(
+                input(json!({ "path": "/tmp/x.txt", "conTENT": "Hello" })),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("missing required argument \"content\""), "message={message}");
+        assert!(message.contains("\"conTENT\" (string)"), "message={message}");
+        assert!(message.contains("case-sensitive"), "message={message}");
+    }
+
+    #[tokio::test]
+    async fn edit_file_error_reports_non_string_value_type() {
+        let error = EditFileTool {}
+            .invoke(
+                input(json!({ "path": "/tmp/x.txt", "old_string": 12345, "new_string": "world" })),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("argument \"old_string\" must be a string, but received number (12345)"),
+            "message={message}"
+        );
     }
 }

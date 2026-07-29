@@ -114,14 +114,20 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
 struct CliRenderer {
     progress: MultiProgress,
     thinking: Option<ProgressBar>,
+    thinking_content: String,
     tools: HashMap<String, ProgressBar>,
 }
+
+/// How many characters of the in-progress thinking text are shown next to the
+/// spinner; the full content is printed once thinking completes.
+const THINKING_PREVIEW_CHARS: usize = 60;
 
 impl CliRenderer {
     fn new() -> Self {
         Self {
             progress: MultiProgress::new(),
             thinking: None,
+            thinking_content: String::new(),
             tools: HashMap::new(),
         }
     }
@@ -161,13 +167,25 @@ impl CliRenderer {
             LiveEvent::AssistantMessageTextCompleted { .. } => {
                 self.print('\n');
             }
-            LiveEvent::AssistantMessageThinkingStarted { .. }
-            | LiveEvent::AssistantMessageThinkingDelta { .. } => {
+            LiveEvent::AssistantMessageThinkingStarted { .. } => {
+                self.thinking_content.clear();
                 if self.thinking.is_none() {
                     self.thinking = Some(self.spinner("Thinking".to_string()));
                 }
             }
+            LiveEvent::AssistantMessageThinkingDelta { delta, .. } => {
+                self.thinking_content.push_str(delta);
+                if self.thinking.is_none() {
+                    self.thinking = Some(self.spinner("Thinking".to_string()));
+                }
+                let spinner = self.thinking.as_ref().expect("just ensured above");
+                spinner.set_message(format!(
+                    "Thinking {}",
+                    tail(&self.thinking_content, THINKING_PREVIEW_CHARS).dark_grey()
+                ));
+            }
             LiveEvent::AssistantMessageThinkingCompleted { content, .. } => {
+                self.thinking_content.clear();
                 if let Some(spinner) = self.thinking.take() {
                     spinner.finish_and_clear();
                 }
@@ -345,6 +363,14 @@ fn empty_dash(value: &str) -> &str {
     if value.is_empty() { "-" } else { value }
 }
 
+/// Last `max_chars` of `text`, without splitting a UTF-8 code point.
+fn tail(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth_back(max_chars.saturating_sub(1)) {
+        Some((idx, _)) => &text[idx..],
+        None => text,
+    }
+}
+
 fn redacted_presence(value: Option<&str>) -> String {
     match value {
         Some(value) if !value.is_empty() => format!("<set, {} chars>", value.len()),
@@ -417,6 +443,13 @@ mod tests {
     }
 
     #[test]
+    fn tail_keeps_last_chars_without_splitting_codepoints() {
+        assert_eq!(tail("hello", 3), "llo");
+        assert_eq!(tail("hi", 60), "hi");
+        assert_eq!(tail("你好世界啊", 3), "世界啊");
+    }
+
+    #[test]
     fn renderer_tracks_thinking_and_tool_lifetimes() {
         let mut renderer = CliRenderer::new();
         let step_id = StepId::new();
@@ -426,6 +459,19 @@ mod tests {
             content_index: 0,
         });
         assert!(renderer.thinking.is_some());
+
+        renderer.render_live(&LiveEvent::AssistantMessageThinkingDelta {
+            step_id,
+            content_index: 0,
+            delta: "thinking hard".to_string(),
+        });
+        assert!(renderer.thinking.is_some());
+        assert!(renderer
+            .thinking
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("thinking hard"));
 
         renderer.render_live(&LiveEvent::AssistantMessageThinkingCompleted {
             step_id,

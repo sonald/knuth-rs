@@ -5,7 +5,9 @@ use once_cell::sync::Lazy;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentTool, ToolInput, ToolResult};
+use crate::{ToolCapabilities, ToolDescription, ToolError};
+
+use super::{required_string, AgentTool, ToolInput, ToolResult};
 
 pub struct BashTool {}
 
@@ -15,15 +17,20 @@ impl AgentTool for BashTool {
         &BASH_SCHEMA
     }
 
+    fn description(&self) -> ToolDescription {
+        ToolDescription {
+            id: (&BASH_SCHEMA.name).into(),
+            introduction: None,
+            capabilities: ToolCapabilities::ALL,
+        }
+    }
+
     async fn invoke(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
-    ) -> Result<ToolResult, String> {
-        let command = input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or("command is required")?;
+    ) -> Result<ToolResult, ToolError> {
+        let command = required_string(&input, "command")?;
 
         let mut cmd = Command::new("bash");
         let output = tokio::select! {
@@ -32,7 +39,7 @@ impl AgentTool for BashTool {
                 content: b"Command execution cancelled".to_vec(),
             }),
             output = cmd.kill_on_drop(true).arg("-c").arg(command).output() => {
-                output.map_err(|e| e.to_string())?
+                output.map_err(|e| ToolError::Message(e.to_string()))?
             }
         };
 
@@ -62,7 +69,9 @@ static BASH_SCHEMA: Lazy<Tool> = Lazy::new(|| Tool {
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "The command to execute" }
-        }
+        },
+        "required": ["command"],
+        "additionalProperties": false
     }),
 });
 
@@ -114,5 +123,21 @@ mod tests {
         assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
         let content = String::from_utf8_lossy(&result.content);
         assert!(content.contains('\u{fffd}'), "content={content}");
+    }
+
+    #[tokio::test]
+    async fn bash_tool_error_echoes_received_argument_keys() {
+        let mut wrong_case = ToolInput::new();
+        wrong_case.insert("CMD".to_string(), serde_json::Value::String("ls".to_string()));
+
+        let error = BashTool {}
+            .invoke(wrong_case, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("missing required argument \"command\""), "message={message}");
+        assert!(message.contains("received arguments: \"CMD\" (string)"), "message={message}");
+        assert!(message.contains("case-sensitive"), "message={message}");
     }
 }
