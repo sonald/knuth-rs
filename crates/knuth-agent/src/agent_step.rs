@@ -4,7 +4,7 @@ use ai::{AssistantMessage, DoneReason, Model, StreamOptions, stream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use knuth_core::{
-    AgentEvent, ModelStepEndReason,
+    AgentEvent, LiveEvent, ModelStepEndReason,
     ids::{Generation, StepId},
 };
 use tokio::sync::mpsc;
@@ -157,6 +157,15 @@ impl AgentStepActor {
             .map_err(|e| AgentStepError::EventSendError(e.to_string()))
     }
 
+    /// Reports streaming progress. Routed through the actor mailbox like
+    /// durable events so subscribers observe both in emission order.
+    async fn emit_live(&mut self, event: LiveEvent) -> Result<(), AgentStepError> {
+        self.store_tx
+            .send(AgentActorMessage::Live(event))
+            .await
+            .map_err(|e| AgentStepError::EventSendError(e.to_string()))
+    }
+
     async fn handle_event(
         &mut self,
         event: ai::AssistantMessageEvent,
@@ -179,7 +188,7 @@ impl AgentStepActor {
             }
 
             ai::AssistantMessageEvent::TextStart { content_index, .. } => {
-                self.emit(AgentEvent::AssistantMessageTextStarted {
+                self.emit_live(LiveEvent::AssistantMessageTextStarted {
                     step_id: self.step_id,
                     content_index,
                 })
@@ -190,7 +199,7 @@ impl AgentStepActor {
                 delta,
                 ..
             } => {
-                self.emit(AgentEvent::AssistantMessageTextDelta {
+                self.emit_live(LiveEvent::AssistantMessageTextDelta {
                     step_id: self.step_id,
                     content_index,
                     delta,
@@ -203,7 +212,7 @@ impl AgentStepActor {
                 partial,
                 ..
             } => {
-                self.emit(AgentEvent::AssistantMessageTextCompleted {
+                self.emit_live(LiveEvent::AssistantMessageTextCompleted {
                     step_id: self.step_id,
                     content_index,
                     text_content: content,
@@ -213,7 +222,7 @@ impl AgentStepActor {
             }
 
             ai::AssistantMessageEvent::ThinkingStart { content_index, .. } => {
-                self.emit(AgentEvent::AssistantMessageThinkingStarted {
+                self.emit_live(LiveEvent::AssistantMessageThinkingStarted {
                     step_id: self.step_id,
                     content_index,
                 })
@@ -224,7 +233,7 @@ impl AgentStepActor {
                 delta,
                 ..
             } => {
-                self.emit(AgentEvent::AssistantMessageThinkingDelta {
+                self.emit_live(LiveEvent::AssistantMessageThinkingDelta {
                     step_id: self.step_id,
                     content_index,
                     delta,
@@ -236,7 +245,7 @@ impl AgentStepActor {
                 content,
                 ..
             } => {
-                self.emit(AgentEvent::AssistantMessageThinkingCompleted {
+                self.emit_live(LiveEvent::AssistantMessageThinkingCompleted {
                     step_id: self.step_id,
                     content_index,
                     content,
@@ -244,8 +253,9 @@ impl AgentStepActor {
                 .await?;
             }
 
+            // ignore these events; they are handled by the harness after completion
+            // TODO: streaming tool calls need to be handled here?
             ai::AssistantMessageEvent::ToolCallEnd { .. } => {}
-
             ai::AssistantMessageEvent::ToolCallStart { .. } => {}
             ai::AssistantMessageEvent::ToolCallDelta { .. } => {}
         }
@@ -472,6 +482,9 @@ mod tests {
                         assert_eq!(*step_id, expected_step_id);
                     }
                 }
+                AgentActorMessage::Live(event) => {
+                    assert_eq!(event.step_id(), expected_step_id);
+                }
                 AgentActorMessage::StepFinished { step_id, .. } => {
                     assert_eq!(*step_id, expected_step_id);
                 }
@@ -493,42 +506,19 @@ mod tests {
         let live_events = messages
             .iter()
             .filter_map(|message| match message {
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageTextStarted { step_id, .. },
-                ) => Some(("text.started", *step_id)),
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageTextDelta { step_id, .. },
-                ) => Some(("text.delta", *step_id)),
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageTextCompleted { step_id, .. },
-                ) => Some(("text.completed", *step_id)),
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageThinkingStarted { step_id, .. },
-                ) => Some(("thinking.started", *step_id)),
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageThinkingDelta { step_id, .. },
-                ) => Some(("thinking.delta", *step_id)),
-                AgentActorMessage::Step(
-                    _,
-                    AgentEvent::AssistantMessageThinkingCompleted { step_id, .. },
-                ) => Some(("thinking.completed", *step_id)),
+                AgentActorMessage::Live(event) => Some((event.name(), event.step_id())),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             live_events,
             [
-                ("text.started", expected_step_id),
-                ("text.delta", expected_step_id),
-                ("text.completed", expected_step_id),
-                ("thinking.started", expected_step_id),
-                ("thinking.delta", expected_step_id),
-                ("thinking.completed", expected_step_id),
+                ("AssistantMessageTextStarted", expected_step_id),
+                ("AssistantMessageTextDelta", expected_step_id),
+                ("AssistantMessageTextCompleted", expected_step_id),
+                ("AssistantMessageThinkingStarted", expected_step_id),
+                ("AssistantMessageThinkingDelta", expected_step_id),
+                ("AssistantMessageThinkingCompleted", expected_step_id),
             ]
         );
 

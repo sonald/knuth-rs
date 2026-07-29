@@ -13,8 +13,8 @@ use ai::{
     UserContentBlock,
 };
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStoreError, InMemoryEventStore, ModelStepEndReason,
-    SessionEndReason, UserMessageIntent,
+    AgentEvent, AgentSubscription, EventStoreError, InMemoryEventStore, LiveEvent,
+    ModelStepEndReason, SessionEndReason, ToolOutcome, UserMessageIntent,
 };
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot;
@@ -65,11 +65,44 @@ struct PendingInput {
     intent: UserMessageIntent,
 }
 
+/// A finished tool invocation, ready to be recorded as `ToolResultReceived`.
+#[derive(Debug)]
+struct CompletedToolCall {
+    step_id: StepId,
+    invocation_id: ToolInvocationId,
+    tool_call_id: String,
+    tool_name: String,
+    outcome: ToolOutcome,
+    content: Vec<u8>,
+}
+
+impl CompletedToolCall {
+    fn failed(
+        step_id: StepId,
+        invocation_id: ToolInvocationId,
+        tool_call_id: String,
+        tool_name: String,
+        message: String,
+    ) -> Self {
+        Self {
+            step_id,
+            invocation_id,
+            tool_call_id,
+            tool_name,
+            outcome: ToolOutcome::Error,
+            content: message.into_bytes(),
+        }
+    }
+}
+
 pub enum AgentActorMessage {
     Command(AgentCommand),
     /// A domain event reported by the model step identified by the `Uuid`.
     /// Committed to the log verbatim; never drives the state machine.
     Step(StepId, AgentEvent),
+    /// Streaming progress from a model step. Fanned out to subscribers and
+    /// then dropped; never persisted and never drives the state machine.
+    Live(LiveEvent),
     /// Control signal from a step runner: the step is over. The actor derives
     /// and commits the `ModelStepEnded` domain event itself, then advances the
     /// turn state machine.
@@ -83,9 +116,11 @@ pub enum AgentActorMessage {
     ToolFinished {
         turn_id: TurnId,
         step_id: StepId,
+        invocation_id: ToolInvocationId,
         tool_call_id: String,
         tool_name: String,
-        result: String,
+        outcome: ToolOutcome,
+        content: Vec<u8>,
     },
 }
 
@@ -200,6 +235,8 @@ impl Actor for AgentActor {
                 }
             }
 
+            AgentActorMessage::Live(event) => self.log.publish_live(event),
+
             AgentActorMessage::StepFinished {
                 step_id,
                 generation,
@@ -217,14 +254,21 @@ impl Actor for AgentActor {
             AgentActorMessage::ToolFinished {
                 turn_id,
                 step_id,
+                invocation_id,
                 tool_call_id,
                 tool_name,
-                result,
+                outcome,
+                content,
             } => {
-                if let Err(e) = self
-                    .handle_tool_finished(turn_id, step_id, tool_call_id, tool_name, result, ctx)
-                    .await
-                {
+                let completed = CompletedToolCall {
+                    step_id,
+                    invocation_id,
+                    tool_call_id,
+                    tool_name,
+                    outcome,
+                    content,
+                };
+                if let Err(e) = self.handle_tool_finished(turn_id, completed, ctx).await {
                     return self.handle_session_error(e).await;
                 }
             }
@@ -480,24 +524,33 @@ impl AgentActor {
         let mut pending = HashSet::new();
 
         for call in tool_calls {
+            let invocation_id = ToolInvocationId::new();
+
             self.log
-                .commit(AgentEvent::ToolExecutionStarted {
+                .commit(AgentEvent::ToolExecutionRequested {
+                    invocation_id,
                     step_id,
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 })
                 .await?;
+            self.log.publish_live(LiveEvent::ToolExecutionStarted {
+                step_id,
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            });
 
             let Some(tool) = self.tools.get(&call.name) else {
-                self.log
-                    .commit(AgentEvent::ToolExecutionEnded {
-                        step_id,
-                        tool_call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        result: format!("Invalid tool name: {}", call.name),
-                    })
-                    .await?;
+                self.record_tool_result(CompletedToolCall::failed(
+                    step_id,
+                    invocation_id,
+                    call.id.clone(),
+                    call.name.clone(),
+                    format!("Invalid tool name: {}", call.name),
+                ))
+                .await?;
                 continue;
             };
 
@@ -505,19 +558,19 @@ impl AgentActor {
             let tx = self_tx.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let result = match tool.invoke(call.arguments, cancel).await {
-                    Ok(ToolResult { content, .. }) => {
-                        String::from_utf8_lossy(&content).into_owned()
-                    }
-                    Err(e) => e,
+                let (outcome, content) = match tool.invoke(call.arguments, cancel).await {
+                    Ok(ToolResult { outcome, content }) => (outcome, content),
+                    Err(e) => (ToolOutcome::Error, e.into_bytes()),
                 };
                 let _ = tx
                     .send(AgentActorMessage::ToolFinished {
                         turn_id,
                         step_id,
+                        invocation_id,
                         tool_call_id: call.id,
                         tool_name: call.name,
-                        result,
+                        outcome,
+                        content,
                     })
                     .await;
             });
@@ -537,23 +590,48 @@ impl AgentActor {
         }
     }
 
+    /// Records the outcome of one invocation: the durable `ToolResultReceived`
+    /// that replay depends on, plus the live counterpart for observers.
+    async fn record_tool_result(
+        &mut self,
+        completed: CompletedToolCall,
+    ) -> Result<(), AgentSessionError> {
+        let CompletedToolCall {
+            step_id,
+            invocation_id,
+            tool_call_id,
+            tool_name,
+            outcome,
+            content,
+        } = completed;
+
+        self.log
+            .commit(AgentEvent::ToolResultReceived {
+                invocation_id,
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                outcome,
+                content: content.clone(),
+            })
+            .await?;
+        self.log.publish_live(LiveEvent::ToolExecutionEnded {
+            step_id,
+            tool_call_id,
+            tool_name,
+            result: String::from_utf8_lossy(&content).into_owned(),
+        });
+
+        Ok(())
+    }
+
     async fn handle_tool_finished(
         &mut self,
         turn_id: TurnId,
-        step_id: StepId,
-        tool_call_id: String,
-        tool_name: String,
-        result: String,
+        completed: CompletedToolCall,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        self.log
-            .commit(AgentEvent::ToolExecutionEnded {
-                step_id,
-                tool_call_id: tool_call_id.clone(),
-                tool_name,
-                result,
-            })
-            .await?;
+        let tool_call_id = completed.tool_call_id.clone();
+        self.record_tool_result(completed).await?;
 
         let TurnState::RunningTools {
             turn_id: current_turn,
@@ -771,6 +849,7 @@ mod tests {
     };
     use ai::{Api, ModelCost, Provider};
     use futures::StreamExt;
+    use knuth_core::SessionEvent;
     use serde_json::Map;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -805,12 +884,20 @@ mod tests {
         .await
     }
 
-    async fn next_event(sub: &mut AgentSubscription) -> AgentEvent {
+    async fn next_session_event(sub: &mut AgentSubscription) -> SessionEvent {
         timeout(Duration::from_secs(5), sub.next())
             .await
             .expect("timed out waiting for event")
             .expect("subscription closed unexpectedly")
-            .event
+    }
+
+    /// Skips live progress so assertions see only the replayable history.
+    async fn next_durable_event(sub: &mut AgentSubscription) -> AgentEvent {
+        loop {
+            if let SessionEvent::Durable(stored) = next_session_event(sub).await {
+                return stored.event;
+            }
+        }
     }
 
     #[tokio::test]
@@ -853,7 +940,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            next_event(&mut sub).await,
+            next_durable_event(&mut sub).await,
             AgentEvent::SystemPromptSet { prompt } if prompt == "after stale completion"
         ));
         runtime.shutdown().await;
@@ -878,27 +965,41 @@ mod tests {
             .unwrap();
 
         let mut turn_started = None;
-        let mut tool_result = None;
-        let mut tool_started_step = None;
-        let mut tool_ended_step = None;
+        let mut requested = None;
+        let mut received = None;
+        let mut live_started_step = None;
+        let mut live_ended = None;
         let mut step_ends = vec![];
         let turn_ended = loop {
-            match next_event(&mut sub).await {
-                AgentEvent::AgentTurnStarted { turn_id } => turn_started = Some(turn_id),
-                AgentEvent::ToolExecutionStarted { step_id, .. } => {
-                    tool_started_step = Some(step_id)
-                }
-                AgentEvent::ToolExecutionEnded {
-                    step_id, result, ..
-                } => {
-                    tool_ended_step = Some(step_id);
-                    tool_result = Some(result);
-                }
-                AgentEvent::ModelStepEnded {
-                    step_id, reason, ..
-                } => step_ends.push((step_id, reason)),
-                AgentEvent::AgentTurnEnded { turn_id } => break turn_id,
-                _ => {}
+            match next_session_event(&mut sub).await {
+                SessionEvent::Durable(stored) => match stored.event {
+                    AgentEvent::AgentTurnStarted { turn_id } => turn_started = Some(turn_id),
+                    AgentEvent::ToolExecutionRequested {
+                        invocation_id,
+                        step_id,
+                        ..
+                    } => requested = Some((invocation_id, step_id)),
+                    AgentEvent::ToolResultReceived {
+                        invocation_id,
+                        outcome,
+                        content,
+                        ..
+                    } => received = Some((invocation_id, outcome, content)),
+                    AgentEvent::ModelStepEnded {
+                        step_id, reason, ..
+                    } => step_ends.push((step_id, reason)),
+                    AgentEvent::AgentTurnEnded { turn_id } => break turn_id,
+                    _ => {}
+                },
+                SessionEvent::Live(event) => match event {
+                    LiveEvent::ToolExecutionStarted { step_id, .. } => {
+                        live_started_step = Some(step_id)
+                    }
+                    LiveEvent::ToolExecutionEnded {
+                        step_id, result, ..
+                    } => live_ended = Some((step_id, result)),
+                    _ => {}
+                },
             }
         };
         clear_faux_responses();
@@ -908,14 +1009,27 @@ mod tests {
             turn_ended,
             "AgentTurnStarted and AgentTurnEnded must carry the same turn_id"
         );
-        assert!(
-            tool_result
-                .as_deref()
-                .is_some_and(|result| result.contains("tool-ran")),
-            "tool result should include command stdout, got {tool_result:?}"
+
+        let (requested_invocation, requested_step) = requested.expect("tool should be requested");
+        let (received_invocation, outcome, content) = received.expect("tool should report a result");
+        assert_eq!(
+            requested_invocation, received_invocation,
+            "the durable pair must share one invocation_id"
         );
-        assert_eq!(tool_started_step, Some(step_ends[0].0));
-        assert_eq!(tool_ended_step, Some(step_ends[0].0));
+        assert_eq!(outcome, ToolOutcome::ExecSuccess);
+        assert!(
+            String::from_utf8_lossy(&content).contains("tool-ran"),
+            "tool result should include command stdout, got {content:?}"
+        );
+
+        let (live_ended_step, live_result) = live_ended.expect("tool should report live completion");
+        assert!(
+            live_result.contains("tool-ran"),
+            "live result should mirror the durable content, got {live_result:?}"
+        );
+        assert_eq!(requested_step, step_ends[0].0);
+        assert_eq!(live_started_step, Some(step_ends[0].0));
+        assert_eq!(live_ended_step, step_ends[0].0);
         assert_eq!(
             step_ends
                 .into_iter()
@@ -949,7 +1063,7 @@ mod tests {
 
         let mut turns = vec![];
         while turns.len() < 2 {
-            if let AgentEvent::AgentTurnEnded { turn_id } = next_event(&mut sub).await {
+            if let AgentEvent::AgentTurnEnded { turn_id } = next_durable_event(&mut sub).await {
                 turns.push(turn_id);
             }
         }

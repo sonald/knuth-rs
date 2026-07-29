@@ -1,6 +1,7 @@
 use ai::{Message, ToolResultMessage, ToolResultRole, UserContentBlock, UserMessage, UserRole};
 use knuth_core::{
-    AgentEvent, AgentSubscription, EventStore, EventStoreError, ModelStepEndReason, StoredEvent,
+    AgentEvent, AgentSubscription, EventStore, EventStoreError, LiveEvent, ModelStepEndReason,
+    SessionEvent, StoredEvent,
 };
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -8,14 +9,18 @@ use tracing::debug;
 
 /// Append-only session log.
 ///
-/// Owns the three things that must stay in sync on every event: durable
+/// Owns the three things that must stay in sync on every durable event:
 /// storage (`EventStore`), the conversation projection used to assemble model
-/// context, and fan-out to live subscribers. `commit` is the only write path,
-/// so the three views cannot drift apart.
+/// context, and fan-out to subscribers. `commit` is the only write path, so the
+/// three views cannot drift apart.
+///
+/// Live events take the separate, weaker [`EventLog::publish_live`] path: they
+/// reach subscribers only, so they can never influence storage or the
+/// conversation.
 #[derive(Debug)]
 pub struct EventLog {
     store: Box<dyn EventStore>,
-    subscriptions: Vec<mpsc::Sender<StoredEvent>>,
+    subscriptions: Vec<mpsc::Sender<SessionEvent>>,
     conversation: ConversationState,
 }
 
@@ -31,8 +36,13 @@ impl EventLog {
     pub async fn commit(&mut self, event: AgentEvent) -> Result<StoredEvent, EventStoreError> {
         let stored = self.store.append(event).await?;
         self.conversation.apply_event(stored.clone());
-        self.notify_subscriptions(stored.clone());
+        self.notify_subscriptions(SessionEvent::Durable(stored.clone()));
         Ok(stored)
+    }
+
+    /// Fans a progress notification out to subscribers without persisting it.
+    pub fn publish_live(&mut self, event: LiveEvent) {
+        self.notify_subscriptions(SessionEvent::Live(event));
     }
 
     pub fn subscribe(&mut self, buffer: usize) -> AgentSubscription {
@@ -53,7 +63,7 @@ impl EventLog {
         &self.conversation
     }
 
-    fn notify_subscriptions(&mut self, event: StoredEvent) {
+    fn notify_subscriptions(&mut self, event: SessionEvent) {
         self.subscriptions
             .retain_mut(|s| match s.try_send(event.clone()) {
                 Ok(_) => true,
@@ -104,15 +114,22 @@ impl ConversationState {
                     timestamp: event.timestamp.timestamp(),
                 }));
             }
-            AgentEvent::ToolExecutionEnded {
+            AgentEvent::ToolResultReceived {
                 tool_call_id,
                 tool_name,
-                result,
+                outcome,
+                content,
                 ..
             } => {
-                debug!("append ToolExecutionEnded event to conversation state");
+                // we deliberately treat error as message content, not a flag
+                let content = String::from_utf8_lossy(&content).into_owned();
+                let result_text = if outcome.is_success() {
+                    content
+                } else {
+                    format!("Tool call failed with details: \n{}", content)
+                };
 
-                let content = vec![UserContentBlock::text(result)];
+                let content = vec![UserContentBlock::text(result_text)];
                 self.add_message(Message::ToolResult(ToolResultMessage {
                     role: ToolResultRole::ToolResult,
                     tool_call_id,
@@ -150,7 +167,10 @@ impl std::fmt::Display for ConversationState {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use knuth_core::{InMemoryEventStore, UserMessageIntent, ids::MessageId};
+    use knuth_core::{
+        InMemoryEventStore, ToolOutcome, UserMessageIntent,
+        ids::{MessageId, StepId, ToolInvocationId},
+    };
 
     fn mk_log() -> EventLog {
         EventLog::new(Box::new(InMemoryEventStore::new()))
@@ -190,8 +210,58 @@ mod tests {
             .unwrap();
 
         let received = sub.next().await.expect("subscriber should receive event");
+        let received = received.as_durable().expect("committed events are durable");
         assert_eq!(received.stream_seq, stored.stream_seq);
         assert_eq!(received.hash, stored.hash);
+    }
+
+    #[tokio::test]
+    async fn live_events_reach_subscribers_without_touching_the_log() {
+        let mut log = mk_log();
+        let mut sub = log.subscribe(4);
+
+        log.publish_live(LiveEvent::AssistantMessageTextDelta {
+            step_id: StepId::new(),
+            content_index: 0,
+            delta: "partial".to_string(),
+        });
+
+        let received = sub.next().await.expect("subscriber should receive event");
+        assert!(matches!(
+            received.as_live(),
+            Some(LiveEvent::AssistantMessageTextDelta { delta, .. }) if delta == "partial"
+        ));
+        assert!(
+            log.messages().is_empty(),
+            "live events must not enter the conversation"
+        );
+        assert!(
+            log.store.range(0, 16).await.unwrap().is_empty(),
+            "live events must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_projects_into_conversation_with_error_flag() {
+        let mut log = mk_log();
+
+        log.commit(AgentEvent::ToolResultReceived {
+            invocation_id: ToolInvocationId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            outcome: ToolOutcome::Error,
+            content: b"boom".to_vec(),
+        })
+        .await
+        .unwrap();
+
+        match log.messages() {
+            [Message::ToolResult(message)] => {
+                assert_eq!(message.tool_call_id, "call-1");
+                assert!(message.is_error);
+            }
+            other => panic!("expected a single tool result message, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::{
 
 use futures::StreamExt;
 use knuth_agent::harness::{AgentConfig, AgentSession};
-use knuth_core::{AgentEvent, AgentSubscription};
+use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
 use config::UserSettings;
@@ -145,35 +145,35 @@ impl CliRenderer {
         });
     }
 
-    fn render_event(&mut self, event: &AgentEvent) {
+    fn render(&mut self, event: &SessionEvent) {
         match event {
-            AgentEvent::AssistantMessageTextDelta { delta, .. } => {
+            SessionEvent::Live(event) => self.render_live(event),
+            SessionEvent::Durable(stored) => self.render_durable(&stored.event),
+        }
+    }
+
+    /// Streaming output: everything the user watches arrive token by token.
+    fn render_live(&mut self, event: &LiveEvent) {
+        match event {
+            LiveEvent::AssistantMessageTextDelta { delta, .. } => {
                 self.print(delta.as_str().green());
             }
-            AgentEvent::AssistantMessageTextCompleted { .. } => {
+            LiveEvent::AssistantMessageTextCompleted { .. } => {
                 self.print('\n');
             }
-            AgentEvent::AssistantMessageThinkingStarted { .. } => {
+            LiveEvent::AssistantMessageThinkingStarted { .. }
+            | LiveEvent::AssistantMessageThinkingDelta { .. } => {
                 if self.thinking.is_none() {
                     self.thinking = Some(self.spinner("Thinking".to_string()));
                 }
             }
-            AgentEvent::AssistantMessageThinkingDelta { .. } => {
-                if self.thinking.is_none() {
-                    self.thinking = Some(self.spinner("Thinking".to_string()));
-                }
-            }
-            AgentEvent::AssistantMessageThinkingCompleted { content, .. } => {
+            LiveEvent::AssistantMessageThinkingCompleted { content, .. } => {
                 if let Some(spinner) = self.thinking.take() {
                     spinner.finish_and_clear();
                 }
                 self.print(format!("* Thinking:\n{content}\n").blue());
             }
-            AgentEvent::ErrorOccurred { message, .. } => {
-                self.progress
-                    .suspend(|| eprintln!("{}", message.as_str().red()));
-            }
-            AgentEvent::ToolExecutionStarted {
+            LiveEvent::ToolExecutionStarted {
                 tool_call_id,
                 tool_name,
                 arguments,
@@ -187,7 +187,7 @@ impl CliRenderer {
                 self.tools
                     .insert(tool_call_id.clone(), self.spinner(message));
             }
-            AgentEvent::ToolExecutionEnded {
+            LiveEvent::ToolExecutionEnded {
                 tool_call_id,
                 result,
                 ..
@@ -199,9 +199,23 @@ impl CliRenderer {
                 }
                 self.print(format!("* Result:\n{result}\n").cyan());
             }
+            LiveEvent::AssistantMessageTextStarted { .. }
+            | LiveEvent::ToolExecutionUpdated { .. } => {
+                debug!("Live: {}", format!("{event}").dark_yellow());
+            }
+        }
+    }
+
+    /// Committed history: only errors are surfaced; the rest is trace output,
+    /// since the live stream already showed the user what happened.
+    fn render_durable(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ErrorOccurred { message, .. } => {
+                self.progress
+                    .suspend(|| eprintln!("{}", message.as_str().red()));
+            }
             _ => {
-                let msg = format!("{}", event);
-                debug!("Ev: {}", msg.dark_yellow());
+                debug!("Ev: {}", format!("{event}").dark_yellow());
             }
         }
     }
@@ -236,11 +250,14 @@ async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscripti
                 session.cancel_current_turn().await?;
             }
             maybe_event = subscription.next() => {
-                let Some(stored) = maybe_event else {
+                let Some(event) = maybe_event else {
                     anyhow::bail!("event stream closed unexpectedly");
                 };
-                renderer.render_event(&stored.event);
-                if matches!(stored.event, AgentEvent::AgentTurnEnded { .. }) {
+                renderer.render(&event);
+                if matches!(
+                    event.as_durable().map(|stored| &stored.event),
+                    Some(AgentEvent::AgentTurnEnded { .. })
+                ) {
                     println!();
                     return Ok(());
                 }
@@ -404,20 +421,20 @@ mod tests {
         let mut renderer = CliRenderer::new();
         let step_id = StepId::new();
 
-        renderer.render_event(&AgentEvent::AssistantMessageThinkingStarted {
+        renderer.render_live(&LiveEvent::AssistantMessageThinkingStarted {
             step_id,
             content_index: 0,
         });
         assert!(renderer.thinking.is_some());
 
-        renderer.render_event(&AgentEvent::AssistantMessageThinkingCompleted {
+        renderer.render_live(&LiveEvent::AssistantMessageThinkingCompleted {
             step_id,
             content_index: 0,
             content: "done".to_string(),
         });
         assert!(renderer.thinking.is_none());
 
-        renderer.render_event(&AgentEvent::ToolExecutionStarted {
+        renderer.render_live(&LiveEvent::ToolExecutionStarted {
             step_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
@@ -425,7 +442,7 @@ mod tests {
         });
         assert!(renderer.tools.contains_key("call-1"));
 
-        renderer.render_event(&AgentEvent::ToolExecutionEnded {
+        renderer.render_live(&LiveEvent::ToolExecutionEnded {
             step_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),

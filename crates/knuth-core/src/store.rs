@@ -15,6 +15,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::events::*;
+use crate::live::LiveEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEvent {
@@ -97,13 +98,52 @@ impl std::fmt::Display for StoredEvent {
     }
 }
 
+/// What a subscriber observes: the durable log interleaved with the ephemeral
+/// progress stream.
+///
+/// The two arms differ in guarantees, not just in payload. `Durable` events are
+/// persisted and sequenced, so a subscriber can resume from `stream_seq`.
+/// `Live` events are best-effort and unsequenced; a slow subscriber may miss
+/// them entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "event")]
+pub enum SessionEvent {
+    Durable(StoredEvent),
+    Live(LiveEvent),
+}
+
+impl SessionEvent {
+    pub fn as_durable(&self) -> Option<&StoredEvent> {
+        match self {
+            SessionEvent::Durable(stored) => Some(stored),
+            SessionEvent::Live(_) => None,
+        }
+    }
+
+    pub fn as_live(&self) -> Option<&LiveEvent> {
+        match self {
+            SessionEvent::Live(event) => Some(event),
+            SessionEvent::Durable(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionEvent::Durable(stored) => write!(f, "{stored}"),
+            SessionEvent::Live(event) => write!(f, "live: {event}"),
+        }
+    }
+}
+
 pub struct AgentSubscription {
-    rx: mpsc::Receiver<StoredEvent>,
+    rx: mpsc::Receiver<SessionEvent>,
     pub id: Uuid,
 }
 
 impl AgentSubscription {
-    pub fn new(rx: mpsc::Receiver<StoredEvent>) -> Self {
+    pub fn new(rx: mpsc::Receiver<SessionEvent>) -> Self {
         Self {
             rx,
             id: Uuid::now_v7(),
@@ -112,7 +152,7 @@ impl AgentSubscription {
 }
 
 impl Stream for AgentSubscription {
-    type Item = StoredEvent;
+    type Item = SessionEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
