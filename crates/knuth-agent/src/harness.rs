@@ -2,11 +2,10 @@ use async_trait::async_trait;
 use knuth_core::ids::*;
 use std::collections::{HashSet, VecDeque};
 use std::ops::ControlFlow;
-use std::sync::Arc;
 
 use crate::{
-    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, BashTool,
-    EditFileTool, EventLog, PythonTool, ReadFileTool, ToolResult, WriteFileTool, spawn_actor,
+    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, EventLog,
+    ToolResult, spawn_actor,
 };
 use ai::{
     AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
@@ -27,6 +26,7 @@ const SUBSCRIPTION_BUFFER: usize = 100;
 pub struct AgentConfig {
     pub model: Model,
     pub options: StreamOptions,
+    pub tool_registry: AgentToolRegistry,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,7 +185,6 @@ pub(crate) struct AgentActor {
     config: AgentConfig,
 
     log: EventLog,
-    tools: AgentToolRegistry,
 
     generation: Generation,
     next_step_id: Option<StepId>,
@@ -297,18 +296,10 @@ impl Actor for AgentActor {
 
 impl AgentActor {
     pub fn new(session_id: SessionId, config: AgentConfig) -> Self {
-        let mut tools = AgentToolRegistry::new();
-        tools.register(Arc::new(BashTool {}));
-        tools.register(Arc::new(ReadFileTool {}));
-        tools.register(Arc::new(WriteFileTool {}));
-        tools.register(Arc::new(EditFileTool {}));
-        tools.register(Arc::new(PythonTool {}));
-
         Self {
             id: session_id,
             config,
             log: EventLog::new(Box::new(InMemoryEventStore::new())),
-            tools,
             generation: Generation::new(),
             next_step_id: None,
             turn: TurnState::Idle,
@@ -542,7 +533,7 @@ impl AgentActor {
                 arguments: call.arguments.clone(),
             });
 
-            let Some(tool) = self.tools.get(&call.name) else {
+            let Some(tool) = self.config.tool_registry.get(&call.name) else {
                 self.record_tool_result(CompletedToolCall::failed(
                     step_id,
                     invocation_id,
@@ -676,7 +667,7 @@ impl AgentActor {
         ai::Context {
             system_prompt: Some(self.log.system_prompt().to_string()),
             messages: self.log.messages().to_vec(),
-            tools: Some(self.tools.schemas()),
+            tools: Some(self.config.tool_registry.schemas()),
         }
     }
 
@@ -854,6 +845,14 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    use crate::AgentToolRegistry;
+
+    fn default_tool_registry() -> AgentToolRegistry {
+        let mut registry = AgentToolRegistry::new();
+        registry.load_default();
+        registry
+    }
+
     fn faux_model() -> Model {
         Model {
             id: "faux".into(),
@@ -879,6 +878,7 @@ mod tests {
             AgentConfig {
                 model: faux_model(),
                 options: StreamOptions::default(),
+                tool_registry: default_tool_registry(),
             },
         )
         .await
@@ -907,6 +907,7 @@ mod tests {
             AgentConfig {
                 model: faux_model(),
                 options: StreamOptions::default(),
+                tool_registry: default_tool_registry(),
             },
         );
         let runtime = spawn_actor(actor, 8).await;

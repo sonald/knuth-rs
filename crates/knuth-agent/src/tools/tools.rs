@@ -12,6 +12,8 @@ use knuth_core::ToolOutcome;
 
 use bitflags::bitflags;
 
+use crate::{BashTool, EditFileTool, PythonTool, ReadFileTool, WriteFileTool};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescription {
     pub id: ToolId,
@@ -188,6 +190,15 @@ impl AgentToolRegistry {
         Self {
             tools: HashMap::new(),
         }
+    }
+
+    pub fn load_default(&mut self) -> &mut Self {
+        self.register(Arc::new(BashTool {}));
+        self.register(Arc::new(ReadFileTool {}));
+        self.register(Arc::new(WriteFileTool {}));
+        self.register(Arc::new(EditFileTool {}));
+        self.register(Arc::new(PythonTool {}));
+        self
     }
 
     pub fn register(&mut self, tool: Arc<dyn AgentTool>) {

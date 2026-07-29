@@ -11,6 +11,7 @@ use std::{
 
 use futures::StreamExt;
 use knuth_agent::harness::{AgentConfig, AgentSession};
+use knuth_agent::AgentToolRegistry;
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
@@ -95,6 +96,12 @@ async fn list_sessions() -> Result<()> {
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
+fn build_tool_registry() -> AgentToolRegistry {
+    let mut registry = AgentToolRegistry::new();
+    registry.load_default();
+    registry
+}
+
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
     let mut session = AgentSession::build(
         "test".to_string(),
@@ -102,6 +109,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
+            tool_registry: build_tool_registry(),
         },
     )
     .await;
