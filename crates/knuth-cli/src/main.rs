@@ -68,14 +68,14 @@ async fn main() -> Result<()> {
     match args.commands {
         Commands::Chat { input, images } => match input {
             Some(input) => {
-                let user_settings = UserSettings::load(model.as_deref(), config.as_deref())?;
+                let user_settings = UserSettings::load(model.as_deref(), config.as_deref()).await?;
                 if args.print_config {
                     print_effective_config(&user_settings);
                 }
                 oneshot(input, images.unwrap_or_default(), user_settings).await?;
             }
             None => {
-                let user_settings = UserSettings::load(model.as_deref(), config.as_deref())?;
+                let user_settings = UserSettings::load(model.as_deref(), config.as_deref()).await?;
                 if args.print_config {
                     print_effective_config(&user_settings);
                 }

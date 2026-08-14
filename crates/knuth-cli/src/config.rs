@@ -1,6 +1,7 @@
 use ai::{
     Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
     get_model,
+    oauth::{OAuthCredentials, openai_codex},
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -8,6 +9,8 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env, fs,
+    future::Future,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -23,7 +26,10 @@ pub struct UserSettings {
 }
 
 impl UserSettings {
-    pub fn load(model_override: Option<&str>, config_override: Option<&Path>) -> Result<Self> {
+    pub async fn load(
+        model_override: Option<&str>,
+        config_override: Option<&Path>,
+    ) -> Result<Self> {
         let (config, config_path) = load_file_config(
             config_override
                 .map(Path::to_path_buf)
@@ -31,7 +37,7 @@ impl UserSettings {
         )?;
         let model = Self::load_model_from_env(model_override, &config)?;
         let mut options = load_options(&config);
-        load_codex_auth_json(&model, &mut options, &config_path)?;
+        load_codex_auth_json(&model, &mut options, &config_path).await?;
         Ok(Self { model, options })
     }
 
@@ -151,7 +157,7 @@ fn default_auth_file(config_path: &Path) -> Option<PathBuf> {
     config_path.parent().map(|dir| dir.join(AUTH_FILE_NAME))
 }
 
-fn load_codex_auth_json(
+async fn load_codex_auth_json(
     model: &Model,
     options: &mut StreamOptions,
     config_path: &Path,
@@ -161,24 +167,45 @@ fn load_codex_auth_json(
     }
 
     let needs_token = options.api_key.is_none() && env_value("CODEX_AUTH_TOKEN").is_none();
-    let needs_account = !has_chatgpt_account_id(&options.provider_extras)
-        && env_value("CODEX_ACCOUNT_ID").is_none();
-    if !needs_token && !needs_account {
+    if !needs_token {
         return Ok(());
     }
+    let needs_account = !has_chatgpt_account_id(&options.provider_extras)
+        && env_value("CODEX_ACCOUNT_ID").is_none();
 
     let Some(path) = default_auth_file(config_path) else {
         return Ok(());
     };
-    apply_codex_auth_json(&path, options, needs_token, needs_account)
+    apply_codex_auth_json(&path, options, needs_token, needs_account).await
 }
 
-fn apply_codex_auth_json(
+async fn apply_codex_auth_json(
     path: &Path,
     options: &mut StreamOptions,
     needs_token: bool,
     needs_account: bool,
 ) -> Result<()> {
+    apply_codex_auth_json_with_refresher(
+        path,
+        options,
+        needs_token,
+        needs_account,
+        |credentials| async move { openai_codex::refresh(&credentials).await },
+    )
+    .await
+}
+
+async fn apply_codex_auth_json_with_refresher<F, Fut>(
+    path: &Path,
+    options: &mut StreamOptions,
+    needs_token: bool,
+    needs_account: bool,
+    refresh: F,
+) -> Result<()>
+where
+    F: FnOnce(OAuthCredentials) -> Fut,
+    Fut: Future<Output = Result<OAuthCredentials, String>>,
+{
     if !path.exists() {
         return Ok(());
     }
@@ -187,15 +214,44 @@ fn apply_codex_auth_json(
         .with_context(|| format!("failed to read Codex auth file {}", path.display()))?;
     let auth: Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse Codex auth file {}", path.display()))?;
+    let mut auth = auth;
 
     if needs_token {
-        let token = auth
+        let access_token = auth
             .get("access_token")
             .and_then(Value::as_str)
             .and_then(nonempty_str)
             .ok_or_else(|| anyhow!("Codex auth file {} is missing access_token", path.display()))?;
-        ensure_codex_auth_not_expired(&auth, path)?;
-        options.api_key = Some(token);
+        let expires_at = parse_codex_auth_expires_at(&auth, path)?;
+        let credentials = OAuthCredentials {
+            access_token,
+            refresh_token: auth
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .and_then(nonempty_str),
+            expires_at,
+            extra: None,
+        };
+        let credentials = match expires_at {
+            Some(expires_at) if expires_at <= chrono::Utc::now().timestamp_millis() => {
+                if credentials.refresh_token.is_none() {
+                    return Err(anyhow!(
+                        "Codex auth file {} is expired and missing refresh_token; refresh it or set CODEX_AUTH_TOKEN",
+                        path.display()
+                    ));
+                }
+                let refreshed = refresh(credentials).await.map_err(|error| {
+                    anyhow!(
+                        "failed to refresh expired Codex auth file {}: {error}",
+                        path.display()
+                    )
+                })?;
+                write_refreshed_codex_auth(path, &mut auth, &refreshed)?;
+                refreshed
+            }
+            _ => credentials,
+        };
+        options.api_key = Some(credentials.access_token);
     }
 
     if needs_account {
@@ -221,17 +277,77 @@ fn has_chatgpt_account_id(provider_extras: &HashMap<String, Value>) -> bool {
         .is_some()
 }
 
-fn ensure_codex_auth_not_expired(auth: &Value, path: &Path) -> Result<()> {
+fn parse_codex_auth_expires_at(auth: &Value, path: &Path) -> Result<Option<i64>> {
     let Some(raw_expires_at) = auth.get("expires_at") else {
-        return Ok(());
+        return Ok(None);
     };
     let expires_at = parse_expires_at_millis(raw_expires_at)
         .ok_or_else(|| anyhow!("Codex auth file {} has invalid expires_at", path.display()))?;
-    if expires_at <= chrono::Utc::now().timestamp_millis() {
+    Ok(Some(expires_at))
+}
+
+fn write_refreshed_codex_auth(
+    path: &Path,
+    auth: &mut Value,
+    credentials: &OAuthCredentials,
+) -> Result<()> {
+    let refresh_token = credentials
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow!("refreshed Codex credentials are missing refresh_token"))?;
+    let expires_at = credentials
+        .expires_at
+        .ok_or_else(|| anyhow!("refreshed Codex credentials are missing expires_at"))?;
+    if credentials.access_token.trim().is_empty() {
         return Err(anyhow!(
-            "Codex auth file {} is expired; refresh it or set CODEX_AUTH_TOKEN",
-            path.display()
+            "refreshed Codex credentials are missing access_token"
         ));
+    }
+    let object = auth
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Codex auth file {} must be a JSON object", path.display()))?;
+    object.insert("access_token".to_string(), json!(credentials.access_token));
+    object.insert("refresh_token".to_string(), json!(refresh_token));
+    object.insert("expires_at".to_string(), json!(expires_at));
+    let contents = serde_json::to_vec_pretty(auth)
+        .context("failed to serialize refreshed Codex credentials")?;
+    replace_file_atomically(path, &contents)
+}
+
+fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let permissions = fs::metadata(path)
+        .with_context(|| format!("failed to inspect Codex auth file {}", path.display()))?
+        .permissions();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Codex auth file {} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Codex auth file {} has an invalid name", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{name}.knuth-refresh-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        fs::set_permissions(&temporary, permissions)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to atomically replace Codex auth file {}",
+                path.display()
+            )
+        });
     }
     Ok(())
 }
@@ -611,8 +727,8 @@ options:
         assert_eq!(options.thinking.unwrap().budget_tokens, Some(8192));
     }
 
-    #[test]
-    fn codex_model_reads_auth_json_next_to_config_file() {
+    #[tokio::test]
+    async fn codex_model_reads_auth_json_next_to_config_file() {
         let _lock = ENV_LOCK.lock().unwrap();
         let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -648,7 +764,7 @@ base_url: https://aicoding.2233.ai
             ("KNUTH_API", None),
         ]);
 
-        let settings = UserSettings::load(None, Some(&config_path)).unwrap();
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
 
         assert_eq!(settings.options.api_key.as_deref(), Some("codex-access"));
         assert_eq!(
@@ -659,8 +775,8 @@ base_url: https://aicoding.2233.ai
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn codex_auth_json_without_expires_at_is_accepted() {
+    #[tokio::test]
+    async fn codex_auth_json_without_expires_at_is_accepted() {
         let _lock = ENV_LOCK.lock().unwrap();
         let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -693,9 +809,117 @@ base_url: https://aicoding.2233.ai
             ("KNUTH_API", None),
         ]);
 
-        let settings = UserSettings::load(None, Some(&config_path)).unwrap();
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
 
         assert_eq!(settings.options.api_key.as_deref(), Some("codex-access"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_api_key_skips_auth_json() {
+        let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("knuth.yaml");
+        fs::write(dir.join("auth.json"), "not valid JSON").unwrap();
+        let model = load_model(
+            "chatgpt/gpt-5.4-mini",
+            None,
+            None,
+            Some("https://aicoding.2233.ai".to_string()),
+        )
+        .unwrap();
+        let mut options = StreamOptions {
+            api_key: Some("explicit-token".to_string()),
+            ..Default::default()
+        };
+
+        load_codex_auth_json(&model, &mut options, &config_path)
+            .await
+            .unwrap();
+
+        assert_eq!(options.api_key.as_deref(), Some("explicit-token"));
+        assert_eq!(
+            fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "not valid JSON"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_codex_auth_json_refreshes_and_preserves_other_fields() {
+        let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "access_token": "expired-access",
+  "refresh_token": "old-refresh",
+  "expires_at": 0,
+  "account_id": "account-123",
+  "id_token": "preserve-me"
+}"#,
+        )
+        .unwrap();
+        let mut options = StreamOptions::default();
+
+        apply_codex_auth_json_with_refresher(&auth_path, &mut options, true, true, |credentials| {
+            assert_eq!(credentials.access_token, "expired-access");
+            assert_eq!(credentials.refresh_token.as_deref(), Some("old-refresh"));
+            std::future::ready(Ok(OAuthCredentials {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: Some(4_102_444_800_000),
+                extra: None,
+            }))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(options.api_key.as_deref(), Some("new-access"));
+        assert_eq!(
+            options.provider_extras[CODEX_ACCOUNT_EXTRA],
+            json!("account-123")
+        );
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(saved["access_token"], json!("new-access"));
+        assert_eq!(saved["refresh_token"], json!("new-refresh"));
+        assert_eq!(saved["expires_at"], json!(4_102_444_800_000_i64));
+        assert_eq!(saved["account_id"], json!("account-123"));
+        assert_eq!(saved["id_token"], json!("preserve-me"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_codex_auth_refresh_leaves_auth_file_unchanged() {
+        let dir = env::temp_dir().join(format!("knuth-auth-json-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        let original = r#"{
+  "access_token": "expired-access",
+  "refresh_token": "old-refresh",
+  "expires_at": 0
+}"#;
+        fs::write(&auth_path, original).unwrap();
+        let mut options = StreamOptions::default();
+
+        let error =
+            apply_codex_auth_json_with_refresher(&auth_path, &mut options, true, false, |_| {
+                std::future::ready(Err("OAuth server rejected refresh".to_string()))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to refresh expired Codex auth file")
+        );
+        assert_eq!(fs::read_to_string(&auth_path).unwrap(), original);
+        assert!(options.api_key.is_none());
 
         fs::remove_dir_all(dir).unwrap();
     }
