@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ToolCapabilities, ToolDescription, ToolError};
 
-use super::{required_string, AgentTool, ToolInput, ToolResult};
+use super::{AgentTool, ToolInput, ToolResult, required_string};
 
 pub struct BashTool {}
 
@@ -25,7 +25,7 @@ impl AgentTool for BashTool {
         }
     }
 
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
@@ -57,7 +57,8 @@ impl AgentTool for BashTool {
             content: format!(
                 "Command exited with {}.\nstdout:\n{}\nstderr:\n{}",
                 output.status, stdout, stderr
-            ).into_bytes(),
+            )
+            .into_bytes(),
         })
     }
 }
@@ -91,7 +92,7 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_returns_stdout() {
         let result = BashTool {}
-            .invoke(input("printf hello"), CancellationToken::new())
+            .execute(input("printf hello"), CancellationToken::new())
             .await
             .unwrap();
 
@@ -103,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_reports_exit_status_and_stderr() {
         let result = BashTool {}
-            .invoke(input("printf nope >&2; exit 7"), CancellationToken::new())
+            .execute(input("printf nope >&2; exit 7"), CancellationToken::new())
             .await
             .unwrap();
 
@@ -116,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_handles_non_utf8_output() {
         let result = BashTool {}
-            .invoke(input("printf '\\377'"), CancellationToken::new())
+            .execute(input("printf '\\377'"), CancellationToken::new())
             .await
             .unwrap();
 
@@ -128,16 +129,25 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_error_echoes_received_argument_keys() {
         let mut wrong_case = ToolInput::new();
-        wrong_case.insert("CMD".to_string(), serde_json::Value::String("ls".to_string()));
+        wrong_case.insert(
+            "CMD".to_string(),
+            serde_json::Value::String("ls".to_string()),
+        );
 
         let error = BashTool {}
-            .invoke(wrong_case, CancellationToken::new())
+            .execute(wrong_case, CancellationToken::new())
             .await
             .unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains("missing required argument \"command\""), "message={message}");
-        assert!(message.contains("received arguments: \"CMD\" (string)"), "message={message}");
+        assert!(
+            message.contains("missing required argument \"command\""),
+            "message={message}"
+        );
+        assert!(
+            message.contains("received arguments: \"CMD\" (string)"),
+            "message={message}"
+        );
         assert!(message.contains("case-sensitive"), "message={message}");
     }
 }

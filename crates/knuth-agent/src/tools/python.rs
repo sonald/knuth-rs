@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ToolCapabilities, ToolDescription, ToolError};
 
-use super::{required_string, AgentTool, ToolInput, ToolResult};
+use super::{AgentTool, ToolInput, ToolResult, required_string};
 
 pub struct PythonTool {}
 
@@ -27,7 +27,7 @@ impl AgentTool for PythonTool {
         }
     }
 
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
@@ -60,9 +60,10 @@ impl AgentTool for PythonTool {
         Ok(ToolResult {
             outcome,
             content: format!(
-            "Python exited with {}.\nstdout:\n{}\nstderr:\n{}",
-            output.status, stdout, stderr
-        ).into_bytes(),
+                "Python exited with {}.\nstdout:\n{}\nstderr:\n{}",
+                output.status, stdout, stderr
+            )
+            .into_bytes(),
         })
     }
 }
@@ -88,7 +89,7 @@ mod tests {
         input.insert("code".to_string(), "print('python-ok')".into());
 
         let result = PythonTool {}
-            .invoke(input, CancellationToken::new())
+            .execute(input, CancellationToken::new())
             .await
             .unwrap();
 

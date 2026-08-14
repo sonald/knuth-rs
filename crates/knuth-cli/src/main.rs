@@ -10,8 +10,8 @@ use std::{
 };
 
 use futures::StreamExt;
-use knuth_agent::harness::{AgentConfig, AgentSession};
 use knuth_agent::AgentToolRegistry;
+use knuth_agent::harness::{AgentConfig, AgentSession};
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
@@ -474,12 +474,14 @@ mod tests {
             delta: "thinking hard".to_string(),
         });
         assert!(renderer.thinking.is_some());
-        assert!(renderer
-            .thinking
-            .as_ref()
-            .unwrap()
-            .message()
-            .contains("thinking hard"));
+        assert!(
+            renderer
+                .thinking
+                .as_ref()
+                .unwrap()
+                .message()
+                .contains("thinking hard")
+        );
 
         renderer.render_live(&LiveEvent::AssistantMessageThinkingCompleted {
             step_id,

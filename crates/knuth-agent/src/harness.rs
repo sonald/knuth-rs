@@ -549,7 +549,7 @@ impl AgentActor {
             let tx = self_tx.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let (outcome, content) = match tool.invoke(call.arguments, cancel).await {
+                let (outcome, content) = match tool.execute(call.arguments, cancel).await {
                     Ok(ToolResult { outcome, content }) => (outcome, content),
                     Err(e) => (ToolOutcome::Error, e.to_string().into_bytes()),
                 };
@@ -1012,7 +1012,8 @@ mod tests {
         );
 
         let (requested_invocation, requested_step) = requested.expect("tool should be requested");
-        let (received_invocation, outcome, content) = received.expect("tool should report a result");
+        let (received_invocation, outcome, content) =
+            received.expect("tool should report a result");
         assert_eq!(
             requested_invocation, received_invocation,
             "the durable pair must share one invocation_id"
@@ -1023,7 +1024,8 @@ mod tests {
             "tool result should include command stdout, got {content:?}"
         );
 
-        let (live_ended_step, live_result) = live_ended.expect("tool should report live completion");
+        let (live_ended_step, live_result) =
+            live_ended.expect("tool should report live completion");
         assert!(
             live_result.contains("tool-ran"),
             "live result should mirror the durable content, got {live_result:?}"

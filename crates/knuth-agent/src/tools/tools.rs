@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use ai::Tool;
 use async_trait::async_trait;
-use std::time::Duration;
 use knuth_core::ids::ToolId;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use knuth_core::ToolOutcome;
@@ -48,8 +48,10 @@ pub enum ToolError {
 
     #[error("tool execution is timeout after {0:?}")]
     TimeoutError(Duration),
-}
 
+    #[error("tool not found: {0}")]
+    InvalidTool(String)
+}
 
 pub type ToolInput = serde_json::Map<String, serde_json::Value>;
 
@@ -149,26 +151,28 @@ mod tests {
     #[test]
     fn missing_argument_error_suggests_case_insensitive_prefix() {
         let mut input = ToolInput::new();
-        input.insert("CMD".to_string(), serde_json::Value::String("ls".to_string()));
+        input.insert(
+            "CMD".to_string(),
+            serde_json::Value::String("ls".to_string()),
+        );
         let error = missing_argument_error(&input, "command", "a non-empty string");
         let message = error.to_string();
-        assert!(message.contains("did you mean \"CMD\""), "message={message}");
+        assert!(
+            message.contains("did you mean \"CMD\""),
+            "message={message}"
+        );
     }
 }
 #[async_trait]
 pub trait AgentTool: Send + Sync {
     fn schema(&self) -> &Tool;
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
     ) -> Result<ToolResult, ToolError>;
 
     fn description(&self) -> ToolDescription;
-
-    async fn prepare(&self, input: ToolInput) -> Result<ToolInput, ToolError> {
-        Ok(input)
-    }
 }
 
 pub struct AgentToolRegistry {

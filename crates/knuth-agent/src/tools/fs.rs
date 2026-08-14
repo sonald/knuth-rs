@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ToolCapabilities, ToolDescription, ToolError};
 
-use super::{required_string, required_string_allow_empty, AgentTool, ToolInput, ToolResult};
+use super::{AgentTool, ToolInput, ToolResult, required_string, required_string_allow_empty};
 
 const MAX_READ_BYTES: usize = 32 * 1024;
 
@@ -30,23 +30,21 @@ impl AgentTool for ReadFileTool {
         }
     }
 
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
         let path = required_string(&input, "path")?;
         let offset = input.get("offset").map_or(Ok(1), |value| {
-            value
-                .as_u64()
-                .filter(|value| *value >= 1)
-                .ok_or_else(|| ToolError::ArgumentError("offset must be an integer >= 1".to_string()))
+            value.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
+                ToolError::ArgumentError("offset must be an integer >= 1".to_string())
+            })
         })? as usize;
         let limit = input.get("limit").map_or(Ok(200), |value| {
-            value
-                .as_u64()
-                .filter(|value| *value >= 1)
-                .ok_or_else(|| ToolError::ArgumentError("limit must be an integer >= 1".to_string()))
+            value.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
+                ToolError::ArgumentError("limit must be an integer >= 1".to_string())
+            })
         })? as usize;
 
         let content = tokio::select! {
@@ -93,7 +91,8 @@ impl AgentTool for ReadFileTool {
                 content: format!(
                     "No content found in the specified range (file has {} total lines)",
                     lines.len()
-                ).into_bytes(),
+                )
+                .into_bytes(),
             });
         }
 
@@ -104,7 +103,8 @@ impl AgentTool for ReadFileTool {
                 "File({path}) - Lines {offset}-{end_line} of {} total:\n{}",
                 lines.len(),
                 rendered.join("\n")
-            ).into_bytes(),
+            )
+            .into_bytes(),
         })
     }
 }
@@ -125,7 +125,7 @@ impl AgentTool for WriteFileTool {
         }
     }
 
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
@@ -168,7 +168,7 @@ impl AgentTool for EditFileTool {
         }
     }
 
-    async fn invoke(
+    async fn execute(
         &self,
         input: ToolInput,
         cancel_token: CancellationToken,
@@ -183,9 +183,9 @@ impl AgentTool for EditFileTool {
             });
         }
         let replace_all = input.get("replace_all").map_or(Ok(false), |value| {
-            value
-                .as_bool()
-                .ok_or_else(|| ToolError::ArgumentError("replace_all must be a boolean".to_string()))
+            value.as_bool().ok_or_else(|| {
+                ToolError::ArgumentError("replace_all must be a boolean".to_string())
+            })
         })?;
 
         let raw = tokio::select! {
@@ -208,7 +208,8 @@ impl AgentTool for EditFileTool {
                 outcome: ToolOutcome::Error,
                 content: format!(
                     "old_string found {count} matches; set replace_all=true to replace all"
-                ).into_bytes(),
+                )
+                .into_bytes(),
             });
         }
 
@@ -228,10 +229,11 @@ impl AgentTool for EditFileTool {
         Ok(ToolResult {
             outcome: ToolOutcome::ExecSuccess,
             content: format!(
-            "Edited {path} (replacements={}, encoding={})",
-            if replace_all { count } else { 1 },
-            encoding.name
-        ).into_bytes(),
+                "Edited {path} (replacements={}, encoding={})",
+                if replace_all { count } else { 1 },
+                encoding.name
+            )
+            .into_bytes(),
         })
     }
 }
@@ -385,14 +387,14 @@ mod tests {
         let path = temp_path("notes/hello.txt");
         let path_string = path.to_string_lossy();
         WriteFileTool {}
-            .invoke(
+            .execute(
                 input(json!({ "path": path_string, "content": "alpha\nbeta\n" })),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         let result = ReadFileTool {}
-            .invoke(
+            .execute(
                 input(json!({ "path": path_string, "offset": 2, "limit": 1 })),
                 CancellationToken::new(),
             )
@@ -424,7 +426,7 @@ mod tests {
                 .await
                 .unwrap();
             EditFileTool {}
-                .invoke(
+                .execute(
                     input(json!({ "path": path, "old_string": "beta", "new_string": "BETA" })),
                     CancellationToken::new(),
                 )
@@ -442,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_error_reports_mistyped_content_key() {
         let error = WriteFileTool {}
-            .invoke(
+            .execute(
                 input(json!({ "path": "/tmp/x.txt", "conTENT": "Hello" })),
                 CancellationToken::new(),
             )
@@ -450,15 +452,21 @@ mod tests {
             .unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains("missing required argument \"content\""), "message={message}");
-        assert!(message.contains("\"conTENT\" (string)"), "message={message}");
+        assert!(
+            message.contains("missing required argument \"content\""),
+            "message={message}"
+        );
+        assert!(
+            message.contains("\"conTENT\" (string)"),
+            "message={message}"
+        );
         assert!(message.contains("case-sensitive"), "message={message}");
     }
 
     #[tokio::test]
     async fn edit_file_error_reports_non_string_value_type() {
         let error = EditFileTool {}
-            .invoke(
+            .execute(
                 input(json!({ "path": "/tmp/x.txt", "old_string": 12345, "new_string": "world" })),
                 CancellationToken::new(),
             )
@@ -467,7 +475,8 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("argument \"old_string\" must be a string, but received number (12345)"),
+            message
+                .contains("argument \"old_string\" must be a string, but received number (12345)"),
             "message={message}"
         );
     }
