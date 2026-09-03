@@ -3,16 +3,22 @@ use dotenvy::dotenv;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
 use std::{
-    collections::HashMap, io::{self, Write}, path::PathBuf, sync::Arc, time::Duration,
+    collections::HashMap,
+    io::{self, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
 use futures::StreamExt;
-use knuth_agent::{AgentToolRegistry, policy::{DefaultPolicyEngine, PolicyContext}};
 use knuth_agent::harness::{AgentConfig, AgentSession};
+use knuth_agent::policy::PolicyContext;
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
+mod policy;
 use config::UserSettings;
+use policy::DefaultPolicyEngine;
 
 use clap::{Parser, Subcommand};
 use crossterm::style::Stylize;
@@ -91,12 +97,6 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-fn build_tool_registry() -> AgentToolRegistry {
-    let mut registry = AgentToolRegistry::new();
-    registry.load_default();
-    registry
-}
-
 fn build_environment() -> String {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "<unknown>".into());
     let user = std::env::var("USER")
@@ -130,7 +130,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
-            policy_engine: Arc::new(DefaultPolicyEngine::new(build_tool_registry())),
+            policy_engine: Arc::new(DefaultPolicyEngine::with_default_tools()),
             policy_context: PolicyContext {
                 mode: user_settings.policy_mode.clone(),
             },

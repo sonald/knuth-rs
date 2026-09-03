@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::{
-    Actor, ActorContext, ActorRuntime, AgentStepRunner, AskError, EventLog, tools::policy::{PolicyContext, PolicyEngineTrait},
-    spawn_actor,
+    Actor, ActorContext, ActorRuntime, AgentStepRunner, AskError, EventLog, spawn_actor,
+    tools::policy::{PolicyContext, PolicyEngineTrait},
 };
 use ai::{
     AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
@@ -444,7 +444,8 @@ impl AgentActor {
             }
             ModelStepEndReason::Cancelled => self.end_turn(turn_id, ctx).await,
             _ if !tool_calls.is_empty() => {
-                self.dispatch_tool_calls(turn_id, step_id, tool_calls, ctx).await
+                self.dispatch_tool_calls(turn_id, step_id, tool_calls, ctx)
+                    .await
             }
             _ => self.end_turn(turn_id, ctx).await,
         }
@@ -526,17 +527,23 @@ impl AgentActor {
         &mut self,
         message: &AgentActorMessage,
     ) -> Result<(), AgentSessionError> {
-        let (
-            step_id,
-            invocation_id,
-            tool_call_id,
-            tool_name,
-            outcome,
-            content,
-        ) = match message {
+        let (step_id, invocation_id, tool_call_id, tool_name, outcome, content) = match message {
             AgentActorMessage::ToolFinished {
-                 step_id, invocation_id, tool_call_id, tool_name, outcome, content, ..
-            } => (step_id.clone(), invocation_id.clone(), tool_call_id.clone(), tool_name.clone(), outcome.clone(), content.clone()),
+                step_id,
+                invocation_id,
+                tool_call_id,
+                tool_name,
+                outcome,
+                content,
+                ..
+            } => (
+                step_id.clone(),
+                invocation_id.clone(),
+                tool_call_id.clone(),
+                tool_name.clone(),
+                outcome.clone(),
+                content.clone(),
+            ),
             _ => unreachable!(),
         };
 
@@ -565,25 +572,27 @@ impl AgentActor {
         message: &AgentActorMessage,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-
-        let (
-            turn_id,
-            invocation_id,
-        ) = match message {
-            AgentActorMessage::ToolFinished { turn_id, invocation_id, ..  } => (turn_id, invocation_id),
+        let (turn_id, invocation_id) = match message {
+            AgentActorMessage::ToolFinished {
+                turn_id,
+                invocation_id,
+                ..
+            } => (turn_id, invocation_id),
             _ => return Ok(()),
         };
 
         let (is_last, cancelled) = match &mut self.turn {
             TurnState::RunningTools {
-                turn_id: current_turn, pending, cancel
+                turn_id: current_turn,
+                pending,
+                cancel,
             } => {
                 if current_turn == turn_id && pending.remove(&invocation_id) {
                     (pending.is_empty(), cancel.is_cancelled())
                 } else {
                     return Ok(());
                 }
-            },
+            }
             _ => return Ok(()),
         };
 
@@ -605,7 +614,9 @@ impl AgentActor {
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         self.log
-            .commit(AgentEvent::AgentTurnEnded { turn_id: turn_id.clone() })
+            .commit(AgentEvent::AgentTurnEnded {
+                turn_id: turn_id.clone(),
+            })
             .await?;
         self.turn = TurnState::Idle;
         self.try_dispatch_next_input(ctx).await
@@ -783,23 +794,84 @@ fn mime_type_from_path(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::faux_lock;
-    use crate::tools::policy::{DefaultPolicyEngine, PolicyMode};
+    use crate::tools::policy::{PolicyContext, PolicyEngineTrait, PolicyMode};
+    use crate::{AgentToolRegistry, ToolError, ToolResult};
     use ai::providers::faux::{
         clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call, set_faux_responses,
     };
-    use ai::{Api, ModelCost, Provider};
+    use ai::{Api, ModelCost, Provider, ToolCall};
     use futures::StreamExt;
     use knuth_core::SessionEvent;
     use serde_json::Map;
     use std::time::Duration;
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
-    use crate::AgentToolRegistry;
+    struct RegistryPolicyEngine {
+        registry: AgentToolRegistry,
+    }
+
+    #[async_trait]
+    impl PolicyEngineTrait for RegistryPolicyEngine {
+        fn schemas(&self) -> Vec<ai::Tool> {
+            self.registry.schemas()
+        }
+
+        async fn execute(
+            &self,
+            tool_call: &ToolCall,
+            cancel: CancellationToken,
+            _ctx: &PolicyContext,
+        ) -> ToolResult {
+            let Some(tool) = self.registry.get(tool_call.name.as_str()) else {
+                return ToolResult {
+                    outcome: ToolOutcome::Error,
+                    content: ToolError::InvalidTool(tool_call.name.clone())
+                        .to_string()
+                        .into_bytes(),
+                };
+            };
+            match tool.execute(tool_call.arguments.clone(), cancel).await {
+                Ok(result) => result,
+                Err(error) => ToolResult {
+                    outcome: ToolOutcome::Error,
+                    content: error.to_string().into_bytes(),
+                },
+            }
+        }
+    }
+
+    struct DenyAllEngine;
+
+    #[async_trait]
+    impl PolicyEngineTrait for DenyAllEngine {
+        fn schemas(&self) -> Vec<ai::Tool> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _tool_call: &ToolCall,
+            _cancel: CancellationToken,
+            _ctx: &PolicyContext,
+        ) -> ToolResult {
+            ToolResult {
+                outcome: ToolOutcome::PolicyDenied,
+                content: b"denied".to_vec(),
+            }
+        }
+    }
 
     fn default_tool_registry() -> AgentToolRegistry {
         let mut registry = AgentToolRegistry::new();
         registry.load_default();
         registry
+    }
+
+    fn passthrough_engine() -> Arc<dyn PolicyEngineTrait> {
+        Arc::new(RegistryPolicyEngine {
+            registry: default_tool_registry(),
+        })
     }
 
     fn faux_model() -> Model {
@@ -820,22 +892,24 @@ mod tests {
         }
     }
 
-    async fn mk_session_with_policy_mode(mode: PolicyMode) -> AgentSession {
-        AgentSession::build(
-            "test".to_string(),
-            "".to_string(),
-            AgentConfig {
-                model: faux_model(),
-                options: StreamOptions::default(),
-                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
-                policy_context: PolicyContext { mode },
+    fn test_config(policy_engine: Arc<dyn PolicyEngineTrait>) -> AgentConfig {
+        AgentConfig {
+            model: faux_model(),
+            options: StreamOptions::default(),
+            policy_engine,
+            policy_context: PolicyContext {
+                mode: PolicyMode::Auto,
             },
-        )
-        .await
+        }
     }
 
     async fn mk_session() -> AgentSession {
-        mk_session_with_policy_mode(PolicyMode::Auto).await
+        AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config(passthrough_engine()),
+        )
+        .await
     }
 
     async fn next_session_event(sub: &mut AgentSubscription) -> SessionEvent {
@@ -856,15 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_step_completion_is_not_published() {
-        let actor = AgentActor::new(
-            SessionId::new(),
-            AgentConfig {
-                model: faux_model(),
-                options: StreamOptions::default(),
-                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
-                policy_context: PolicyContext { mode: crate::tools::policy::PolicyMode::Auto },
-            }
-        );
+        let actor = AgentActor::new(SessionId::new(), test_config(passthrough_engine()));
         let runtime = spawn_actor(actor, 8).await;
         let mut sub = runtime
             .handle()
@@ -904,17 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_tool_completion_is_not_persisted() {
-        let actor = AgentActor::new(
-            SessionId::new(),
-            AgentConfig {
-                model: faux_model(),
-                options: StreamOptions::default(),
-                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
-                policy_context: PolicyContext {
-                    mode: PolicyMode::Auto,
-                },
-            },
-        );
+        let actor = AgentActor::new(SessionId::new(), test_config(passthrough_engine()));
         let runtime = spawn_actor(actor, 8).await;
         let mut sub = runtime
             .handle()
@@ -1053,16 +1109,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_denial_is_recorded_without_writing_and_turn_resumes() {
+    async fn policy_denial_is_recorded_and_turn_resumes() {
         let _guard = faux_lock();
         clear_faux_responses();
 
-        let path =
-            std::env::temp_dir().join(format!("knuth-read-only-{}.txt", ToolInvocationId::new()));
         let mut args = Map::new();
         args.insert(
             "path".into(),
-            serde_json::Value::String(path.to_string_lossy().into_owned()),
+            serde_json::Value::String("/tmp/unused.txt".into()),
         );
         args.insert(
             "content".into(),
@@ -1073,7 +1127,12 @@ mod tests {
             faux_assistant_message(vec![faux_text("done")]),
         ]);
 
-        let mut session = mk_session_with_policy_mode(PolicyMode::ReadOnly).await;
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config(Arc::new(DenyAllEngine)),
+        )
+        .await;
         let mut sub = session.subscribe(None).await.unwrap();
         session
             .submit_input("try writing".to_string(), vec![])
@@ -1093,13 +1152,7 @@ mod tests {
         }
         clear_faux_responses();
 
-        let file_was_created = path.exists();
-        if file_was_created {
-            std::fs::remove_file(&path).unwrap();
-        }
-
         assert_eq!(outcome, Some(ToolOutcome::PolicyDenied));
-        assert!(!file_was_created, "read-only policy allowed {path:?}");
         session.close().await.unwrap();
     }
 
