@@ -91,12 +91,36 @@ async fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-
 fn build_tool_registry() -> AgentToolRegistry {
     let mut registry = AgentToolRegistry::new();
     registry.load_default();
     registry
+}
+
+fn build_environment() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "<unknown>".into());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "<unknown>".into());
+
+    let os = os_info::get();
+
+    format!(
+        "\n## Environment
+- You are running on the following OS: {}, take care of the commands you run, some flags might not be available on your system.
+- current login user: {user}
+- Shell: {shell}
+",
+        format!("{} {}", os.os_type(), os.version())
+    )
+}
+
+fn build_system_prompt() -> String {
+    let mut system_prompt = String::new();
+    system_prompt.push_str(include_str!("../data/system.md"));
+    system_prompt.push_str(&build_environment());
+    debug!("system prompt:\n{}", system_prompt);
+    system_prompt
 }
 
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
@@ -115,7 +139,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
     .await;
 
     let subscription = session.subscribe(None).await?;
-    session.set_system_prompt(SYSTEM_PROMPT.to_string()).await?;
+    session.set_system_prompt(build_system_prompt()).await?;
     Ok((session, subscription))
 }
 
