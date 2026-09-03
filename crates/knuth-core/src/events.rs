@@ -7,7 +7,7 @@ use crate::ids::*;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolOutcome {
     ExecSuccess,
-    Denied,
+    PolicyDenied,
     Cancelled,
     Interrupted,
     Error,

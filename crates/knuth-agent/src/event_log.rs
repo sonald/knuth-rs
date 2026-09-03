@@ -121,12 +121,15 @@ impl ConversationState {
                 content,
                 ..
             } => {
-                // we deliberately treat error as message content, not a flag
+                // Error details go into the content so every provider sees them,
+                // and the flag is set too for providers that carry it natively
+                // (e.g. Anthropic's tool_result.is_error).
+                let is_error = !outcome.is_success();
                 let content = String::from_utf8_lossy(&content).into_owned();
-                let result_text = if outcome.is_success() {
-                    content
-                } else {
+                let result_text = if is_error {
                     format!("Tool call failed with details: \n{}", content)
+                } else {
+                    content
                 };
 
                 let content = vec![UserContentBlock::text(result_text)];
@@ -136,7 +139,7 @@ impl ConversationState {
                     tool_name,
                     content,
                     details: None,
-                    is_error: false,
+                    is_error,
                     timestamp: event.timestamp.timestamp(),
                 }));
             }
@@ -259,6 +262,14 @@ mod tests {
             [Message::ToolResult(message)] => {
                 assert_eq!(message.tool_call_id, "call-1");
                 assert!(message.is_error);
+                match &message.content[0] {
+                    UserContentBlock::Text(text) => assert!(
+                        text.text.contains("boom"),
+                        "error details should stay in the content, got {:?}",
+                        text.text
+                    ),
+                    other => panic!("expected a text content block, got {other:?}"),
+                }
             }
             other => panic!("expected a single tool result message, got {other:?}"),
         }

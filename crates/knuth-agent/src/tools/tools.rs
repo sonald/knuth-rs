@@ -50,7 +50,7 @@ pub enum ToolError {
     TimeoutError(Duration),
 
     #[error("tool not found: {0}")]
-    InvalidTool(String)
+    InvalidTool(String),
 }
 
 pub type ToolInput = serde_json::Map<String, serde_json::Value>;

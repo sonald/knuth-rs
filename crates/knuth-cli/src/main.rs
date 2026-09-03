@@ -3,14 +3,11 @@ use dotenvy::dotenv;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
 use std::{
-    collections::HashMap,
-    io::{self, Write},
-    path::PathBuf,
-    time::Duration,
+    collections::HashMap, io::{self, Write}, path::PathBuf, sync::Arc, time::Duration,
 };
 
 use futures::StreamExt;
-use knuth_agent::AgentToolRegistry;
+use knuth_agent::{AgentToolRegistry, policy::{DefaultPolicyEngine, PolicyContext}};
 use knuth_agent::harness::{AgentConfig, AgentSession};
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
@@ -109,7 +106,10 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
-            tool_registry: build_tool_registry(),
+            policy_engine: Arc::new(DefaultPolicyEngine::new(build_tool_registry())),
+            policy_context: PolicyContext {
+                mode: user_settings.policy_mode.clone(),
+            },
         },
     )
     .await;
@@ -345,6 +345,7 @@ fn print_effective_config(settings: &UserSettings) {
     eprintln!("  provider: {}", model.provider.0);
     eprintln!("  api: {}", model.api.0);
     eprintln!("  base_url: {}", empty_dash(&model.base_url));
+    eprintln!("  policy_mode: {}", settings.policy_mode.as_str());
     eprintln!("  context_window: {}", model.context_window);
     eprintln!("  model_max_tokens: {}", model.max_tokens);
     eprintln!("  model_reasoning: {}", model.reasoning);

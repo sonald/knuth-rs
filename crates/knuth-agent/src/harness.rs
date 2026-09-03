@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use knuth_core::ids::*;
 use std::collections::{HashSet, VecDeque};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::{
-    Actor, ActorContext, ActorRuntime, AgentStepRunner, AgentToolRegistry, AskError, EventLog,
-    ToolResult, spawn_actor,
+    Actor, ActorContext, ActorRuntime, AgentStepRunner, AskError, EventLog, tools::policy::{PolicyContext, PolicyEngineTrait},
+    spawn_actor,
 };
 use ai::{
     AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
@@ -22,11 +23,11 @@ use tracing::debug;
 
 const SUBSCRIPTION_BUFFER: usize = 100;
 
-#[derive(Debug)]
 pub struct AgentConfig {
     pub model: Model,
     pub options: StreamOptions,
-    pub tool_registry: AgentToolRegistry,
+    pub policy_engine: Arc<dyn PolicyEngineTrait>,
+    pub policy_context: PolicyContext,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,36 +64,6 @@ pub enum AgentSessionError {
 struct PendingInput {
     content: UserContent,
     intent: UserMessageIntent,
-}
-
-/// A finished tool invocation, ready to be recorded as `ToolResultReceived`.
-#[derive(Debug)]
-struct CompletedToolCall {
-    step_id: StepId,
-    invocation_id: ToolInvocationId,
-    tool_call_id: String,
-    tool_name: String,
-    outcome: ToolOutcome,
-    content: Vec<u8>,
-}
-
-impl CompletedToolCall {
-    fn failed(
-        step_id: StepId,
-        invocation_id: ToolInvocationId,
-        tool_call_id: String,
-        tool_name: String,
-        message: String,
-    ) -> Self {
-        Self {
-            step_id,
-            invocation_id,
-            tool_call_id,
-            tool_name,
-            outcome: ToolOutcome::Error,
-            content: message.into_bytes(),
-        }
-    }
 }
 
 pub enum AgentActorMessage {
@@ -167,7 +138,7 @@ enum TurnState {
     /// `pending` holds the tool_call_ids we are still waiting on.
     RunningTools {
         turn_id: TurnId,
-        pending: HashSet<String>,
+        pending: HashSet<ToolInvocationId>,
         cancel: CancellationToken,
     },
 }
@@ -179,7 +150,6 @@ enum TurnState {
 /// completion. Persistence + projection + fan-out live in [`EventLog`]; tool
 /// lookup lives in [`AgentToolRegistry`]; model streaming lives in
 /// [`AgentStepRunner`].
-#[derive(Debug)]
 pub(crate) struct AgentActor {
     id: SessionId,
     config: AgentConfig,
@@ -250,24 +220,8 @@ impl Actor for AgentActor {
                 }
             }
 
-            AgentActorMessage::ToolFinished {
-                turn_id,
-                step_id,
-                invocation_id,
-                tool_call_id,
-                tool_name,
-                outcome,
-                content,
-            } => {
-                let completed = CompletedToolCall {
-                    step_id,
-                    invocation_id,
-                    tool_call_id,
-                    tool_name,
-                    outcome,
-                    content,
-                };
-                if let Err(e) = self.handle_tool_finished(turn_id, completed, ctx).await {
+            AgentActorMessage::ToolFinished { .. } => {
+                if let Err(e) = self.handle_tool_finished(&message, ctx).await {
                     return self.handle_session_error(e).await;
                 }
             }
@@ -411,7 +365,7 @@ impl AgentActor {
     ) -> Result<(), AgentSessionError> {
         let step = self.spawn_model_step(ctx).await?;
         self.turn = TurnState::Streaming {
-            turn_id,
+            turn_id: turn_id.clone(),
             step_id: step.step_id(),
             generation: step.generation(),
             step,
@@ -490,7 +444,7 @@ impl AgentActor {
             }
             ModelStepEndReason::Cancelled => self.end_turn(turn_id, ctx).await,
             _ if !tool_calls.is_empty() => {
-                self.spawn_tools(turn_id, step_id, tool_calls, ctx).await
+                self.dispatch_tool_calls(turn_id, step_id, tool_calls, ctx).await
             }
             _ => self.end_turn(turn_id, ctx).await,
         }
@@ -499,19 +453,20 @@ impl AgentActor {
     /// Spawns one background task per tool call; each reports back with a
     /// `ToolFinished` message so the actor stays responsive (e.g. to `Cancel`)
     /// while tools run.
-    async fn spawn_tools(
+    async fn dispatch_tool_calls(
         &mut self,
         turn_id: TurnId,
         step_id: StepId,
         tool_calls: Vec<ToolCall>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let Some(self_tx) = ctx.upgrade() else {
+        let Some(mailbox) = ctx.upgrade() else {
             return Err(AgentSessionError::InvalidState(
                 "actor mailbox is gone".to_string(),
             ));
         };
-        let cancel = ctx.shutdown.child_token();
+        let batch_cancel = ctx.shutdown.child_token();
+        let policy_engine = Arc::clone(&self.config.policy_engine);
         let mut pending = HashSet::new();
 
         for call in tool_calls {
@@ -533,68 +488,57 @@ impl AgentActor {
                 arguments: call.arguments.clone(),
             });
 
-            let Some(tool) = self.config.tool_registry.get(&call.name) else {
-                self.record_tool_result(CompletedToolCall::failed(
-                    step_id,
-                    invocation_id,
-                    call.id.clone(),
-                    call.name.clone(),
-                    format!("Invalid tool name: {}", call.name),
-                ))
-                .await?;
-                continue;
-            };
+            pending.insert(invocation_id);
 
-            pending.insert(call.id.clone());
-            let tx = self_tx.clone();
-            let cancel = cancel.clone();
+            let mailbox = mailbox.clone();
+            let cancel = batch_cancel.clone();
+            let policy_engine = Arc::clone(&policy_engine);
+            let policy_context = self.config.policy_context.clone();
+            let turn_id = turn_id.clone();
+
             tokio::spawn(async move {
-                let (outcome, content) = match tool.execute(call.arguments, cancel).await {
-                    Ok(ToolResult { outcome, content }) => (outcome, content),
-                    Err(e) => (ToolOutcome::Error, e.to_string().into_bytes()),
-                };
-                let _ = tx
+                let result = policy_engine.execute(&call, cancel, &policy_context).await;
+                let _ = mailbox
                     .send(AgentActorMessage::ToolFinished {
-                        turn_id,
+                        turn_id: turn_id,
                         step_id,
                         invocation_id,
                         tool_call_id: call.id,
                         tool_name: call.name,
-                        outcome,
-                        content,
+                        outcome: result.outcome,
+                        content: result.content,
                     })
                     .await;
             });
         }
 
-        if pending.is_empty() {
-            // Every call had an unknown tool name; their error results are
-            // already committed, so go straight back to the model.
-            self.continue_step(turn_id, ctx).await
-        } else {
-            self.turn = TurnState::RunningTools {
-                turn_id,
-                pending,
-                cancel,
-            };
-            Ok(())
-        }
+        self.turn = TurnState::RunningTools {
+            turn_id: turn_id,
+            pending,
+            cancel: batch_cancel,
+        };
+        Ok(())
     }
 
     /// Records the outcome of one invocation: the durable `ToolResultReceived`
     /// that replay depends on, plus the live counterpart for observers.
     async fn record_tool_result(
         &mut self,
-        completed: CompletedToolCall,
+        message: &AgentActorMessage,
     ) -> Result<(), AgentSessionError> {
-        let CompletedToolCall {
+        let (
             step_id,
             invocation_id,
             tool_call_id,
             tool_name,
             outcome,
             content,
-        } = completed;
+        ) = match message {
+            AgentActorMessage::ToolFinished {
+                 step_id, invocation_id, tool_call_id, tool_name, outcome, content, ..
+            } => (step_id.clone(), invocation_id.clone(), tool_call_id.clone(), tool_name.clone(), outcome.clone(), content.clone()),
+            _ => unreachable!(),
+        };
 
         self.log
             .commit(AgentEvent::ToolResultReceived {
@@ -605,6 +549,7 @@ impl AgentActor {
                 content: content.clone(),
             })
             .await?;
+
         self.log.publish_live(LiveEvent::ToolExecutionEnded {
             step_id,
             tool_call_id,
@@ -617,37 +562,40 @@ impl AgentActor {
 
     async fn handle_tool_finished(
         &mut self,
-        turn_id: TurnId,
-        completed: CompletedToolCall,
+        message: &AgentActorMessage,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let tool_call_id = completed.tool_call_id.clone();
-        self.record_tool_result(completed).await?;
 
-        let TurnState::RunningTools {
-            turn_id: current_turn,
-            pending,
-            cancel,
-        } = &mut self.turn
-        else {
-            debug!("ToolFinished for turn {turn_id} arrived outside RunningTools state");
-            return Ok(());
+        let (
+            turn_id,
+            invocation_id,
+        ) = match message {
+            AgentActorMessage::ToolFinished { turn_id, invocation_id, ..  } => (turn_id, invocation_id),
+            _ => return Ok(()),
         };
-        if *current_turn != turn_id {
-            debug!("ToolFinished for stale turn {turn_id}");
+
+        let (is_last, cancelled) = match &mut self.turn {
+            TurnState::RunningTools {
+                turn_id: current_turn, pending, cancel
+            } => {
+                if current_turn == turn_id && pending.remove(&invocation_id) {
+                    (pending.is_empty(), cancel.is_cancelled())
+                } else {
+                    return Ok(());
+                }
+            },
+            _ => return Ok(()),
+        };
+
+        self.record_tool_result(message).await?;
+        if !is_last {
             return Ok(());
         }
 
-        pending.remove(&tool_call_id);
-        if !pending.is_empty() {
-            return Ok(());
-        }
-
-        let cancelled = cancel.is_cancelled();
         if cancelled {
-            self.end_turn(turn_id, ctx).await
+            self.end_turn(*turn_id, ctx).await
         } else {
-            self.continue_step(turn_id, ctx).await
+            self.continue_step(*turn_id, ctx).await
         }
     }
 
@@ -657,7 +605,7 @@ impl AgentActor {
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         self.log
-            .commit(AgentEvent::AgentTurnEnded { turn_id })
+            .commit(AgentEvent::AgentTurnEnded { turn_id: turn_id.clone() })
             .await?;
         self.turn = TurnState::Idle;
         self.try_dispatch_next_input(ctx).await
@@ -667,7 +615,7 @@ impl AgentActor {
         ai::Context {
             system_prompt: Some(self.log.system_prompt().to_string()),
             messages: self.log.messages().to_vec(),
-            tools: Some(self.config.tool_registry.schemas()),
+            tools: Some(self.config.policy_engine.schemas()),
         }
     }
 
@@ -835,6 +783,7 @@ fn mime_type_from_path(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::faux_lock;
+    use crate::tools::policy::{DefaultPolicyEngine, PolicyMode};
     use ai::providers::faux::{
         clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call, set_faux_responses,
     };
@@ -871,17 +820,22 @@ mod tests {
         }
     }
 
-    async fn mk_session() -> AgentSession {
+    async fn mk_session_with_policy_mode(mode: PolicyMode) -> AgentSession {
         AgentSession::build(
             "test".to_string(),
             "".to_string(),
             AgentConfig {
                 model: faux_model(),
                 options: StreamOptions::default(),
-                tool_registry: default_tool_registry(),
+                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
+                policy_context: PolicyContext { mode },
             },
         )
         .await
+    }
+
+    async fn mk_session() -> AgentSession {
+        mk_session_with_policy_mode(PolicyMode::Auto).await
     }
 
     async fn next_session_event(sub: &mut AgentSubscription) -> SessionEvent {
@@ -907,8 +861,9 @@ mod tests {
             AgentConfig {
                 model: faux_model(),
                 options: StreamOptions::default(),
-                tool_registry: default_tool_registry(),
-            },
+                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
+                policy_context: PolicyContext { mode: crate::tools::policy::PolicyMode::Auto },
+            }
         );
         let runtime = spawn_actor(actor, 8).await;
         let mut sub = runtime
@@ -943,6 +898,59 @@ mod tests {
         assert!(matches!(
             next_durable_event(&mut sub).await,
             AgentEvent::SystemPromptSet { prompt } if prompt == "after stale completion"
+        ));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_tool_completion_is_not_persisted() {
+        let actor = AgentActor::new(
+            SessionId::new(),
+            AgentConfig {
+                model: faux_model(),
+                options: StreamOptions::default(),
+                policy_engine: Arc::new(DefaultPolicyEngine::new(default_tool_registry())),
+                policy_context: PolicyContext {
+                    mode: PolicyMode::Auto,
+                },
+            },
+        );
+        let runtime = spawn_actor(actor, 8).await;
+        let mut sub = runtime
+            .handle()
+            .ask(|reply| {
+                AgentActorMessage::Command(AgentCommand::Subscribe {
+                    from_seq: None,
+                    reply,
+                })
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .handle()
+            .send(AgentActorMessage::ToolFinished {
+                turn_id: TurnId::new(),
+                step_id: StepId::new(),
+                invocation_id: ToolInvocationId::new(),
+                tool_call_id: "stale-call".into(),
+                tool_name: "bash".into(),
+                outcome: ToolOutcome::Error,
+                content: b"stale result".to_vec(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .send(AgentActorMessage::Command(AgentCommand::SetSystemPrompt(
+                "after stale tool completion".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next_durable_event(&mut sub).await,
+            AgentEvent::SystemPromptSet { prompt } if prompt == "after stale tool completion"
         ));
         runtime.shutdown().await;
     }
@@ -1041,6 +1049,122 @@ mod tests {
             vec![ModelStepEndReason::ToolUse, ModelStepEndReason::Success]
         );
 
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_denial_is_recorded_without_writing_and_turn_resumes() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let path =
+            std::env::temp_dir().join(format!("knuth-read-only-{}.txt", ToolInvocationId::new()));
+        let mut args = Map::new();
+        args.insert(
+            "path".into(),
+            serde_json::Value::String(path.to_string_lossy().into_owned()),
+        );
+        args.insert(
+            "content".into(),
+            serde_json::Value::String("must not be written".into()),
+        );
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("write_file", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut session = mk_session_with_policy_mode(PolicyMode::ReadOnly).await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("try writing".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut outcome = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolResultReceived {
+                    outcome: tool_outcome,
+                    ..
+                } => outcome = Some(tool_outcome),
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        let file_was_created = path.exists();
+        if file_was_created {
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        assert_eq!(outcome, Some(ToolOutcome::PolicyDenied));
+        assert!(!file_was_created, "read-only policy allowed {path:?}");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_ids_wait_for_both_invocations() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut slow_args = Map::new();
+        slow_args.insert(
+            "command".into(),
+            serde_json::Value::String("sleep 0.25; printf slow".into()),
+        );
+        let mut fast_args = Map::new();
+        fast_args.insert(
+            "command".into(),
+            serde_json::Value::String("printf fast".into()),
+        );
+        let duplicate_id = "duplicate-call-id".to_string();
+        set_faux_responses(vec![
+            faux_assistant_message(vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: duplicate_id.clone(),
+                    name: "bash".into(),
+                    arguments: slow_args,
+                    thought_signature: None,
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: duplicate_id,
+                    name: "bash".into(),
+                    arguments: fast_args,
+                    thought_signature: None,
+                }),
+            ]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut session = mk_session().await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run both".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut requested = HashSet::new();
+        let mut received = HashSet::new();
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolExecutionRequested { invocation_id, .. } => {
+                    requested.insert(invocation_id);
+                }
+                AgentEvent::ToolResultReceived { invocation_id, .. } => {
+                    received.insert(invocation_id);
+                }
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        assert_eq!(requested.len(), 2, "each call needs its own invocation");
+        assert_eq!(
+            received, requested,
+            "turn ended before every invocation finished"
+        );
         session.close().await.unwrap();
     }
 

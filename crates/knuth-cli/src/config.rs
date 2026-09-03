@@ -4,6 +4,7 @@ use ai::{
     oauth::{OAuthCredentials, openai_codex},
 };
 use anyhow::{Context, Result, anyhow};
+use knuth_agent::policy::PolicyMode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -23,6 +24,7 @@ const CODEX_ACCOUNT_EXTRA: &str = "chatgpt_account_id";
 pub struct UserSettings {
     pub model: Model,
     pub options: StreamOptions,
+    pub policy_mode: PolicyMode,
 }
 
 impl UserSettings {
@@ -38,7 +40,17 @@ impl UserSettings {
         let model = Self::load_model_from_env(model_override, &config)?;
         let mut options = load_options(&config);
         load_codex_auth_json(&model, &mut options, &config_path).await?;
-        Ok(Self { model, options })
+        let policy_mode = env_value("KNUTH_POLICY_MODE")
+            .map(|s| s.parse::<PolicyMode>())
+            .transpose()
+            .map_err(|e| anyhow!("KNUTH_POLICY_MODE: {e}"))?
+            .or(config.policy_mode)
+            .unwrap_or_default();
+        Ok(Self {
+            model,
+            options,
+            policy_mode,
+        })
     }
 
     fn load_model_from_env(model_override: Option<&str>, config: &FileConfig) -> Result<Model> {
@@ -63,6 +75,7 @@ struct FileConfig {
     provider: Option<String>,
     api: Option<String>,
     base_url: Option<String>,
+    policy_mode: Option<PolicyMode>,
     options: Option<FileOptions>,
 }
 
@@ -700,6 +713,7 @@ mod tests {
 model: openrouter/anthropic/claude-sonnet-4.5
 api: openai-completions
 base_url: https://openrouter.ai/api/v1
+policy_mode: plan
 options:
   max_tokens: 4096
   temperature: 0.2
@@ -721,10 +735,57 @@ options:
             "openrouter/anthropic/claude-sonnet-4.5"
         );
         assert_eq!(config.api.unwrap(), "openai-completions");
+        assert_eq!(config.policy_mode.unwrap().as_str(), "plan");
         let options = config.options.unwrap();
         assert_eq!(options.cache_retention, Some(CacheRetention::Long));
         assert_eq!(options.reasoning_effort.unwrap(), "high");
         assert_eq!(options.thinking.unwrap().budget_tokens, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn policy_mode_defaults_to_auto_and_env_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = env::temp_dir().join(format!("knuth-policy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("knuth.yaml");
+        fs::write(
+            &config_path,
+            r#"
+model: chatgpt/gpt-5.4-mini
+base_url: https://aicoding.2233.ai
+"#,
+        )
+        .unwrap();
+
+        let cleared = &[
+            ("KNUTH_MODEL", None),
+            ("KNUTH_BASE_URL", None),
+            ("KNUTH_API_KEY", None),
+            ("CODEX_AUTH_TOKEN", None),
+            ("CODEX_ACCOUNT_ID", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_PROVIDER", None),
+            ("KNUTH_API", None),
+            ("KNUTH_POLICY_MODE", None),
+        ];
+
+        let _env = EnvGuard::set(cleared);
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
+        assert_eq!(settings.policy_mode.as_str(), "auto");
+        drop(_env);
+
+        let _env = EnvGuard::set(&[
+            ("KNUTH_POLICY_MODE", Some("bypass-permissions")),
+            ("KNUTH_MODEL", None),
+            ("KNUTH_API_KEY", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_BASE_URL", None),
+        ]);
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
+        assert_eq!(settings.policy_mode.as_str(), "bypass-permissions");
+        drop(_env);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
