@@ -249,3 +249,84 @@ impl EventStore for InMemoryEventStore {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::SessionId;
+
+    #[tokio::test]
+    async fn append_builds_a_verifiable_hash_chain() {
+        let store = InMemoryEventStore::new();
+        store
+            .append(AgentEvent::SessionStarted {
+                session_id: SessionId::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .append(AgentEvent::SystemPromptSet {
+                prompt: "be brief".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let events = store.range(0, 16).await.unwrap();
+        store.verify_hash_chain(&events).await.unwrap();
+
+        assert_eq!(events[0].stream_seq, 0);
+        assert_eq!(events[1].stream_seq, 1);
+        assert_eq!(events[1].parent_hash.as_ref(), Some(&events[0].hash));
+        assert!(events[0].parent_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_hash_chain_rejects_tampered_hash() {
+        let store = InMemoryEventStore::new();
+        store
+            .append(AgentEvent::SystemPromptSet {
+                prompt: "p".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .append(AgentEvent::SystemPromptSet {
+                prompt: "q".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut events = store.range(0, 16).await.unwrap();
+        events[1].hash = "deadbeef".to_string();
+
+        let error = store.verify_hash_chain(&events).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid event hash"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn session_event_distinguishes_durable_from_live() {
+        let durable = SessionEvent::Durable(
+            StoredEvent::new(
+                AgentEvent::SystemPromptSet {
+                    prompt: "p".to_string(),
+                },
+                0,
+                None,
+            )
+            .unwrap(),
+        );
+        let live = SessionEvent::Live(LiveEvent::AssistantMessageTextDelta {
+            step_id: crate::ids::StepId::new(),
+            content_index: 0,
+            delta: "x".to_string(),
+        });
+
+        assert!(durable.as_durable().is_some());
+        assert!(durable.as_live().is_none());
+        assert!(live.as_live().is_some());
+        assert!(live.as_durable().is_none());
+    }
+}

@@ -83,6 +83,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn python_reports_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut input = ToolInput::new();
+        input.insert("code".to_string(), "import time; time.sleep(10)".into());
+
+        let result = PythonTool {}.execute(input, cancel).await.unwrap();
+
+        assert!(matches!(result.outcome, ToolOutcome::Cancelled));
+        assert!(
+            result.content.contains("cancelled"),
+            "content={}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
     async fn python_returns_stdout() {
         let mut input = ToolInput::new();
         input.insert("code".to_string(), "print('python-ok')".into());

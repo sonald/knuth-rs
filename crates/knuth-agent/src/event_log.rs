@@ -275,6 +275,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_tool_result_projects_without_error_prefix() {
+        let mut log = mk_log();
+
+        log.commit(AgentEvent::ToolResultReceived {
+            invocation_id: ToolInvocationId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            outcome: ToolOutcome::ExecSuccess,
+            content: "ok".to_string(),
+        })
+        .await
+        .unwrap();
+
+        match log.messages() {
+            [Message::ToolResult(message)] => {
+                assert!(!message.is_error);
+                match &message.content[0] {
+                    UserContentBlock::Text(text) => assert_eq!(text.text, "ok"),
+                    other => panic!("expected a text content block, got {other:?}"),
+                }
+            }
+            other => panic!("expected a single tool result message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denied_tool_result_is_projected_as_error() {
+        let mut log = mk_log();
+
+        log.commit(AgentEvent::ToolResultReceived {
+            invocation_id: ToolInvocationId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "write_file".to_string(),
+            outcome: ToolOutcome::PolicyDenied,
+            content: "read-only mode".to_string(),
+        })
+        .await
+        .unwrap();
+
+        match log.messages() {
+            [Message::ToolResult(message)] => {
+                assert!(message.is_error);
+                match &message.content[0] {
+                    UserContentBlock::Text(text) => {
+                        assert!(text.text.contains("read-only mode"), "got {:?}", text.text)
+                    }
+                    other => panic!("expected a text content block, got {other:?}"),
+                }
+            }
+            other => panic!("expected a single tool result message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proposed_and_observed_tool_events_do_not_enter_conversation() {
+        let mut log = mk_log();
+        let invocation_id = ToolInvocationId::new();
+
+        log.commit(AgentEvent::ToolCallProposed {
+            invocation_id,
+            step_id: StepId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            arguments: serde_json::Map::new(),
+        })
+        .await
+        .unwrap();
+        log.commit(AgentEvent::ToolExecutionObserved {
+            invocation_id,
+            tool_call_id: "call-1".to_string(),
+            additional_content: vec![],
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            log.messages().is_empty(),
+            "pipeline bookkeeping events must not become model messages"
+        );
+    }
+
+    #[tokio::test]
     async fn dropped_subscriber_is_pruned() {
         let mut log = mk_log();
         let sub = log.subscribe(4);

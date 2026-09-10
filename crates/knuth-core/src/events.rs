@@ -92,6 +92,7 @@ pub enum AgentEvent {
         details: Option<serde_json::Value>,
     },
 
+    /// originally proposed by the tool use policy, then finalized after before_tool_use hook has run
     ToolCallProposed {
         invocation_id: ToolInvocationId,
         step_id: StepId,
@@ -120,6 +121,7 @@ pub enum AgentEvent {
         content: String,
     },
 
+    /// observed after the tool execution has completed, before the tool result is post-processed
     ToolExecutionObserved {
         invocation_id: ToolInvocationId,
         tool_call_id: String,
@@ -293,41 +295,62 @@ impl std::fmt::Display for AgentEvent {
 mod tests {
     use super::*;
 
+    fn sample_tool_events() -> Vec<AgentEvent> {
+        let invocation_id = ToolInvocationId::new();
+        let step_id = StepId::new();
+        vec![
+            AgentEvent::ToolCallProposed {
+                invocation_id,
+                step_id,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "bash".to_string(),
+                arguments: serde_json::Map::new(),
+            },
+            AgentEvent::ToolExecutionRequested {
+                invocation_id,
+                step_id,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "bash".to_string(),
+                arguments: serde_json::Map::new(),
+            },
+            AgentEvent::ToolExecutionObserved {
+                invocation_id,
+                tool_call_id: "call-1".to_string(),
+                additional_content: vec![],
+            },
+            AgentEvent::ToolResultReceived {
+                invocation_id,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "bash".to_string(),
+                outcome: ToolOutcome::ExecSuccess,
+                content: "ok".to_string(),
+            },
+        ]
+    }
+
     #[test]
     fn durable_tool_events_carry_stable_event_types() {
-        let invocation_id = ToolInvocationId::new();
-        let requested = AgentEvent::ToolExecutionRequested {
-            invocation_id,
-            step_id: StepId::new(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "bash".to_string(),
-            arguments: serde_json::Map::new(),
-        };
-        let received = AgentEvent::ToolResultReceived {
-            invocation_id,
-            tool_call_id: "call-1".to_string(),
-            tool_name: "bash".to_string(),
-            outcome: ToolOutcome::ExecSuccess,
-            content: "ok".to_string(),
-        };
-
-        assert_eq!(requested.event_type(), "tool.execution_requested");
-        assert_eq!(received.event_type(), "tool.result_received");
+        let events = sample_tool_events();
+        let types: Vec<_> = events.iter().map(AgentEvent::event_type).collect();
+        assert_eq!(
+            types,
+            [
+                "tool.call_proposed",
+                "tool.execution_requested",
+                "tool.execution_observed",
+                "tool.result_received",
+            ]
+        );
     }
 
     #[test]
     fn agent_event_round_trips_through_serde() {
-        let event = AgentEvent::ToolResultReceived {
-            invocation_id: ToolInvocationId::new(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "bash".to_string(),
-            outcome: ToolOutcome::Error,
-            content: "boom".to_string(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(decoded.name(), "ToolResultReceived");
+        for event in sample_tool_events() {
+            let expected_name = event.name();
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.name(), expected_name);
+            assert_eq!(decoded.event_type(), event.event_type());
+        }
     }
 }

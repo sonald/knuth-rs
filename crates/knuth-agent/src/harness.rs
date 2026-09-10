@@ -84,15 +84,9 @@ pub struct ToolInvocationKey {
 
 #[derive(Debug, Clone)]
 enum InvocationState {
-    Proposing {
-        proposed: ToolCall,
-    },
-    Executing {
-        effective: ToolCall,
-    },
-    Finalized {
-        effective: ToolCall,
-    },
+    Proposing { proposed: ToolCall },
+    Executing { effective: ToolCall },
+    Finalized { effective: ToolCall },
 }
 
 #[derive(Debug, Clone)]
@@ -688,26 +682,42 @@ impl AgentActor {
         Ok(())
     }
 
+    fn running_invocation(
+        &self,
+        key: &ToolInvocationKey,
+    ) -> Option<(InvocationState, CancellationToken)> {
+        match &self.turn {
+            TurnState::RunningTools {
+                turn_id,
+                pending,
+                cancel,
+            } if *turn_id == key.turn_id => pending.get(&key.invocation_id).and_then(|inv| {
+                if inv.key.generation == key.generation && inv.key.step_id == key.step_id {
+                    Some((inv.state.clone(), cancel.clone()))
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }
+    }
+
     async fn handle_tool_input_prepared(
         &mut self,
         key: ToolInvocationKey,
         data: Result<BeforeToolUseData, HookError>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let TurnState::RunningTools {
-            cancel, pending, ..
-        } = &self.turn
-        else {
-            return Err(AgentSessionError::InvalidState(
-                "not in RunningTools state".to_string(),
-            ));
+        let Some((state, cancel)) = self.running_invocation(&key) else {
+            debug!("ignoring stale ToolInputPrepared for {}", key.invocation_id);
+            return Ok(());
         };
-
-        let invocation = pending
-            .get(&key.invocation_id)
-            .expect("invocation not found");
-        let InvocationState::Proposing { proposed } = &invocation.state else {
-            unreachable!("not in Proposing state");
+        let InvocationState::Proposing { proposed } = state else {
+            debug!(
+                "ignoring ToolInputPrepared for non-proposing invocation {}",
+                key.invocation_id
+            );
+            return Ok(());
         };
 
         let data = match data {
@@ -817,22 +827,19 @@ impl AgentActor {
         data: Result<AfterToolUseData, HookError>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let TurnState::RunningTools {
-            pending, cancel, ..
-        } = &self.turn
-        else {
-            return Err(AgentSessionError::InvalidState(
-                "not in RunningTools state".to_string(),
-            ));
+        let Some((state, cancel)) = self.running_invocation(&key) else {
+            debug!(
+                "ignoring stale ToolResultFinalized for {}",
+                key.invocation_id
+            );
+            return Ok(());
         };
-
-        let invocation = pending
-            .get(&key.invocation_id)
-            .expect("invocation not found");
-        let InvocationState::Finalized { effective, .. } = &invocation.state else {
-            return Err(AgentSessionError::InvalidState(
-                "invocation not in Finalized state".to_string(),
-            ));
+        let InvocationState::Finalized { effective } = state else {
+            debug!(
+                "ignoring ToolResultFinalized for non-finalized invocation {}",
+                key.invocation_id
+            );
+            return Ok(());
         };
 
         let (result, additional_content) = if cancel.is_cancelled() {
@@ -884,24 +891,17 @@ impl AgentActor {
         result: ToolResult,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let TurnState::RunningTools {
-            pending, cancel, ..
-        } = &self.turn
-        else {
-            return Err(AgentSessionError::InvalidState(
-                "not in RunningTools state".to_string(),
-            ));
+        let Some((state, cancel)) = self.running_invocation(&key) else {
+            debug!("ignoring stale ToolFinished for {}", key.invocation_id);
+            return Ok(());
         };
-
-        let invocation = pending
-            .get(&key.invocation_id)
-            .expect("invocation not found");
-        let InvocationState::Executing { effective } = &invocation.state else {
-            return Err(AgentSessionError::InvalidState(
-                "invocation not in Executing state".to_string(),
-            ));
+        let InvocationState::Executing { effective } = state else {
+            debug!(
+                "ignoring ToolFinished for non-executing invocation {}",
+                key.invocation_id
+            );
+            return Ok(());
         };
-        let cancel = cancel.clone();
 
         self.log
             .commit(AgentEvent::ToolExecutionObserved {
@@ -1116,6 +1116,11 @@ fn mime_type_from_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::{
+        AfterToolUseData, AfterToolUseHook, AfterToolUseResult, BeforeToolUseData,
+        BeforeToolUseHook, BeforeToolUseResult, HookContext, HookError, ToolCallDecision,
+        ToolResultView,
+    };
     use crate::test_support::faux_lock;
     use crate::tools::policy::{PolicyContext, PolicyEngineTrait};
     use crate::{AgentToolRegistry, ToolError, ToolResult};
@@ -1123,10 +1128,12 @@ mod tests {
         clear_faux_responses, faux_assistant_message, faux_text, faux_tool_call, set_faux_responses,
     };
     use ai::{Api, ModelCost, Provider, ToolCall};
+    use async_trait::async_trait;
     use futures::StreamExt;
-    use knuth_core::{SessionEvent, ToolOutcome};
+    use knuth_core::{SessionEvent, ToolOutcome, ids::HookId};
     use serde_json::Map;
     use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
@@ -1184,6 +1191,144 @@ mod tests {
         }
     }
 
+    struct EchoArgsEngine {
+        executed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EchoArgsEngine {
+        fn new() -> Self {
+            Self {
+                executed: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PolicyEngineTrait for EchoArgsEngine {
+        fn schemas(&self) -> Vec<ai::Tool> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            tool_call: &ToolCall,
+            _cancel: CancellationToken,
+            _ctx: &PolicyContext,
+        ) -> ToolResult {
+            self.executed.lock().unwrap().push(tool_call.name.clone());
+            ToolResult {
+                outcome: ToolOutcome::ExecSuccess,
+                content: serde_json::to_string(&tool_call.arguments).unwrap(),
+            }
+        }
+    }
+
+    struct DenyNamedHook {
+        id: HookId,
+        name: String,
+        reason: String,
+    }
+
+    #[async_trait]
+    impl BeforeToolUseHook for DenyNamedHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            tool_call: &ToolCall,
+        ) -> Result<BeforeToolUseResult, HookError> {
+            if tool_call.name == self.name {
+                Ok(BeforeToolUseResult {
+                    modified_arguments: None,
+                    permission: ToolCallDecision::Deny {
+                        reason: self.reason.clone(),
+                    },
+                    additional_content: None,
+                })
+            } else {
+                Ok(BeforeToolUseResult {
+                    modified_arguments: None,
+                    permission: ToolCallDecision::Allow,
+                    additional_content: None,
+                })
+            }
+        }
+    }
+
+    struct RewriteCommandHook {
+        id: HookId,
+        to: String,
+    }
+
+    #[async_trait]
+    impl BeforeToolUseHook for RewriteCommandHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            _tool_call: &ToolCall,
+        ) -> Result<BeforeToolUseResult, HookError> {
+            let mut arguments = Map::new();
+            arguments.insert("command".into(), serde_json::Value::String(self.to.clone()));
+            Ok(BeforeToolUseResult {
+                modified_arguments: Some(arguments),
+                permission: ToolCallDecision::Allow,
+                additional_content: None,
+            })
+        }
+    }
+
+    struct PrefixResultHook {
+        id: HookId,
+        prefix: String,
+    }
+
+    #[async_trait]
+    impl AfterToolUseHook for PrefixResultHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            current: &ToolResultView,
+        ) -> Result<AfterToolUseResult, HookError> {
+            Ok(AfterToolUseResult {
+                modified: Some(ToolResult {
+                    outcome: current.result.outcome.clone(),
+                    content: format!("{}{}", self.prefix, current.result.content),
+                }),
+                additional_content: None,
+            })
+        }
+    }
+
+    struct TimeoutAfterHook {
+        id: HookId,
+    }
+
+    #[async_trait]
+    impl AfterToolUseHook for TimeoutAfterHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            _current: &ToolResultView,
+        ) -> Result<AfterToolUseResult, HookError> {
+            Err(HookError::Timeout)
+        }
+    }
+
     fn default_tool_registry() -> AgentToolRegistry {
         let mut registry = AgentToolRegistry::new();
         registry.load_default();
@@ -1215,12 +1360,28 @@ mod tests {
     }
 
     fn test_config(policy_engine: Arc<dyn PolicyEngineTrait>) -> AgentConfig {
+        test_config_with_hooks(policy_engine, HookRegistry::new())
+    }
+
+    fn test_config_with_hooks(
+        policy_engine: Arc<dyn PolicyEngineTrait>,
+        hooks: HookRegistry,
+    ) -> AgentConfig {
         AgentConfig {
             model: faux_model(),
             options: StreamOptions::default(),
             policy_engine,
             policy_context: PolicyContext {},
-            hooks: Arc::new(HookRegistry::new()),
+            hooks: Arc::new(hooks),
+        }
+    }
+
+    fn dummy_tool_call() -> ToolCall {
+        ToolCall {
+            id: "stale-call".into(),
+            name: "bash".into(),
+            arguments: Map::new(),
+            thought_signature: None,
         }
     }
 
@@ -1290,7 +1451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_tool_completion_is_not_persisted() {
+    async fn stale_tool_pipeline_messages_are_not_persisted() {
         let actor = AgentActor::new(SessionId::new(), test_config(passthrough_engine()));
         let runtime = spawn_actor(actor, 8).await;
         let mut sub = runtime
@@ -1304,19 +1465,46 @@ mod tests {
             .await
             .unwrap();
 
+        let key = ToolInvocationKey {
+            turn_id: TurnId::new(),
+            step_id: StepId::new(),
+            invocation_id: ToolInvocationId::new(),
+            generation: Generation::new(),
+        };
+        runtime
+            .handle()
+            .send(AgentActorMessage::ToolInputPrepared {
+                key,
+                data: Ok(BeforeToolUseData {
+                    tool_call: dummy_tool_call(),
+                    permission: ToolCallDecision::Allow,
+                    additional_hints: vec![],
+                }),
+            })
+            .await
+            .unwrap();
         runtime
             .handle()
             .send(AgentActorMessage::ToolFinished {
-                key: ToolInvocationKey {
-                    turn_id: TurnId::new(),
-                    step_id: StepId::new(),
-                    invocation_id: ToolInvocationId::new(),
-                    generation: Generation::new(),
-                },
+                key,
                 result: ToolResult {
                     outcome: ToolOutcome::Error,
                     content: "stale result".to_string(),
                 },
+            })
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .send(AgentActorMessage::ToolResultFinalized {
+                key,
+                data: Ok(AfterToolUseData {
+                    modified: ToolResult {
+                        outcome: ToolOutcome::Error,
+                        content: "stale finalized".to_string(),
+                    },
+                    additional_hints: vec![],
+                }),
             })
             .await
             .unwrap();
@@ -1328,10 +1516,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
-            next_durable_event(&mut sub).await,
-            AgentEvent::SystemPromptSet { prompt } if prompt == "after stale tool completion"
-        ));
+        let event = next_durable_event(&mut sub).await;
+        assert!(
+            matches!(
+                &event,
+                AgentEvent::SystemPromptSet { prompt } if prompt == "after stale tool completion"
+            ),
+            "stale pipeline messages must not persist or kill the session, got {event:?}"
+        );
         runtime.shutdown().await;
     }
 
@@ -1359,21 +1551,34 @@ mod tests {
         let mut live_started_step = None;
         let mut live_ended = None;
         let mut step_ends = vec![];
+        let mut tool_lifecycle = vec![];
         let turn_ended = loop {
             match next_session_event(&mut sub).await {
                 SessionEvent::Durable(stored) => match stored.event {
                     AgentEvent::AgentTurnStarted { turn_id } => turn_started = Some(turn_id),
+                    AgentEvent::ToolCallProposed { invocation_id, .. } => {
+                        tool_lifecycle.push(("proposed", invocation_id))
+                    }
                     AgentEvent::ToolExecutionRequested {
                         invocation_id,
                         step_id,
                         ..
-                    } => requested = Some((invocation_id, step_id)),
+                    } => {
+                        requested = Some((invocation_id, step_id));
+                        tool_lifecycle.push(("requested", invocation_id));
+                    }
+                    AgentEvent::ToolExecutionObserved { invocation_id, .. } => {
+                        tool_lifecycle.push(("observed", invocation_id))
+                    }
                     AgentEvent::ToolResultReceived {
                         invocation_id,
                         outcome,
                         content,
                         ..
-                    } => received = Some((invocation_id, outcome, content)),
+                    } => {
+                        received = Some((invocation_id, outcome, content));
+                        tool_lifecycle.push(("received", invocation_id));
+                    }
                     AgentEvent::ModelStepEnded {
                         step_id, reason, ..
                     } => step_ends.push((step_id, reason)),
@@ -1397,6 +1602,18 @@ mod tests {
             turn_started.expect("turn should start"),
             turn_ended,
             "AgentTurnStarted and AgentTurnEnded must carry the same turn_id"
+        );
+
+        assert_eq!(
+            tool_lifecycle
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            ["proposed", "requested", "observed", "received"]
+        );
+        assert!(
+            tool_lifecycle.windows(2).all(|pair| pair[0].1 == pair[1].1),
+            "the hook pipeline must keep one invocation_id, got {tool_lifecycle:?}"
         );
 
         let (requested_invocation, requested_step) = requested.expect("tool should be requested");
@@ -1464,8 +1681,10 @@ mod tests {
             .unwrap();
 
         let mut outcome = None;
+        let mut requested = false;
         loop {
             match next_durable_event(&mut sub).await {
+                AgentEvent::ToolExecutionRequested { .. } => requested = true,
                 AgentEvent::ToolResultReceived {
                     outcome: tool_outcome,
                     ..
@@ -1476,6 +1695,10 @@ mod tests {
         }
         clear_faux_responses();
 
+        assert!(
+            requested,
+            "policy-engine denial happens after ToolExecutionRequested"
+        );
         assert_eq!(outcome, Some(ToolOutcome::PolicyDenied));
         session.close().await.unwrap();
     }
@@ -1574,6 +1797,310 @@ mod tests {
         clear_faux_responses();
 
         assert_ne!(turns[0], turns[1], "each input should get its own turn");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn before_hook_deny_skips_execution() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf should-not-run"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let engine = EchoArgsEngine::new();
+        let executed = Arc::clone(&engine.executed);
+        let mut hooks = HookRegistry::new();
+        hooks.on_before_tool_use(Arc::new(DenyNamedHook {
+            id: HookId::new(),
+            name: "bash".into(),
+            reason: "blocked by hook".into(),
+        }));
+
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config_with_hooks(Arc::new(engine), hooks),
+        )
+        .await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut requested = false;
+        let mut proposed = false;
+        let mut outcome = None;
+        let mut content = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolCallProposed { .. } => proposed = true,
+                AgentEvent::ToolExecutionRequested { .. } => requested = true,
+                AgentEvent::ToolResultReceived {
+                    outcome: tool_outcome,
+                    content: tool_content,
+                    ..
+                } => {
+                    outcome = Some(tool_outcome);
+                    content = Some(tool_content);
+                }
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        assert!(proposed, "deny still records the proposed call");
+        assert!(
+            !requested,
+            "before-hook deny must not emit ToolExecutionRequested"
+        );
+        assert_eq!(outcome, Some(ToolOutcome::PolicyDenied));
+        assert_eq!(content.as_deref(), Some("blocked by hook"));
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "policy engine must not run a hook-denied call"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn before_hook_rewrites_arguments_used_for_execution() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf original"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut hooks = HookRegistry::new();
+        hooks.on_before_tool_use(Arc::new(RewriteCommandHook {
+            id: HookId::new(),
+            to: "printf rewritten".into(),
+        }));
+
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config_with_hooks(Arc::new(EchoArgsEngine::new()), hooks),
+        )
+        .await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut proposed_args = None;
+        let mut requested_args = None;
+        let mut content = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolCallProposed { arguments, .. } => proposed_args = Some(arguments),
+                AgentEvent::ToolExecutionRequested { arguments, .. } => {
+                    requested_args = Some(arguments)
+                }
+                AgentEvent::ToolResultReceived {
+                    content: tool_content,
+                    ..
+                } => content = Some(tool_content),
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        assert_eq!(
+            proposed_args.expect("call should be proposed")["command"],
+            "printf original"
+        );
+        assert_eq!(
+            requested_args.expect("rewritten call should be requested")["command"],
+            "printf rewritten"
+        );
+        let content = content.expect("tool should report a result");
+        assert!(
+            content.contains("printf rewritten"),
+            "execution should see rewritten arguments, got {content:?}"
+        );
+        assert!(
+            !content.contains("printf original"),
+            "original arguments must not be executed, got {content:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_hook_rewrites_persisted_tool_result() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf raw"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut hooks = HookRegistry::new();
+        hooks.on_after_tool_use(Arc::new(PrefixResultHook {
+            id: HookId::new(),
+            prefix: "hooked:".into(),
+        }));
+
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config_with_hooks(Arc::new(EchoArgsEngine::new()), hooks),
+        )
+        .await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut content = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolResultReceived {
+                    content: tool_content,
+                    ..
+                } => content = Some(tool_content),
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        let content = content.expect("tool should report a result");
+        assert!(
+            content.starts_with("hooked:"),
+            "after-tool-use hook should rewrite the persisted result, got {content:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_hook_timeout_is_recorded_as_tool_error() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf raw"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut hooks = HookRegistry::new();
+        hooks.on_after_tool_use(Arc::new(TimeoutAfterHook { id: HookId::new() }));
+
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config_with_hooks(Arc::new(EchoArgsEngine::new()), hooks),
+        )
+        .await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut outcome = None;
+        let mut content = None;
+        let mut error_phase = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolResultReceived {
+                    outcome: tool_outcome,
+                    content: tool_content,
+                    ..
+                } => {
+                    outcome = Some(tool_outcome);
+                    content = Some(tool_content);
+                }
+                AgentEvent::ErrorOccurred { details, .. } => {
+                    error_phase = details
+                        .as_ref()
+                        .and_then(|value| value.get("phase"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                }
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        assert_eq!(outcome, Some(ToolOutcome::Error));
+        assert!(
+            content
+                .as_deref()
+                .is_some_and(|text| text.contains("timed out")),
+            "got {content:?}"
+        );
+        assert_eq!(error_phase.as_deref(), Some("after_tool_use"));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_execution_records_cancelled() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("sleep 5"));
+        set_faux_responses(vec![faux_assistant_message(vec![faux_tool_call(
+            "bash", args,
+        )])]);
+
+        let mut session = mk_session().await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        loop {
+            if matches!(
+                next_durable_event(&mut sub).await,
+                AgentEvent::ToolExecutionRequested { .. }
+            ) {
+                break;
+            }
+        }
+        session.cancel_current_turn().await.unwrap();
+
+        let mut outcome = None;
+        let mut resumed = false;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolResultReceived {
+                    outcome: tool_outcome,
+                    ..
+                } => outcome = Some(tool_outcome),
+                AgentEvent::ModelStepStarted { .. } => resumed = true,
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        assert_eq!(outcome, Some(ToolOutcome::Cancelled));
+        assert!(
+            !resumed,
+            "a cancelled tool batch must end the turn without another model step"
+        );
         session.close().await.unwrap();
     }
 }

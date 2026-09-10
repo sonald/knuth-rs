@@ -109,4 +109,15 @@ mod tests {
         );
         assert_eq!(id.as_uuid(), uuid);
     }
+
+    #[test]
+    fn generation_starts_at_zero_and_advances() {
+        let first = Generation::new();
+        let second = first.next();
+        let third = second.next();
+
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!(third, Generation::new().next().next());
+    }
 }

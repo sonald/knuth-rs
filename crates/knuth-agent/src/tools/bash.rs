@@ -126,6 +126,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_tool_reports_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = BashTool {}
+            .execute(input("sleep 10"), cancel)
+            .await
+            .unwrap();
+
+        assert!(matches!(result.outcome, ToolOutcome::Cancelled));
+        assert!(
+            result.content.contains("cancelled"),
+            "content={}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
     async fn bash_tool_error_echoes_received_argument_keys() {
         let mut wrong_case = ToolInput::new();
         wrong_case.insert(
