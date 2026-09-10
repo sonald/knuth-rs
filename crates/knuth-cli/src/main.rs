@@ -11,12 +11,16 @@ use std::{
 };
 
 use futures::StreamExt;
-use knuth_agent::harness::{AgentConfig, AgentSession};
 use knuth_agent::policy::PolicyContext;
+use knuth_agent::{
+    harness::{AgentConfig, AgentSession},
+    hooks::HookRegistry,
+};
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
 mod policy;
+
 use config::UserSettings;
 use policy::DefaultPolicyEngine;
 
@@ -124,16 +128,18 @@ fn build_system_prompt() -> String {
 }
 
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
+    let policy_engine = DefaultPolicyEngine::with_default_tools(user_settings.policy_mode.clone());
+    let hooks = HookRegistry::new();
+
     let mut session = AgentSession::build(
         "test".to_string(),
         "test".to_string(),
         AgentConfig {
             model: user_settings.model.clone(),
             options: user_settings.options.clone(),
-            policy_engine: Arc::new(DefaultPolicyEngine::with_default_tools()),
-            policy_context: PolicyContext {
-                mode: user_settings.policy_mode.clone(),
-            },
+            policy_engine: Arc::new(policy_engine),
+            policy_context: PolicyContext {},
+            hooks: Arc::new(hooks),
         },
     )
     .await;

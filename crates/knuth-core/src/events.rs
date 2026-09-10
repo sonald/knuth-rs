@@ -92,6 +92,15 @@ pub enum AgentEvent {
         details: Option<serde_json::Value>,
     },
 
+    ToolCallProposed {
+        invocation_id: ToolInvocationId,
+        step_id: StepId,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
+
+    /// finalized after before_tool_use hook has run
     ToolExecutionRequested {
         invocation_id: ToolInvocationId,
         step_id: StepId,
@@ -108,7 +117,13 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         outcome: ToolOutcome,
-        content: Vec<u8>,
+        content: String,
+    },
+
+    ToolExecutionObserved {
+        invocation_id: ToolInvocationId,
+        tool_call_id: String,
+        additional_content: Vec<UserContent>,
     },
 }
 
@@ -118,6 +133,7 @@ impl AgentEvent {
         match self {
             AgentEvent::SessionStarted { .. } => "SessionStarted",
             AgentEvent::SessionEnded { .. } => "SessionEnded",
+            AgentEvent::SystemPromptSet { .. } => "SystemPromptSet",
             AgentEvent::AgentTurnStarted { .. } => "AgentTurnStarted",
             AgentEvent::AgentTurnEnded { .. } => "AgentTurnEnded",
             AgentEvent::ModelStepStarted { .. } => "ModelStepStarted",
@@ -126,7 +142,8 @@ impl AgentEvent {
             AgentEvent::ToolExecutionRequested { .. } => "ToolExecutionRequested",
             AgentEvent::ToolResultReceived { .. } => "ToolResultReceived",
             AgentEvent::ErrorOccurred { .. } => "ErrorOccurred",
-            AgentEvent::SystemPromptSet { .. } => "SystemPromptSet",
+            AgentEvent::ToolCallProposed { .. } => "ToolCallProposed",
+            AgentEvent::ToolExecutionObserved { .. } => "ToolExecutionObserved",
         }
     }
 
@@ -143,6 +160,8 @@ impl AgentEvent {
             AgentEvent::SystemPromptSet { .. } => "system_prompt.set",
             AgentEvent::ToolExecutionRequested { .. } => "tool.execution_requested",
             AgentEvent::ToolResultReceived { .. } => "tool.result_received",
+            AgentEvent::ToolCallProposed { .. } => "tool.call_proposed",
+            AgentEvent::ToolExecutionObserved { .. } => "tool.execution_observed",
         }
     }
 }
@@ -235,11 +254,36 @@ impl std::fmt::Display for AgentEvent {
                     f,
                     "ToolResultReceived(invocation_id={}, tool_call_id={tool_call_id}, tool_name={tool_name}, outcome={outcome:?}, content={})",
                     invocation_id.short(),
-                    short_string(&String::from_utf8_lossy(content))
+                    short_string(content)
                 )
             }
             AgentEvent::ErrorOccurred { message, details } => {
                 write!(f, "ErrorOccurred(message={message:?}, details={details:?})")
+            }
+            AgentEvent::ToolCallProposed {
+                invocation_id,
+                step_id,
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ToolCallProposed(invocation_id={}, step_id={}, tool_call_id={tool_call_id}, tool_name={tool_name})",
+                    invocation_id.short(),
+                    step_id.short()
+                )
+            }
+            AgentEvent::ToolExecutionObserved {
+                invocation_id,
+                tool_call_id,
+                additional_content,
+            } => {
+                write!(
+                    f,
+                    "ToolExecutionObserved(invocation_id={}, tool_call_id={tool_call_id}, additional_content={additional_content:?})",
+                    invocation_id.short()
+                )
             }
         }
     }
@@ -264,7 +308,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             outcome: ToolOutcome::ExecSuccess,
-            content: b"ok".to_vec(),
+            content: "ok".to_string(),
         };
 
         assert_eq!(requested.event_type(), "tool.execution_requested");
@@ -278,7 +322,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             outcome: ToolOutcome::Error,
-            content: b"boom".to_vec(),
+            content: "boom".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();

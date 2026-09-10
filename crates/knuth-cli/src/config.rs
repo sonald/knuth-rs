@@ -1,10 +1,10 @@
+use crate::policy::PolicyMode;
 use ai::{
     Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
     get_model,
     oauth::{OAuthCredentials, openai_codex},
 };
 use anyhow::{Context, Result, anyhow};
-use knuth_agent::policy::PolicyMode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -713,7 +713,7 @@ mod tests {
 model: openrouter/anthropic/claude-sonnet-4.5
 api: openai-completions
 base_url: https://openrouter.ai/api/v1
-policy_mode: plan
+policy_mode: read-only
 options:
   max_tokens: 4096
   temperature: 0.2
@@ -735,7 +735,7 @@ options:
             "openrouter/anthropic/claude-sonnet-4.5"
         );
         assert_eq!(config.api.unwrap(), "openai-completions");
-        assert_eq!(config.policy_mode.unwrap().as_str(), "plan");
+        assert_eq!(config.policy_mode.unwrap().as_str(), "read-only");
         let options = config.options.unwrap();
         assert_eq!(options.cache_retention, Some(CacheRetention::Long));
         assert_eq!(options.reasoning_effort.unwrap(), "high");

@@ -32,10 +32,10 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolResult {
     pub outcome: ToolOutcome,
-    pub content: Vec<u8>,
+    pub content: String,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -125,7 +125,6 @@ impl ConversationState {
                 // and the flag is set too for providers that carry it natively
                 // (e.g. Anthropic's tool_result.is_error).
                 let is_error = !outcome.is_success();
-                let content = String::from_utf8_lossy(&content).into_owned();
                 let result_text = if is_error {
                     format!("Tool call failed with details: \n{}", content)
                 } else {
@@ -253,7 +252,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             outcome: ToolOutcome::Error,
-            content: b"boom".to_vec(),
+            content: "boom".to_string(),
         })
         .await
         .unwrap();

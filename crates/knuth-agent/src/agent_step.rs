@@ -490,6 +490,12 @@ mod tests {
                 }
                 AgentActorMessage::Command(_) => panic!("unexpected actor command"),
                 AgentActorMessage::ToolFinished { .. } => panic!("unexpected ToolFinished"),
+                AgentActorMessage::ToolInputPrepared { .. } => {
+                    panic!("unexpected ToolInputPrepared")
+                }
+                AgentActorMessage::ToolResultFinalized { .. } => {
+                    panic!("unexpected ToolResultFinalized")
+                }
             }
         }
 

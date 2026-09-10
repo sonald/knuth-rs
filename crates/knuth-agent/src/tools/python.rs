@@ -39,7 +39,7 @@ impl AgentTool for PythonTool {
             _ = cancel_token.cancelled() => {
                 return Ok(ToolResult {
                     outcome: ToolOutcome::Cancelled,
-                    content: b"Python execution cancelled".to_vec(),
+                    content: "Python execution cancelled".to_string(),
                 })
             },
             _ = tokio::time::sleep(Duration::from_secs(30)) => return Err(ToolError::TimeoutError(Duration::from_secs(30))),
@@ -62,8 +62,7 @@ impl AgentTool for PythonTool {
             content: format!(
                 "Python exited with {}.\nstdout:\n{}\nstderr:\n{}",
                 output.status, stdout, stderr
-            )
-            .into_bytes(),
+            ),
         })
     }
 }
@@ -94,7 +93,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
-        let content = String::from_utf8_lossy(&result.content);
+        let content = result.content;
         assert!(content.contains("python-ok"), "content={content}");
     }
 }

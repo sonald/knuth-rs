@@ -15,6 +15,8 @@ pub use event_log::*;
 pub mod tools;
 pub use tools::*;
 
+pub mod hooks;
+
 #[cfg(test)]
 pub(crate) mod test_support {
     /// The faux provider's response queue is process-global; tests that use it

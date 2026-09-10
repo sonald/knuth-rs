@@ -50,7 +50,7 @@ impl AgentTool for ReadFileTool {
         let content = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
                 outcome: ToolOutcome::Cancelled,
-                content: b"File read cancelled".to_vec(),
+                content: "File read cancelled".to_string(),
             }),
             result = fs::read_to_string(path) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         };
@@ -67,7 +67,7 @@ impl AgentTool for ReadFileTool {
                     outcome: ToolOutcome::Error,
                     content: format!(
                         "Line {line_number} is {line_bytes} bytes, exceeding read_file max of {MAX_READ_BYTES} bytes; no content returned"
-                    ).into_bytes(),
+                    ),
                 });
             }
             bytes += line_bytes;
@@ -76,7 +76,7 @@ impl AgentTool for ReadFileTool {
                     outcome: ToolOutcome::Error,
                     content: format!(
                         "Requested content exceeds read_file max of {MAX_READ_BYTES} bytes ({bytes} bytes needed); no content returned"
-                    ).into_bytes(),
+                    ),
                 });
             }
             rendered.push(format!(
@@ -91,8 +91,7 @@ impl AgentTool for ReadFileTool {
                 content: format!(
                     "No content found in the specified range (file has {} total lines)",
                     lines.len()
-                )
-                .into_bytes(),
+                ),
             });
         }
 
@@ -103,8 +102,7 @@ impl AgentTool for ReadFileTool {
                 "File({path}) - Lines {offset}-{end_line} of {} total:\n{}",
                 lines.len(),
                 rendered.join("\n")
-            )
-            .into_bytes(),
+            ),
         })
     }
 }
@@ -136,7 +134,7 @@ impl AgentTool for WriteFileTool {
         tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
                 outcome: ToolOutcome::Cancelled,
-                content: b"File write cancelled".to_vec(),
+                content: "File write cancelled".to_string(),
             }),
             result = async {
                 if let Some(parent) = Path::new(path).parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -147,7 +145,7 @@ impl AgentTool for WriteFileTool {
         }
         Ok(ToolResult {
             outcome: ToolOutcome::ExecSuccess,
-            content: format!("Wrote {path}").into_bytes(),
+            content: format!("Wrote {path}"),
         })
     }
 }
@@ -179,7 +177,7 @@ impl AgentTool for EditFileTool {
         if old_string == new_string {
             return Ok(ToolResult {
                 outcome: ToolOutcome::Error,
-                content: b"new_string must be different from old_string".to_vec(),
+                content: "new_string must be different from old_string".to_string(),
             });
         }
         let replace_all = input.get("replace_all").map_or(Ok(false), |value| {
@@ -191,7 +189,7 @@ impl AgentTool for EditFileTool {
         let raw = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
                 outcome: ToolOutcome::Cancelled,
-                content: b"File edit cancelled".to_vec(),
+                content: "File edit cancelled".to_string(),
             }),
             result = fs::read(path) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         };
@@ -200,7 +198,7 @@ impl AgentTool for EditFileTool {
         if count == 0 {
             return Ok(ToolResult {
                 outcome: ToolOutcome::Error,
-                content: b"old_string was not found".to_vec(),
+                content: "old_string was not found".to_string(),
             });
         }
         if count > 1 && !replace_all {
@@ -208,8 +206,7 @@ impl AgentTool for EditFileTool {
                 outcome: ToolOutcome::Error,
                 content: format!(
                     "old_string found {count} matches; set replace_all=true to replace all"
-                )
-                .into_bytes(),
+                ),
             });
         }
 
@@ -222,7 +219,7 @@ impl AgentTool for EditFileTool {
         tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
                 outcome: ToolOutcome::Cancelled,
-                content: b"File edit cancelled".to_vec(),
+                content: "File edit cancelled".to_string(),
             }),
             result = fs::write(path, encoded) => result.map_err(|error| ToolError::Message(error.to_string()))?,
         }
@@ -232,8 +229,7 @@ impl AgentTool for EditFileTool {
                 "Edited {path} (replacements={}, encoding={})",
                 if replace_all { count } else { 1 },
                 encoding.name
-            )
-            .into_bytes(),
+            ),
         })
     }
 }
@@ -402,7 +398,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
-        let content = String::from_utf8_lossy(&result.content);
+        let content = result.content;
         assert!(content.contains("   2: beta"), "content={content}");
         fs::remove_dir_all(path.parent().unwrap()).await.unwrap();
     }

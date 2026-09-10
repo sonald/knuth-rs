@@ -36,7 +36,7 @@ impl AgentTool for BashTool {
         let output = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(ToolResult {
                 outcome: ToolOutcome::Cancelled,
-                content: b"Command execution cancelled".to_vec(),
+                content: "Command execution cancelled".to_string(),
             }),
             output = cmd.kill_on_drop(true).arg("-c").arg(command).output() => {
                 output.map_err(|e| ToolError::Message(e.to_string()))?
@@ -57,8 +57,7 @@ impl AgentTool for BashTool {
             content: format!(
                 "Command exited with {}.\nstdout:\n{}\nstderr:\n{}",
                 output.status, stdout, stderr
-            )
-            .into_bytes(),
+            ),
         })
     }
 }
@@ -97,7 +96,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
-        let content = String::from_utf8_lossy(&result.content);
+        let content = result.content;
         assert!(content.contains("hello"), "content={content}");
     }
 
@@ -109,7 +108,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.outcome, ToolOutcome::Error));
-        let content = String::from_utf8_lossy(&result.content);
+        let content = result.content;
         assert!(content.contains("exit status: 7"), "content={content}");
         assert!(content.contains("nope"), "content={content}");
     }
@@ -122,7 +121,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.outcome, ToolOutcome::ExecSuccess));
-        let content = String::from_utf8_lossy(&result.content);
+        let content = result.content;
         assert!(content.contains('\u{fffd}'), "content={content}");
     }
 

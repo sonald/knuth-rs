@@ -50,6 +50,7 @@ define_id!(MessageId);
 define_id!(TurnId);
 define_id!(StepId);
 define_id!(ToolInvocationId);
+define_id!(HookId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Generation(u64);
