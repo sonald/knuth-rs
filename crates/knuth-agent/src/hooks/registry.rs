@@ -1,13 +1,14 @@
 use crate::{
     ToolResult,
     hooks::{
-        AfterToolUseHook, BeforeToolUseHook, ContextHook, HookContext, HookError, InputHook,
-        SessionEndHook, SessionStartHook, ToolCallDecision, ToolResultView,
+        AfterToolUseHook, BeforeToolUseHook, ContextHook, ContextPatch, ContextView, HookContext,
+        HookError, InputHook, SessionEndHook, SessionStartHook, ToolCallDecision, ToolResultView,
     },
 };
-use ai::{ToolCall, UserContent};
+use ai::{Context, ToolCall, UserContent};
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct HookRegistry {
     input_hooks: Vec<Arc<dyn InputHook>>,
     context_hooks: Vec<Arc<dyn ContextHook>>,
@@ -17,40 +18,52 @@ pub struct HookRegistry {
     session_end_hooks: Vec<Arc<dyn SessionEndHook>>,
 }
 
+pub enum Hook {
+    Input(Arc<dyn InputHook>),
+    Context(Arc<dyn ContextHook>),
+    BeforeToolUse(Arc<dyn BeforeToolUseHook>),
+    AfterToolUse(Arc<dyn AfterToolUseHook>),
+    SessionStart(Arc<dyn SessionStartHook>),
+    SessionEnd(Arc<dyn SessionEndHook>),
+}
+
 impl HookRegistry {
     pub fn new() -> Self {
-        Self {
-            input_hooks: Vec::new(),
-            context_hooks: Vec::new(),
-            before_tool_use_hooks: Vec::new(),
-            after_tool_use_hooks: Vec::new(),
-            session_start_hooks: Vec::new(),
-            session_end_hooks: Vec::new(),
+        Self::default()
+    }
+
+    pub fn register(&mut self, hook: Hook) {
+        match hook {
+            Hook::Input(hook) => self.input_hooks.push(hook),
+            Hook::Context(hook) => self.context_hooks.push(hook),
+            Hook::BeforeToolUse(hook) => self.before_tool_use_hooks.push(hook),
+            Hook::AfterToolUse(hook) => self.after_tool_use_hooks.push(hook),
+            Hook::SessionStart(hook) => self.session_start_hooks.push(hook),
+            Hook::SessionEnd(hook) => self.session_end_hooks.push(hook),
         }
     }
 
-    pub fn on_input(&mut self, hook: Arc<dyn InputHook>) {
-        self.input_hooks.push(hook);
-    }
+    pub async fn context(
+        &self,
+        ctx: &HookContext,
+        view: &ContextView<'_>,
+    ) -> Result<ContextPatch, HookError> {
+        let mut merged = ContextPatch::default();
 
-    pub fn on_context(&mut self, hook: Arc<dyn ContextHook>) {
-        self.context_hooks.push(hook);
-    }
+        for hook in self.context_hooks.iter() {
+            let patch = tokio::select! {
+                _ = ctx.cancel.cancelled() => {
+                    return Err(HookError::Cancelled);
+                }
+                result = hook.transform(ctx, view) => {
+                    result?
+                }
+            };
 
-    pub fn on_before_tool_use(&mut self, hook: Arc<dyn BeforeToolUseHook>) {
-        self.before_tool_use_hooks.push(hook);
-    }
-
-    pub fn on_after_tool_use(&mut self, hook: Arc<dyn AfterToolUseHook>) {
-        self.after_tool_use_hooks.push(hook);
-    }
-
-    pub fn on_session_start(&mut self, hook: Arc<dyn SessionStartHook>) {
-        self.session_start_hooks.push(hook);
-    }
-
-    pub fn on_session_end(&mut self, hook: Arc<dyn SessionEndHook>) {
-        self.session_end_hooks.push(hook);
+            merged.edits.extend(patch.edits);
+            merged.hints.extend(patch.hints);
+        }
+        Ok(merged)
     }
 
     pub async fn before_tool_use(
@@ -323,14 +336,14 @@ mod tests {
     #[tokio::test]
     async fn before_hooks_can_rewrite_arguments() {
         let mut registry = HookRegistry::new();
-        registry.on_before_tool_use(Arc::new(RewriteCommandHook {
+        registry.register(Hook::BeforeToolUse(Arc::new(RewriteCommandHook {
             id: HookId::new(),
             to: "first".into(),
-        }));
-        registry.on_before_tool_use(Arc::new(RewriteCommandHook {
+        })));
+        registry.register(Hook::BeforeToolUse(Arc::new(RewriteCommandHook {
             id: HookId::new(),
             to: "second".into(),
-        }));
+        })));
 
         let data = registry
             .before_tool_use(&ctx(CancellationToken::new()), bash_call("original"))
@@ -344,15 +357,15 @@ mod tests {
     async fn deny_stops_later_before_hooks() {
         let later_calls = Arc::new(AtomicUsize::new(0));
         let mut registry = HookRegistry::new();
-        registry.on_before_tool_use(Arc::new(DenyHook {
+        registry.register(Hook::BeforeToolUse(Arc::new(DenyHook {
             id: HookId::new(),
             reason: "nope".into(),
             calls: Arc::new(AtomicUsize::new(0)),
-        }));
-        registry.on_before_tool_use(Arc::new(CountingBeforeHook {
+        })));
+        registry.register(Hook::BeforeToolUse(Arc::new(CountingBeforeHook {
             id: HookId::new(),
             calls: Arc::clone(&later_calls),
-        }));
+        })));
 
         let data = registry
             .before_tool_use(&ctx(CancellationToken::new()), bash_call("printf hi"))
@@ -369,10 +382,10 @@ mod tests {
     #[tokio::test]
     async fn after_hooks_can_rewrite_the_result() {
         let mut registry = HookRegistry::new();
-        registry.on_after_tool_use(Arc::new(PrefixResultHook {
+        registry.register(Hook::AfterToolUse(Arc::new(PrefixResultHook {
             id: HookId::new(),
             prefix: "hooked:".into(),
-        }));
+        })));
 
         let data = registry
             .after_tool_use(
@@ -392,7 +405,9 @@ mod tests {
     #[tokio::test]
     async fn before_hooks_surface_cancellation() {
         let mut registry = HookRegistry::new();
-        registry.on_before_tool_use(Arc::new(PendingBeforeHook { id: HookId::new() }));
+        registry.register(Hook::BeforeToolUse(Arc::new(PendingBeforeHook {
+            id: HookId::new(),
+        })));
         let cancel = CancellationToken::new();
         cancel.cancel();
 

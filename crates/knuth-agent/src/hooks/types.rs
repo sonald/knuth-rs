@@ -1,4 +1,5 @@
-use ai::{Context, ToolCall, UserContent};
+use ai::Context as AiContext;
+use ai::{Message, ToolCall, ToolResultMessage, UserContent, UserContentBlock};
 use async_trait::async_trait;
 use knuth_core::ids::{HookId, SessionId, ToolInvocationId};
 use tokio_util::sync::CancellationToken;
@@ -8,6 +9,7 @@ use crate::{ToolInput, ToolResult};
 #[derive(Debug, Clone)]
 pub struct HookContext {
     pub session_id: SessionId,
+    /// available only for tool use hooks
     pub invocation_id: Option<ToolInvocationId>,
     pub cancel: CancellationToken,
 }
@@ -38,12 +40,42 @@ pub trait InputHook: Send + Sync {
     ) -> Result<InputHookResult, HookError>;
 }
 
+pub struct ContextView<'a> {
+    pub snapshot: &'a AiContext,
+}
+
+#[derive(Debug)]
+pub enum ContextEditData {
+    ToolResultEdit(Vec<UserContentBlock>),
+    UserMessageEdit(UserContent),
+}
+
+#[derive(Debug)]
+pub struct ContextEdit {
+    pub message_id: usize,
+    pub edit: ContextEditData,
+}
+
+#[derive(Default, Debug)]
+pub struct ContextPatch {
+    pub edits: Vec<ContextEdit>,
+    pub hints: Vec<UserContent>,
+}
+
+/// Called before messages are submitted to the model.
+/// The context is the history of the conversation so far.
+/// 
+/// FIXME: this allows editting in the middle of the conversation, 
+/// which invalidates the prefix cache. should I allow this?
 #[async_trait]
 pub trait ContextHook: Send + Sync {
     fn id(&self) -> HookId;
 
-    /// Called when a context is available.
-    async fn transform(&self, ctx: &HookContext, context: Context) -> Result<Context, HookError>;
+    async fn transform(
+        &self,
+        ctx: &HookContext,
+        view: &ContextView<'_>,
+    ) -> Result<ContextPatch, HookError>;
 }
 
 pub enum ToolCallDecision {

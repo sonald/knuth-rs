@@ -496,6 +496,9 @@ mod tests {
                 AgentActorMessage::ToolResultFinalized { .. } => {
                     panic!("unexpected ToolResultFinalized")
                 }
+                AgentActorMessage::ContextPrepared { .. } => {
+                    panic!("unexpected ContextPrepared")
+                }
             }
         }
 

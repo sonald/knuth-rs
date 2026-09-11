@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use crate::ToolResult;
 use crate::hooks::{
-    AfterToolUseData, BeforeToolUseData, HookContext, HookError, HookRegistry, ToolCallDecision,
+    AfterToolUseData, BeforeToolUseData, ContextEditData, ContextPatch, ContextView, HookContext,
+    HookError, HookRegistry, ToolCallDecision,
 };
 use crate::{
     Actor, ActorContext, ActorRuntime, AgentStepRunner, AskError, EventLog, spawn_actor,
     tools::policy::{PolicyContext, PolicyEngineTrait},
 };
 use ai::{
-    AssistantMessage, ContentBlock, ImageContent, Model, StreamOptions, ToolCall, UserContent,
-    UserContentBlock,
+    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolCall,
+    UserContent, UserContentBlock,
 };
 use knuth_core::{
     AgentEvent, AgentSubscription, EventStoreError, InMemoryEventStore, LiveEvent,
@@ -103,6 +104,11 @@ pub enum AgentActorMessage {
     /// Streaming progress from a model step. Fanned out to subscribers and
     /// then dropped; never persisted and never drives the state machine.
     Live(LiveEvent),
+    ContextPrepared {
+        turn_id: TurnId,
+        context: ai::Context,
+        hints: Vec<UserContent>,
+    },
     /// Control signal from a step runner: the step is over. The actor derives
     /// and commits the `ModelStepEnded` domain event itself, then advances the
     /// turn state machine.
@@ -158,6 +164,11 @@ impl std::fmt::Display for AgentCommand {
 #[derive(Debug)]
 enum TurnState {
     Idle,
+    /// Context hooks are running; `ContextPrepared` starts the model step.
+    PreparingContext {
+        turn_id: TurnId,
+        cancel: CancellationToken,
+    },
     /// A model step is streaming.
     Streaming {
         turn_id: TurnId,
@@ -238,6 +249,20 @@ impl Actor for AgentActor {
             }
 
             AgentActorMessage::Live(event) => self.log.publish_live(event),
+
+            AgentActorMessage::ContextPrepared {
+                turn_id,
+                context,
+                hints,
+            } => {
+                if let Err(e) = self
+                    .handle_context_prepared(turn_id, context, hints, ctx)
+                    .await
+                {
+                    let _ = self.handle_session_error(e).await;
+                    return ControlFlow::Break(());
+                }
+            }
 
             AgentActorMessage::StepFinished {
                 step_id,
@@ -349,6 +374,7 @@ impl AgentActor {
             }
             AgentCommand::Cancel {} => match &self.turn {
                 TurnState::Idle => {}
+                TurnState::PreparingContext { cancel, .. } => cancel.cancel(),
                 TurnState::Streaming { step, .. } => step.cancel().await,
                 TurnState::RunningTools { cancel, .. } => cancel.cancel(),
             },
@@ -406,13 +432,103 @@ impl AgentActor {
         self.continue_step(turn_id, ctx).await
     }
 
-    /// Runs the next model step of `turn_id` against the current conversation.
-    async fn continue_step(
+    fn assemble_context(&self) -> ai::Context {
+        ai::Context {
+            system_prompt: Some(self.log.system_prompt().to_string()),
+            messages: self.log.messages().to_vec(),
+            tools: Some(self.config.policy_engine.schemas()),
+        }
+    }
+
+    async fn prepare_context(
         &mut self,
         turn_id: TurnId,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
-        let step = self.spawn_model_step(ctx).await?;
+        let context = self.assemble_context();
+        let hooks = Arc::clone(&self.config.hooks);
+        let cancel = ctx.shutdown.child_token();
+        let hook_ctx = HookContext {
+            session_id: self.id.clone(),
+            invocation_id: None,
+            cancel: cancel.clone(),
+        };
+        let Some(mailbox) = ctx.upgrade() else {
+            return Err(AgentSessionError::InvalidState(
+                "actor mailbox is gone".to_string(),
+            ));
+        };
+
+        self.turn = TurnState::PreparingContext { turn_id, cancel };
+
+        tokio::spawn(async move {
+            let context_view = ContextView { snapshot: &context };
+
+            let patch = hooks.context(&hook_ctx, &context_view).await;
+            let result = match patch {
+                Ok(patch) => apply_patch(context, &patch),
+                Err(_) => (context, vec![]),
+            };
+
+            let _ = mailbox
+                .send(AgentActorMessage::ContextPrepared {
+                    turn_id,
+                    context: result.0,
+                    hints: result.1,
+                })
+                .await;
+        });
+
+        Ok(())
+    }
+
+    fn next_step_id(&mut self) -> (StepId, Generation) {
+        self.generation = self.generation.next();
+        self.next_step_id = Some(StepId::new());
+        (self.next_step_id.unwrap(), self.generation)
+    }
+
+    async fn handle_context_prepared(
+        &mut self,
+        turn_id: TurnId,
+        context: ai::Context,
+        _hints: Vec<UserContent>,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        let cancelled = match &self.turn {
+            TurnState::PreparingContext {
+                turn_id: current,
+                cancel,
+            } if *current == turn_id => cancel.is_cancelled(),
+            _ => {
+                debug!("ignoring stale ContextPrepared for {turn_id}");
+                return Ok(());
+            }
+        };
+
+        if cancelled {
+            return self.end_turn(turn_id, ctx).await;
+        }
+
+        let Some(mailbox) = ctx.upgrade() else {
+            return Err(AgentSessionError::InvalidState(
+                "actor mailbox is gone".to_string(),
+            ));
+        };
+
+        debug!("current conversation state: \n{}", self.log.conversation());
+
+        let (step_id, generation) = self.next_step_id();
+
+        let step = AgentStepRunner::new(
+            step_id,
+            generation,
+            self.config.model.clone(),
+            self.config.options.clone(),
+            mailbox,
+            context,
+        )
+        .await;
         self.turn = TurnState::Streaming {
             turn_id: turn_id.clone(),
             step_id: step.step_id(),
@@ -420,6 +536,15 @@ impl AgentActor {
             step,
         };
         Ok(())
+    }
+
+    /// Runs the next model step of `turn_id` against the current conversation.
+    async fn continue_step(
+        &mut self,
+        turn_id: TurnId,
+        ctx: &mut ActorContext<AgentActorMessage>,
+    ) -> Result<(), AgentSessionError> {
+        self.prepare_context(turn_id, ctx).await
     }
 
     async fn end_turn(
@@ -945,45 +1070,6 @@ impl AgentActor {
         Ok(())
     }
 
-    fn assemble_context(&self) -> ai::Context {
-        ai::Context {
-            system_prompt: Some(self.log.system_prompt().to_string()),
-            messages: self.log.messages().to_vec(),
-            tools: Some(self.config.policy_engine.schemas()),
-        }
-    }
-
-    fn next_step_id(&mut self) -> (StepId, Generation) {
-        self.generation = self.generation.next();
-        self.next_step_id = Some(StepId::new());
-        (self.next_step_id.unwrap(), self.generation)
-    }
-
-    async fn spawn_model_step(
-        &mut self,
-        actor_ctx: &mut ActorContext<AgentActorMessage>,
-    ) -> Result<AgentStepRunner, AgentSessionError> {
-        let Some(store_tx) = actor_ctx.upgrade() else {
-            return Err(AgentSessionError::InvalidState(
-                "actor mailbox is gone".to_string(),
-            ));
-        };
-
-        debug!("current conversation state: \n{}", self.log.conversation());
-
-        let (step_id, generation) = self.next_step_id();
-
-        Ok(AgentStepRunner::new(
-            step_id,
-            generation,
-            self.config.model.clone(),
-            self.config.options.clone(),
-            store_tx,
-            self.assemble_context(),
-        )
-        .await)
-    }
-
     //TODO: impl from_seq
     async fn subscribe(
         &mut self,
@@ -1094,6 +1180,35 @@ impl AgentSession {
     }
 }
 
+fn apply_patch(mut context: ai::Context, patch: &ContextPatch) -> (ai::Context, Vec<UserContent>) {
+    for edit in &patch.edits {
+        let Some(message) = context.messages.get_mut(edit.message_id) else {
+            debug!(
+                message_id = edit.message_id,
+                "skipping context edit: index out of range"
+            );
+            continue;
+        };
+
+        match (&edit.edit, message) {
+            (ContextEditData::ToolResultEdit(content), Message::ToolResult(msg)) => {
+                msg.content = content.clone();
+            }
+            (ContextEditData::UserMessageEdit(content), Message::User(msg)) => {
+                msg.content = content.clone();
+            }
+            _ => {
+                debug!(
+                    message_id = edit.message_id,
+                    "skipping context edit: message kind does not match edit"
+                );
+            }
+        }
+    }
+
+    (context, patch.hints.clone())
+}
+
 fn mime_type_from_path(path: &str) -> String {
     let extension = std::path::Path::new(path)
         .extension()
@@ -1118,8 +1233,8 @@ mod tests {
     use super::*;
     use crate::hooks::{
         AfterToolUseData, AfterToolUseHook, AfterToolUseResult, BeforeToolUseData,
-        BeforeToolUseHook, BeforeToolUseResult, HookContext, HookError, ToolCallDecision,
-        ToolResultView,
+        BeforeToolUseHook, BeforeToolUseResult, ContextEdit, ContextEditData, ContextPatch, Hook,
+        HookContext, HookError, ToolCallDecision, ToolResultView,
     };
     use crate::test_support::faux_lock;
     use crate::tools::policy::{PolicyContext, PolicyEngineTrait};
@@ -1383,6 +1498,120 @@ mod tests {
             arguments: Map::new(),
             thought_signature: None,
         }
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message::User(ai::UserMessage {
+            role: Default::default(),
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    fn tool_result_message(text: &str) -> Message {
+        Message::ToolResult(ai::ToolResultMessage {
+            role: Default::default(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            content: vec![UserContentBlock::text(text)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    fn user_text(message: &Message) -> &str {
+        match message {
+            Message::User(msg) => match &msg.content {
+                UserContent::Text(text) => text,
+                UserContent::Blocks(_) => panic!("expected text user content"),
+            },
+            _ => panic!("expected user message"),
+        }
+    }
+
+    fn tool_result_text(message: &Message) -> &str {
+        match message {
+            Message::ToolResult(msg) => match msg.content.as_slice() {
+                [UserContentBlock::Text(text)] => &text.text,
+                _ => panic!("expected a single text tool-result block"),
+            },
+            _ => panic!("expected tool result message"),
+        }
+    }
+
+    #[test]
+    fn apply_patch_rewrites_matching_messages_and_returns_hints() {
+        let context = ai::Context {
+            system_prompt: Some("sys".into()),
+            messages: vec![
+                user_message("hello"),
+                tool_result_message("old output"),
+                user_message("follow up"),
+            ],
+            tools: None,
+        };
+        let hint = UserContent::Text("remember this".into());
+        let patch = ContextPatch {
+            edits: vec![
+                ContextEdit {
+                    message_id: 0,
+                    edit: ContextEditData::UserMessageEdit(UserContent::Text("rewritten".into())),
+                },
+                ContextEdit {
+                    message_id: 1,
+                    edit: ContextEditData::ToolResultEdit(vec![UserContentBlock::text(
+                        "compacted",
+                    )]),
+                },
+                ContextEdit {
+                    message_id: 0,
+                    edit: ContextEditData::UserMessageEdit(UserContent::Text("final".into())),
+                },
+            ],
+            hints: vec![hint.clone()],
+        };
+
+        let (patched, hints) = apply_patch(context, &patch);
+
+        assert_eq!(patched.system_prompt.as_deref(), Some("sys"));
+        assert_eq!(user_text(&patched.messages[0]), "final");
+        assert_eq!(tool_result_text(&patched.messages[1]), "compacted");
+        assert_eq!(user_text(&patched.messages[2]), "follow up");
+        assert_eq!(hints.len(), 1);
+        assert!(matches!(&hints[0], UserContent::Text(text) if text == "remember this"));
+    }
+
+    #[test]
+    fn apply_patch_skips_out_of_range_and_kind_mismatch_edits() {
+        let context = ai::Context {
+            system_prompt: None,
+            messages: vec![user_message("keep me"), tool_result_message("keep tool")],
+            tools: None,
+        };
+        let patch = ContextPatch {
+            edits: vec![
+                ContextEdit {
+                    message_id: 9,
+                    edit: ContextEditData::UserMessageEdit(UserContent::Text("gone".into())),
+                },
+                ContextEdit {
+                    message_id: 0,
+                    edit: ContextEditData::ToolResultEdit(vec![UserContentBlock::text("nope")]),
+                },
+                ContextEdit {
+                    message_id: 1,
+                    edit: ContextEditData::UserMessageEdit(UserContent::Text("nope".into())),
+                },
+            ],
+            hints: vec![],
+        };
+
+        let (patched, hints) = apply_patch(context, &patch);
+
+        assert_eq!(user_text(&patched.messages[0]), "keep me");
+        assert_eq!(tool_result_text(&patched.messages[1]), "keep tool");
+        assert!(hints.is_empty());
     }
 
     async fn mk_session() -> AgentSession {
@@ -1815,11 +2044,11 @@ mod tests {
         let engine = EchoArgsEngine::new();
         let executed = Arc::clone(&engine.executed);
         let mut hooks = HookRegistry::new();
-        hooks.on_before_tool_use(Arc::new(DenyNamedHook {
+        hooks.register(Hook::BeforeToolUse(Arc::new(DenyNamedHook {
             id: HookId::new(),
             name: "bash".into(),
             reason: "blocked by hook".into(),
-        }));
+        })));
 
         let mut session = AgentSession::build(
             "test".to_string(),
@@ -1882,10 +2111,10 @@ mod tests {
         ]);
 
         let mut hooks = HookRegistry::new();
-        hooks.on_before_tool_use(Arc::new(RewriteCommandHook {
+        hooks.register(Hook::BeforeToolUse(Arc::new(RewriteCommandHook {
             id: HookId::new(),
             to: "printf rewritten".into(),
-        }));
+        })));
 
         let mut session = AgentSession::build(
             "test".to_string(),
@@ -1951,10 +2180,10 @@ mod tests {
         ]);
 
         let mut hooks = HookRegistry::new();
-        hooks.on_after_tool_use(Arc::new(PrefixResultHook {
+        hooks.register(Hook::AfterToolUse(Arc::new(PrefixResultHook {
             id: HookId::new(),
             prefix: "hooked:".into(),
-        }));
+        })));
 
         let mut session = AgentSession::build(
             "test".to_string(),
@@ -2002,7 +2231,9 @@ mod tests {
         ]);
 
         let mut hooks = HookRegistry::new();
-        hooks.on_after_tool_use(Arc::new(TimeoutAfterHook { id: HookId::new() }));
+        hooks.register(Hook::AfterToolUse(Arc::new(TimeoutAfterHook {
+            id: HookId::new(),
+        })));
 
         let mut session = AgentSession::build(
             "test".to_string(),
