@@ -19,9 +19,11 @@ use knuth_agent::{
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
+mod output;
 mod policy;
 
 use config::UserSettings;
+use output::{OutputStyle, format_tool_finished, format_tool_running};
 use policy::DefaultPolicyEngine;
 
 use clap::{Parser, Subcommand};
@@ -41,6 +43,18 @@ struct Args {
 
     #[arg(long)]
     print_config: bool,
+
+    /// How tool calls are printed: `default` dumps arguments and results;
+    /// `concise` shows a short summary.
+    #[arg(
+        short('s'),
+        long,
+        value_enum,
+        global = true,
+        ignore_case = true,
+        value_name = "STYLE"
+    )]
+    output_style: Option<OutputStyle>,
 
     #[command(subcommand)]
     commands: Commands,
@@ -73,22 +87,23 @@ async fn main() -> Result<()> {
     let config = args.config;
 
     match args.commands {
-        Commands::Chat { input, images } => match input {
-            Some(input) => {
-                let user_settings = UserSettings::load(model.as_deref(), config.as_deref()).await?;
-                if args.print_config {
-                    print_effective_config(&user_settings);
-                }
-                oneshot(input, images.unwrap_or_default(), user_settings).await?;
+        Commands::Chat { input, images } => {
+            let mut user_settings = UserSettings::load(model.as_deref(), config.as_deref()).await?;
+            if let Some(style) = args.output_style {
+                user_settings.output_style = style;
             }
-            None => {
-                let user_settings = UserSettings::load(model.as_deref(), config.as_deref()).await?;
-                if args.print_config {
-                    print_effective_config(&user_settings);
-                }
-                chat_loop(user_settings).await?;
+            if args.print_config {
+                print_effective_config(&user_settings);
             }
-        },
+            match input {
+                Some(input) => {
+                    oneshot(input, images.unwrap_or_default(), user_settings).await?;
+                }
+                None => {
+                    chat_loop(user_settings).await?;
+                }
+            }
+        }
         Commands::Sessions {} => {
             list_sessions().await?;
         }
@@ -150,11 +165,17 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
     Ok((session, subscription))
 }
 
+struct InFlightTool {
+    spinner: ProgressBar,
+    arguments: serde_json::Map<String, Value>,
+}
+
 struct CliRenderer {
     progress: MultiProgress,
     thinking: Option<ProgressBar>,
     thinking_content: String,
-    tools: HashMap<String, ProgressBar>,
+    tools: HashMap<String, InFlightTool>,
+    style: OutputStyle,
 }
 
 /// How many characters of the in-progress thinking text are shown next to the
@@ -162,12 +183,13 @@ struct CliRenderer {
 const THINKING_PREVIEW_CHARS: usize = 60;
 
 impl CliRenderer {
-    fn new() -> Self {
+    fn new(style: OutputStyle) -> Self {
         Self {
             progress: MultiProgress::new(),
             thinking: None,
             thinking_content: String::new(),
             tools: HashMap::new(),
+            style,
         }
     }
 
@@ -236,25 +258,36 @@ impl CliRenderer {
                 arguments,
                 ..
             } => {
-                let message = format!(
-                    "Exec {}({})",
-                    tool_name,
-                    serde_json::to_string(arguments).unwrap_or_default()
+                let message = format_tool_running(self.style, tool_name, arguments);
+                self.tools.insert(
+                    tool_call_id.clone(),
+                    InFlightTool {
+                        spinner: self.spinner(message),
+                        arguments: arguments.clone(),
+                    },
                 );
-                self.tools
-                    .insert(tool_call_id.clone(), self.spinner(message));
             }
             LiveEvent::ToolExecutionEnded {
                 tool_call_id,
+                tool_name,
                 result,
                 ..
             } => {
-                if let Some(spinner) = self.tools.remove(tool_call_id) {
-                    let message = spinner.message().to_string();
-                    spinner.finish_and_clear();
-                    self.print(format!("* {message}\n").cyan());
+                let arguments = self.tools.remove(tool_call_id).map(|tool| {
+                    tool.spinner.finish_and_clear();
+                    tool.arguments
+                });
+                match (self.style, arguments) {
+                    (OutputStyle::Default, None) => {
+                        self.print(format!("* Result:\n{result}\n").cyan());
+                    }
+                    (style, arguments) => {
+                        let arguments = arguments.unwrap_or_default();
+                        self.print(
+                            format_tool_finished(style, tool_name, &arguments, result).cyan(),
+                        );
+                    }
                 }
-                self.print(format!("* Result:\n{result}\n").cyan());
             }
             LiveEvent::AssistantMessageTextStarted { .. }
             | LiveEvent::ToolExecutionUpdated { .. } => {
@@ -283,8 +316,8 @@ impl Drop for CliRenderer {
         if let Some(spinner) = self.thinking.take() {
             spinner.finish_and_clear();
         }
-        for (_, spinner) in self.tools.drain() {
-            spinner.finish_and_clear();
+        for (_, tool) in self.tools.drain() {
+            tool.spinner.finish_and_clear();
         }
     }
 }
@@ -292,9 +325,13 @@ impl Drop for CliRenderer {
 /// Renders events until the current turn ends. The first Ctrl+C cancels the
 /// turn (it finishes with a `Cancelled` step and ends normally); a second
 /// Ctrl+C force-quits in case the turn cannot end (e.g. a wedged connection).
-async fn run_turn(session: &mut AgentSession, subscription: &mut AgentSubscription) -> Result<()> {
+async fn run_turn(
+    session: &mut AgentSession,
+    subscription: &mut AgentSubscription,
+    output_style: OutputStyle,
+) -> Result<()> {
     let mut cancel_requested = false;
-    let mut renderer = CliRenderer::new();
+    let mut renderer = CliRenderer::new(output_style);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -327,7 +364,7 @@ async fn oneshot(input: String, images: Vec<String>, user_settings: UserSettings
     let (mut session, mut subscription) = build_session(&user_settings).await?;
 
     session.submit_input(input, images).await?;
-    run_turn(&mut session, &mut subscription).await?;
+    run_turn(&mut session, &mut subscription, user_settings.output_style).await?;
 
     session.close().await?;
     Ok(())
@@ -351,7 +388,7 @@ async fn chat_loop(user_settings: UserSettings) -> Result<()> {
                     continue;
                 }
                 session.submit_input(line, vec![]).await?;
-                run_turn(&mut session, &mut subscription).await?;
+                run_turn(&mut session, &mut subscription, user_settings.output_style).await?;
             }
             Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => {
                 session.close().await?;
@@ -377,6 +414,7 @@ fn print_effective_config(settings: &UserSettings) {
     eprintln!("  api: {}", model.api.0);
     eprintln!("  base_url: {}", empty_dash(&model.base_url));
     eprintln!("  policy_mode: {}", settings.policy_mode.as_str());
+    eprintln!("  output_style: {}", settings.output_style.as_str());
     eprintln!("  context_window: {}", model.context_window);
     eprintln!("  model_max_tokens: {}", model.max_tokens);
     eprintln!("  model_reasoning: {}", model.reasoning);
@@ -469,6 +507,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_output_style_short_flag() {
+        let args = Args::parse_from(["knuth", "-s", "concise", "chat"]);
+
+        assert_eq!(args.output_style, Some(OutputStyle::Concise));
+    }
+
+    #[test]
+    fn parses_output_style_after_subcommand() {
+        let args = Args::parse_from(["knuth", "chat", "--output-style", "default"]);
+
+        assert_eq!(args.output_style, Some(OutputStyle::Default));
+    }
+
+    #[test]
+    fn rejects_unknown_output_style() {
+        let err = Args::try_parse_from(["knuth", "-s", "verbose", "chat"]).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("concise") || message.contains("invalid"),
+            "message={message}"
+        );
+    }
+
+    #[test]
     fn redacts_secret_like_json_keys() {
         let mut value = serde_json::json!({
             "api_key": "secret",
@@ -491,7 +553,7 @@ mod tests {
 
     #[test]
     fn renderer_tracks_thinking_and_tool_lifetimes() {
-        let mut renderer = CliRenderer::new();
+        let mut renderer = CliRenderer::new(OutputStyle::Default);
         let step_id = StepId::new();
 
         renderer.render_live(&LiveEvent::AssistantMessageThinkingStarted {

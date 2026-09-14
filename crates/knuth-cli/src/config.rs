@@ -1,3 +1,4 @@
+use crate::output::OutputStyle;
 use crate::policy::PolicyMode;
 use ai::{
     Api, CacheRetention, InputModality, KnownApi, Model, ModelCost, Provider, StreamOptions,
@@ -25,6 +26,7 @@ pub struct UserSettings {
     pub model: Model,
     pub options: StreamOptions,
     pub policy_mode: PolicyMode,
+    pub output_style: OutputStyle,
 }
 
 impl UserSettings {
@@ -46,10 +48,17 @@ impl UserSettings {
             .map_err(|e| anyhow!("KNUTH_POLICY_MODE: {e}"))?
             .or(config.policy_mode)
             .unwrap_or_default();
+        let output_style = env_value("KNUTH_OUTPUT_STYLE")
+            .map(|s| s.parse::<OutputStyle>())
+            .transpose()
+            .map_err(|e| anyhow!("KNUTH_OUTPUT_STYLE: {e}"))?
+            .or(config.output_style)
+            .unwrap_or_default();
         Ok(Self {
             model,
             options,
             policy_mode,
+            output_style,
         })
     }
 
@@ -76,6 +85,7 @@ struct FileConfig {
     api: Option<String>,
     base_url: Option<String>,
     policy_mode: Option<PolicyMode>,
+    output_style: Option<OutputStyle>,
     options: Option<FileOptions>,
 }
 
@@ -736,6 +746,7 @@ options:
         );
         assert_eq!(config.api.unwrap(), "openai-completions");
         assert_eq!(config.policy_mode.unwrap().as_str(), "read-only");
+        assert!(config.output_style.is_none());
         let options = config.options.unwrap();
         assert_eq!(options.cache_retention, Some(CacheRetention::Long));
         assert_eq!(options.reasoning_effort.unwrap(), "high");
@@ -784,6 +795,51 @@ base_url: https://aicoding.2233.ai
         let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
         assert_eq!(settings.policy_mode.as_str(), "bypass-permissions");
         drop(_env);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_style_defaults_to_default_and_env_overrides_yaml() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = env::temp_dir().join(format!("knuth-output-style-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("knuth.yaml");
+        fs::write(
+            &config_path,
+            r#"
+model: chatgpt/gpt-5.4-mini
+base_url: https://aicoding.2233.ai
+output_style: concise
+"#,
+        )
+        .unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("KNUTH_MODEL", None),
+            ("KNUTH_BASE_URL", None),
+            ("KNUTH_API_KEY", None),
+            ("CODEX_AUTH_TOKEN", None),
+            ("CODEX_ACCOUNT_ID", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_PROVIDER", None),
+            ("KNUTH_API", None),
+            ("KNUTH_POLICY_MODE", None),
+            ("KNUTH_OUTPUT_STYLE", None),
+        ]);
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
+        assert_eq!(settings.output_style, OutputStyle::Concise);
+        drop(_env);
+
+        let _env = EnvGuard::set(&[
+            ("KNUTH_OUTPUT_STYLE", Some("default")),
+            ("KNUTH_MODEL", None),
+            ("KNUTH_API_KEY", None),
+            ("KNUTH_CONFIG", None),
+            ("KNUTH_BASE_URL", None),
+        ]);
+        let settings = UserSettings::load(None, Some(&config_path)).await.unwrap();
+        assert_eq!(settings.output_style, OutputStyle::Default);
 
         fs::remove_dir_all(dir).unwrap();
     }
