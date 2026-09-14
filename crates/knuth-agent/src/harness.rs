@@ -1055,6 +1055,7 @@ impl AgentActor {
             ));
         };
         let hooks = Arc::clone(&self.config.hooks);
+        let tool_call = effective.clone();
         let hook_ctx = HookContext {
             session_id: self.id.clone(),
             invocation_id: Some(key.invocation_id),
@@ -1062,7 +1063,7 @@ impl AgentActor {
         };
 
         tokio::spawn(async move {
-            let data = hooks.after_tool_use(&hook_ctx, result).await;
+            let data = hooks.after_tool_use(&hook_ctx, tool_call, result).await;
             let _ = mailbox
                 .send(AgentActorMessage::ToolResultFinalized { key, data })
                 .await;
@@ -1394,6 +1395,31 @@ mod tests {
             Ok(BeforeToolUseResult {
                 modified_arguments: Some(arguments),
                 permission: ToolCallDecision::Allow,
+                additional_content: None,
+            })
+        }
+    }
+
+    struct PrefixByToolNameHook {
+        id: HookId,
+    }
+
+    #[async_trait]
+    impl AfterToolUseHook for PrefixByToolNameHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            current: &ToolResultView,
+        ) -> Result<AfterToolUseResult, HookError> {
+            Ok(AfterToolUseResult {
+                modified: Some(ToolResult {
+                    outcome: current.result.outcome.clone(),
+                    content: format!("{}:{}", current.tool_call.name, current.result.content),
+                }),
                 additional_content: None,
             })
         }
@@ -2214,6 +2240,68 @@ mod tests {
         assert!(
             content.starts_with("hooked:"),
             "after-tool-use hook should rewrite the persisted result, got {content:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_hook_sees_the_executed_tool_call() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf rewritten"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let mut hooks = HookRegistry::new();
+        hooks.register(Hook::BeforeToolUse(Arc::new(RewriteCommandHook {
+            id: HookId::new(),
+            to: "printf executed".into(),
+        })));
+        hooks.register(Hook::AfterToolUse(Arc::new(PrefixByToolNameHook {
+            id: HookId::new(),
+        })));
+
+        let mut session = AgentSession::build(
+            "test".to_string(),
+            "".to_string(),
+            test_config_with_hooks(Arc::new(EchoArgsEngine::new()), hooks),
+        )
+        .await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let mut content = None;
+        loop {
+            match next_durable_event(&mut sub).await {
+                AgentEvent::ToolResultReceived {
+                    content: tool_content,
+                    ..
+                } => content = Some(tool_content),
+                AgentEvent::AgentTurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        clear_faux_responses();
+
+        let content = content.expect("tool should report a result");
+        assert!(
+            content.starts_with("bash:"),
+            "after-tool-use hook should see the executed tool name, got {content:?}"
+        );
+        assert!(
+            content.contains("printf executed"),
+            "after-tool-use hook should see rewritten arguments, got {content:?}"
+        );
+        assert!(
+            !content.contains("printf rewritten"),
+            "after-tool-use hook must not see the pre-rewrite arguments, got {content:?}"
         );
         session.close().await.unwrap();
     }

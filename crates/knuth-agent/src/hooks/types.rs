@@ -1,5 +1,5 @@
 use ai::Context as AiContext;
-use ai::{Message, ToolCall, ToolResultMessage, UserContent, UserContentBlock};
+use ai::{ToolCall, UserContent, UserContentBlock};
 use async_trait::async_trait;
 use knuth_core::ids::{HookId, SessionId, ToolInvocationId};
 use tokio_util::sync::CancellationToken;
@@ -64,8 +64,8 @@ pub struct ContextPatch {
 
 /// Called before messages are submitted to the model.
 /// The context is the history of the conversation so far.
-/// 
-/// FIXME: this allows editting in the middle of the conversation, 
+///
+/// FIXME: this allows editting in the middle of the conversation,
 /// which invalidates the prefix cache. should I allow this?
 #[async_trait]
 pub trait ContextHook: Send + Sync {
@@ -102,6 +102,8 @@ pub trait BeforeToolUseHook: Send + Sync {
 }
 
 pub struct ToolResultView {
+    /// The call that was executed, after before-tool-use rewrites.
+    pub tool_call: ToolCall,
     pub result: ToolResult,
 }
 

@@ -5,7 +5,7 @@ use crate::{
         HookError, InputHook, SessionEndHook, SessionStartHook, ToolCallDecision, ToolResultView,
     },
 };
-use ai::{Context, ToolCall, UserContent};
+use ai::{ToolCall, UserContent};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -113,10 +113,12 @@ impl HookRegistry {
     pub async fn after_tool_use(
         &self,
         ctx: &HookContext,
+        tool_call: ToolCall,
         tool_result: ToolResult,
     ) -> Result<AfterToolUseData, HookError> {
         let mut additional_hints = vec![];
         let mut view = ToolResultView {
+            tool_call,
             result: tool_result,
         };
 
@@ -170,6 +172,7 @@ mod tests {
     };
     use serde_json::Map;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
@@ -269,6 +272,37 @@ mod tests {
             Ok(BeforeToolUseResult {
                 modified_arguments: None,
                 permission: ToolCallDecision::Allow,
+                additional_content: None,
+            })
+        }
+    }
+
+    struct CaptureToolCallHook {
+        id: HookId,
+        seen: Arc<Mutex<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl AfterToolUseHook for CaptureToolCallHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            _ctx: &HookContext,
+            current: &ToolResultView,
+        ) -> Result<AfterToolUseResult, HookError> {
+            let command = current
+                .tool_call
+                .arguments
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            *self.seen.lock().unwrap() = (current.tool_call.name.clone(), command);
+            Ok(AfterToolUseResult {
+                modified: None,
                 additional_content: None,
             })
         }
@@ -390,6 +424,7 @@ mod tests {
         let data = registry
             .after_tool_use(
                 &ctx(CancellationToken::new()),
+                bash_call("printf hi"),
                 ToolResult {
                     outcome: ToolOutcome::ExecSuccess,
                     content: "ok".into(),
@@ -400,6 +435,41 @@ mod tests {
 
         assert_eq!(data.modified.content, "hooked:ok");
         assert_eq!(data.modified.outcome, ToolOutcome::ExecSuccess);
+    }
+
+    #[tokio::test]
+    async fn after_hooks_see_the_executed_tool_call() {
+        let seen = Arc::new(Mutex::new((String::new(), String::new())));
+        let mut registry = HookRegistry::new();
+        registry.register(Hook::AfterToolUse(Arc::new(CaptureToolCallHook {
+            id: HookId::new(),
+            seen: Arc::clone(&seen),
+        })));
+        registry.register(Hook::AfterToolUse(Arc::new(PrefixResultHook {
+            id: HookId::new(),
+            prefix: "hooked:".into(),
+        })));
+        registry.register(Hook::AfterToolUse(Arc::new(CaptureToolCallHook {
+            id: HookId::new(),
+            seen: Arc::clone(&seen),
+        })));
+
+        let data = registry
+            .after_tool_use(
+                &ctx(CancellationToken::new()),
+                bash_call("printf hi"),
+                ToolResult {
+                    outcome: ToolOutcome::ExecSuccess,
+                    content: "ok".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(data.modified.content, "hooked:ok");
+        let (name, command) = seen.lock().unwrap().clone();
+        assert_eq!(name, "bash");
+        assert_eq!(command, "printf hi");
     }
 
     #[tokio::test]
