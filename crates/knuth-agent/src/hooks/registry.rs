@@ -171,6 +171,7 @@ mod tests {
         ids::{HookId, SessionId, ToolInvocationId},
     };
     use serde_json::Map;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,6 +181,7 @@ mod tests {
         HookContext {
             session_id: SessionId::new(),
             invocation_id: Some(ToolInvocationId::new()),
+            workspace: PathBuf::from("/knuth-test-workspace"),
             cancel,
         }
     }

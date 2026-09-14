@@ -140,6 +140,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
             policy_engine: Arc::new(policy_engine),
             policy_context: PolicyContext {},
             hooks: Arc::new(hooks),
+            workspace: std::env::current_dir().context("failed to determine current directory")?,
         },
     )
     .await;

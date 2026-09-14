@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use ai::Context as AiContext;
 use ai::{ToolCall, UserContent, UserContentBlock};
 use async_trait::async_trait;
@@ -11,6 +13,7 @@ pub struct HookContext {
     pub session_id: SessionId,
     /// available only for tool use hooks
     pub invocation_id: Option<ToolInvocationId>,
+    pub workspace: PathBuf,
     pub cancel: CancellationToken,
 }
 

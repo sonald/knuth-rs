@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use knuth_core::{ToolOutcome, ids::*};
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ToolResult;
@@ -34,6 +35,7 @@ pub struct AgentConfig {
     pub policy_engine: Arc<dyn PolicyEngineTrait>,
     pub policy_context: PolicyContext,
     pub hooks: Arc<HookRegistry>,
+    pub workspace: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -335,6 +337,19 @@ impl AgentActor {
         }
     }
 
+    fn hook_context(
+        &self,
+        invocation_id: Option<ToolInvocationId>,
+        cancel: CancellationToken,
+    ) -> HookContext {
+        HookContext {
+            session_id: self.id.clone(),
+            invocation_id,
+            workspace: self.config.workspace.clone(),
+            cancel,
+        }
+    }
+
     async fn handle_session_error(&mut self, error: AgentSessionError) -> ControlFlow<()> {
         match error {
             AgentSessionError::StoreError(_) => return ControlFlow::Break(()),
@@ -448,11 +463,7 @@ impl AgentActor {
         let context = self.assemble_context();
         let hooks = Arc::clone(&self.config.hooks);
         let cancel = ctx.shutdown.child_token();
-        let hook_ctx = HookContext {
-            session_id: self.id.clone(),
-            invocation_id: None,
-            cancel: cancel.clone(),
-        };
+        let hook_ctx = self.hook_context(None, cancel.clone());
         let Some(mailbox) = ctx.upgrade() else {
             return Err(AgentSessionError::InvalidState(
                 "actor mailbox is gone".to_string(),
@@ -650,7 +661,7 @@ impl AgentActor {
 
         let TurnState::RunningTools {
             pending, cancel, ..
-        } = &mut self.turn
+        } = &self.turn
         else {
             unreachable!("not in RunningTools state");
         };
@@ -661,11 +672,7 @@ impl AgentActor {
                 unreachable!("not in Proposing state");
             };
 
-            let hook_ctx = HookContext {
-                session_id: self.id.clone(),
-                invocation_id: Some(*invocation_id),
-                cancel: cancel.clone(),
-            };
+            let hook_ctx = self.hook_context(Some(*invocation_id), cancel.clone());
 
             let hooks = Arc::clone(&self.config.hooks);
             let proposed = proposed.clone();
@@ -1056,11 +1063,7 @@ impl AgentActor {
         };
         let hooks = Arc::clone(&self.config.hooks);
         let tool_call = effective.clone();
-        let hook_ctx = HookContext {
-            session_id: self.id.clone(),
-            invocation_id: Some(key.invocation_id),
-            cancel,
-        };
+        let hook_ctx = self.hook_context(Some(key.invocation_id), cancel);
 
         tokio::spawn(async move {
             let data = hooks.after_tool_use(&hook_ctx, tool_call, result).await;
@@ -1400,6 +1403,30 @@ mod tests {
         }
     }
 
+    struct CaptureWorkspaceHook {
+        id: HookId,
+        seen: Arc<Mutex<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl AfterToolUseHook for CaptureWorkspaceHook {
+        fn id(&self) -> HookId {
+            self.id
+        }
+
+        async fn transform(
+            &self,
+            ctx: &HookContext,
+            _current: &ToolResultView,
+        ) -> Result<AfterToolUseResult, HookError> {
+            *self.seen.lock().unwrap() = ctx.workspace.clone();
+            Ok(AfterToolUseResult {
+                modified: None,
+                additional_content: None,
+            })
+        }
+    }
+
     struct PrefixByToolNameHook {
         id: HookId,
     }
@@ -1514,6 +1541,7 @@ mod tests {
             policy_engine,
             policy_context: PolicyContext {},
             hooks: Arc::new(hooks),
+            workspace: PathBuf::from("/knuth-test-workspace"),
         }
     }
 
@@ -2302,6 +2330,52 @@ mod tests {
         assert!(
             !content.contains("printf rewritten"),
             "after-tool-use hook must not see the pre-rewrite arguments, got {content:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_hook_sees_workspace_from_config() {
+        let _guard = faux_lock();
+        clear_faux_responses();
+
+        let mut args = Map::new();
+        args.insert("command".into(), serde_json::json!("printf hi"));
+        set_faux_responses(vec![
+            faux_assistant_message(vec![faux_tool_call("bash", args)]),
+            faux_assistant_message(vec![faux_text("done")]),
+        ]);
+
+        let seen = Arc::new(Mutex::new(PathBuf::new()));
+        let mut hooks = HookRegistry::new();
+        hooks.register(Hook::AfterToolUse(Arc::new(CaptureWorkspaceHook {
+            id: HookId::new(),
+            seen: Arc::clone(&seen),
+        })));
+
+        let mut config = test_config_with_hooks(Arc::new(EchoArgsEngine::new()), hooks);
+        config.workspace = PathBuf::from("/custom-workspace");
+
+        let mut session = AgentSession::build("test".to_string(), "".to_string(), config).await;
+        let mut sub = session.subscribe(None).await.unwrap();
+        session
+            .submit_input("run it".to_string(), vec![])
+            .await
+            .unwrap();
+
+        loop {
+            if matches!(
+                next_durable_event(&mut sub).await,
+                AgentEvent::AgentTurnEnded { .. }
+            ) {
+                break;
+            }
+        }
+        clear_faux_responses();
+
+        assert_eq!(
+            seen.lock().unwrap().as_path(),
+            PathBuf::from("/custom-workspace").as_path()
         );
         session.close().await.unwrap();
     }
