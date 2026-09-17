@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use knuth_core::{ToolOutcome, ids::*};
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
@@ -15,8 +16,7 @@ use crate::{
     tools::policy::{PolicyContext, PolicyEngineTrait},
 };
 use ai::{
-    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolCall,
-    UserContent, UserContentBlock,
+    AssistantMessage, ContentBlock, ImageContent, Message, Model, StreamOptions, ToolCall, UserContent, UserContentBlock, UserMessage, UserRole,
 };
 use knuth_core::{
     AgentEvent, AgentSubscription, EventStoreError, InMemoryEventStore, LiveEvent,
@@ -184,6 +184,7 @@ enum TurnState {
         turn_id: TurnId,
         pending: HashMap<ToolInvocationId, PendingInvocation>,
         cancel: CancellationToken,
+        hints: Vec<UserContent>,
     },
 }
 
@@ -502,8 +503,8 @@ impl AgentActor {
     async fn handle_context_prepared(
         &mut self,
         turn_id: TurnId,
-        context: ai::Context,
-        _hints: Vec<UserContent>,
+        mut context: ai::Context,
+        hints: Vec<UserContent>,
         ctx: &mut ActorContext<AgentActorMessage>,
     ) -> Result<(), AgentSessionError> {
         let cancelled = match &self.turn {
@@ -530,6 +531,12 @@ impl AgentActor {
         debug!("current conversation state: \n{}", self.log.conversation());
 
         let (step_id, generation) = self.next_step_id();
+
+        context.messages.push(Message::User(UserMessage {
+            role: UserRole::User,
+            content: self.build_message_from_hints(hints),
+            timestamp: Utc::now().timestamp_millis(),
+        }));
 
         let step = AgentStepRunner::new(
             step_id,
@@ -736,11 +743,28 @@ impl AgentActor {
             turn_id,
             pending,
             cancel: batch_cancel,
+            hints: Vec::new(),
         };
 
         self.prepare_tool_calls(ctx).await?;
 
         Ok(())
+    }
+
+    fn build_message_from_hints(&self, hints: Vec<UserContent>) -> UserContent {
+        let v: Vec<UserContentBlock> = hints.into_iter().flat_map(|h| match h {
+            UserContent::Text(text) => vec![UserContentBlock::text(text)],
+            UserContent::Blocks(blocks) => blocks,
+        })
+        .map(|b| {
+            match b {
+                UserContentBlock::Text(text) => UserContentBlock::text(format!{
+                    r"<system-reminder>{}</system-reminder>", text.text}),
+                _ => unreachable!("unexpected hint type"),
+            }
+        })
+        .collect();
+        UserContent::Blocks(v)
     }
 
     async fn commit_invocation_result(
@@ -767,14 +791,16 @@ impl AgentActor {
             result: result.content.clone(),
         });
 
-        let (is_last, cancelled) = match &mut self.turn {
+        let (is_last, cancelled, hints) = match &mut self.turn {
             TurnState::RunningTools {
                 turn_id: current_turn,
                 pending,
                 cancel,
+                hints,
+                ..
             } => {
                 if *current_turn == key.turn_id && pending.remove(&key.invocation_id).is_some() {
-                    (pending.is_empty(), cancel.is_cancelled())
+                    (pending.is_empty(), cancel.is_cancelled(), hints.clone())
                 } else {
                     return Ok(());
                 }
@@ -793,6 +819,13 @@ impl AgentActor {
         if cancelled {
             self.end_turn(key.turn_id, ctx).await
         } else {
+            let message = self.build_message_from_hints(hints);
+            self.log.commit(AgentEvent::UserMessageCommitted {
+                message_id: MessageId::new(),
+                content: message,
+                intent: UserMessageIntent::Normal,
+            }).await?;
+
             self.continue_step(key.turn_id, ctx).await
         }
     }
@@ -814,6 +847,12 @@ impl AgentActor {
         Ok(())
     }
 
+    fn append_additional_hints(&mut self, new_hints: Vec<UserContent>) {
+        if let TurnState::RunningTools { hints, .. } = &mut self.turn {
+            hints.extend(new_hints.into_iter());
+        };
+    }
+
     fn running_invocation(
         &self,
         key: &ToolInvocationKey,
@@ -823,6 +862,7 @@ impl AgentActor {
                 turn_id,
                 pending,
                 cancel,
+                ..
             } if *turn_id == key.turn_id => pending.get(&key.invocation_id).and_then(|inv| {
                 if inv.key.generation == key.generation && inv.key.step_id == key.step_id {
                     Some((inv.state.clone(), cancel.clone()))
@@ -901,7 +941,7 @@ impl AgentActor {
         }
 
         if data.additional_hints.len() > 0 {
-            //TODO: schedule system hints insertion
+            self.append_additional_hints(data.additional_hints);
         }
 
         let Some(mailbox) = ctx.upgrade() else {
@@ -996,7 +1036,7 @@ impl AgentActor {
         };
 
         if additional_content.len() > 0 {
-            //TODO: schedule system hints insertion
+            self.append_additional_hints(additional_content);
         }
 
         if !result.outcome.is_success() {
@@ -1039,7 +1079,6 @@ impl AgentActor {
             .commit(AgentEvent::ToolExecutionObserved {
                 invocation_id: key.invocation_id,
                 tool_call_id: effective.id.clone(),
-                additional_content: vec![],
             })
             .await?;
 

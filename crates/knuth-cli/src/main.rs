@@ -11,16 +11,19 @@ use std::{
 };
 
 use futures::StreamExt;
-use knuth_agent::policy::PolicyContext;
 use knuth_agent::{
     harness::{AgentConfig, AgentSession},
     hooks::HookRegistry,
 };
+use knuth_agent::{hooks::Hook, policy::PolicyContext};
 use knuth_core::{AgentEvent, AgentSubscription, LiveEvent, SessionEvent};
 
 mod config;
+mod hooks;
 mod output;
 mod policy;
+
+use hooks::ToolCountHook;
 
 use config::UserSettings;
 use output::{OutputStyle, format_tool_finished, format_tool_running};
@@ -31,6 +34,8 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
+
+use crate::hooks::RepeatedToolCallWarning;
 
 #[derive(Debug, Parser)]
 #[command(name = "knuth")]
@@ -144,7 +149,11 @@ fn build_system_prompt() -> String {
 
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
     let policy_engine = DefaultPolicyEngine::with_default_tools(user_settings.policy_mode.clone());
-    let hooks = HookRegistry::new();
+    let mut hooks = HookRegistry::new();
+    hooks.register(Hook::AfterToolUse(Arc::new(ToolCountHook::new(2))));
+    hooks.register(Hook::AfterToolUse(Arc::new(RepeatedToolCallWarning::new(
+        3,
+    ))));
 
     let mut session = AgentSession::build(
         "test".to_string(),

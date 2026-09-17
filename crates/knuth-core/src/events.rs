@@ -125,7 +125,6 @@ pub enum AgentEvent {
     ToolExecutionObserved {
         invocation_id: ToolInvocationId,
         tool_call_id: String,
-        additional_content: Vec<UserContent>,
     },
 }
 
@@ -279,11 +278,10 @@ impl std::fmt::Display for AgentEvent {
             AgentEvent::ToolExecutionObserved {
                 invocation_id,
                 tool_call_id,
-                additional_content,
             } => {
                 write!(
                     f,
-                    "ToolExecutionObserved(invocation_id={}, tool_call_id={tool_call_id}, additional_content={additional_content:?})",
+                    "ToolExecutionObserved(invocation_id={}, tool_call_id={tool_call_id})",
                     invocation_id.short()
                 )
             }
@@ -316,7 +314,6 @@ mod tests {
             AgentEvent::ToolExecutionObserved {
                 invocation_id,
                 tool_call_id: "call-1".to_string(),
-                additional_content: vec![],
             },
             AgentEvent::ToolResultReceived {
                 invocation_id,
