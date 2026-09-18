@@ -22,12 +22,14 @@ mod config;
 mod hooks;
 mod output;
 mod policy;
+mod skill;
 
 use hooks::ToolCountHook;
 
 use config::UserSettings;
 use output::{OutputStyle, format_tool_finished, format_tool_running};
 use policy::DefaultPolicyEngine;
+use skill::{SkillSet, SkillTool};
 
 use clap::{Parser, Subcommand};
 use crossterm::style::Stylize;
@@ -148,7 +150,17 @@ fn build_system_prompt() -> String {
 }
 
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
-    let policy_engine = DefaultPolicyEngine::with_default_tools(user_settings.policy_mode.clone());
+    let workspace = std::env::current_dir().context("failed to determine current directory")?;
+
+    let skills = SkillSet::discover(&workspace);
+    info!("loaded {} skills", skills.len());
+
+    let mut policy_engine =
+        DefaultPolicyEngine::with_default_tools(user_settings.policy_mode.clone());
+    if let Some(skill_tool) = SkillTool::new(skills) {
+        policy_engine.register(Arc::new(skill_tool));
+    }
+
     let mut hooks = HookRegistry::new();
     hooks.register(Hook::AfterToolUse(Arc::new(ToolCountHook::new(2))));
     hooks.register(Hook::AfterToolUse(Arc::new(RepeatedToolCallWarning::new(
@@ -164,7 +176,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
             policy_engine: Arc::new(policy_engine),
             policy_context: PolicyContext {},
             hooks: Arc::new(hooks),
-            workspace: std::env::current_dir().context("failed to determine current directory")?,
+            workspace,
         },
     )
     .await;

@@ -345,7 +345,6 @@ mod tests {
         log.commit(AgentEvent::ToolExecutionObserved {
             invocation_id,
             tool_call_id: "call-1".to_string(),
-            additional_content: vec![],
         })
         .await
         .unwrap();

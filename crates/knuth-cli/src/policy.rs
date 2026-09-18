@@ -117,6 +117,10 @@ impl DefaultPolicyEngine {
         Self::new(registry, policy_mode)
     }
 
+    pub fn register(&mut self, tool: Arc<dyn AgentTool>) {
+        self.tool_registry.register(tool);
+    }
+
     async fn decide(
         &self,
         tool: Arc<dyn AgentTool>,
