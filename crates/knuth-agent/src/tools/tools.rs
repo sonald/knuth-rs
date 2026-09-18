@@ -216,9 +216,12 @@ impl AgentToolRegistry {
     }
 
     pub fn schemas(&self) -> Vec<Tool> {
-        self.tools
+        let mut schemas =self.tools
             .values()
             .map(|tool| tool.schema().clone())
-            .collect()
+            .collect::<Vec<_>>();
+
+        schemas.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        schemas
     }
 }

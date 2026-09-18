@@ -146,8 +146,14 @@ fn build_system_prompt() -> String {
     system_prompt.push_str(include_str!("../data/system.md"));
     system_prompt.push_str(&build_environment());
     debug!("system prompt:\n{}", system_prompt);
+
+    let agents_md = std::fs::read_to_string("~/.agents/AGENTS.md").unwrap();
+    let user_guidance = format!("## User Guidance (from ~/.agents/AGENTS.md)\n{agents_md}\n");
+    system_prompt.push_str(&user_guidance);
+
     system_prompt
 }
+
 
 async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, AgentSubscription)> {
     let workspace = std::env::current_dir().context("failed to determine current directory")?;
@@ -162,7 +168,7 @@ async fn build_session(user_settings: &UserSettings) -> Result<(AgentSession, Ag
     }
 
     let mut hooks = HookRegistry::new();
-    hooks.register(Hook::AfterToolUse(Arc::new(ToolCountHook::new(2))));
+    hooks.register(Hook::AfterToolUse(Arc::new(ToolCountHook::new(20))));
     hooks.register(Hook::AfterToolUse(Arc::new(RepeatedToolCallWarning::new(
         3,
     ))));

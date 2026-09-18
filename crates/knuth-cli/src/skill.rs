@@ -96,7 +96,7 @@ impl SkillSet {
     fn catalog(&self) -> String {
         self.skills
             .values()
-            .map(|skill| format!("- {}: {}", skill.name, skill.description))
+            .map(|skill| format!("<skill><name>{}</name><description>{}</description></skill>\n", skill.name, skill.description))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -252,7 +252,7 @@ impl SkillTool {
             description: format!(
                 "Load the full instructions for a named skill. Call this before \
                  starting a task that one of the skills below covers.\n\n\
-                 Available skills:\n{}",
+                 <available_skills>\n{}</available_skills>\n",
                 skills.catalog()
             ),
             parameters: serde_json::json!({
